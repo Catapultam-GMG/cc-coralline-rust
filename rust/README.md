@@ -30,6 +30,11 @@ are masked. Run it:
 ./test-parity.sh            # from the rust/ directory
 ```
 
+This same diff runs on **Linux in CI** (`.github/workflows/rust-parity.yml`) on
+every push, so parity is verified on coralline's primary platform, not just
+Windows. Cross-platform: Windows uses `GetLocalTime`, Linux/macOS use libc
+`localtime_r` for the clock — both matching bash's `date`.
+
 ## Build & install
 
 ```bash

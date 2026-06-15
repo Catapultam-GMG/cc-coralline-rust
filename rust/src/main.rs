@@ -244,7 +244,42 @@ fn local_hms() -> (u32, u32, u32) {
     }
 }
 
-#[cfg(not(windows))]
+// Linux/macOS: honor the system timezone via libc localtime_r, matching bash's
+// `date` (zero-dep — libc is always linked on unix).
+#[cfg(unix)]
+fn local_hms() -> (u32, u32, u32) {
+    #[repr(C)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        wday: i32,
+        yday: i32,
+        isdst: i32,
+        gmtoff: i64,
+        zone: *const u8,
+    }
+    extern "C" {
+        fn time(t: *mut i64) -> i64;
+        fn localtime_r(t: *const i64, result: *mut Tm) -> *mut Tm;
+    }
+    unsafe {
+        let mut now_t: i64 = 0;
+        time(&mut now_t);
+        let mut tm: Tm = std::mem::zeroed();
+        if localtime_r(&now_t, &mut tm).is_null() {
+            let day = now_t.rem_euclid(86400);
+            return ((day / 3600) as u32, ((day % 3600) / 60) as u32, (day % 60) as u32);
+        }
+        (tm.hour as u32, tm.min as u32, tm.sec as u32)
+    }
+}
+
+// Fallback for any other target: UTC.
+#[cfg(not(any(windows, unix)))]
 fn local_hms() -> (u32, u32, u32) {
     let secs = now_epoch();
     let day = secs.rem_euclid(86400);

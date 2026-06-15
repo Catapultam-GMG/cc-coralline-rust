@@ -234,7 +234,9 @@ fn expand(s: &str, home: &str) -> String {
 }
 
 /// Convert an MSYS absolute path (/c/Users/…) to a Windows one (c:/Users/…) so
-/// std::fs can read it — a config might `. /c/...` instead of using ~.
+/// std::fs can read it — a config might `. /c/...` instead of using ~. Windows
+/// only: on Linux/macOS `/x/...` is a legitimate native path, so leave it alone.
+#[cfg(windows)]
 fn msys_to_win(p: &str) -> String {
     let b = p.as_bytes();
     if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b'/' {
@@ -242,4 +244,9 @@ fn msys_to_win(p: &str) -> String {
     } else {
         p.to_string()
     }
+}
+
+#[cfg(not(windows))]
+fn msys_to_win(p: &str) -> String {
+    p.to_string()
 }

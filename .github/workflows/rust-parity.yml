@@ -1,0 +1,26 @@
+name: rust-parity
+
+# Builds the Rust port on Linux and proves it is byte-identical to the bash
+# statusline.sh across every theme / style / layout (rust/test-parity.sh).
+on:
+  push:
+    branches: [rust-rewrite, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tooling versions
+        run: |
+          jq --version
+          cargo --version
+          bash --version | head -1
+      - name: Build (release)
+        working-directory: rust
+        run: cargo build --release
+      - name: Parity vs bash statusline.sh
+        working-directory: rust
+        run: bash test-parity.sh
