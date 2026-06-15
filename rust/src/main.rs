@@ -96,7 +96,7 @@ fn render_all(j: Option<&Json>, home: &str, coralline_dir: &str) -> String {
 
     let all_segs = format!(" {} {} {} ", cfg.segments, cfg.segments2, cfg.segments3);
     let uses = |name: &str| all_segs.contains(&format!(" {name} "));
-    let use_git = uses("git") || uses("stash") || uses("project");
+    let use_git = uses("git") || uses("stash") || uses("project") || uses("worktree");
 
     let git = git::gather(&p.cwd, coralline_dir, use_git);
     let (h, m, s) = local_hms();

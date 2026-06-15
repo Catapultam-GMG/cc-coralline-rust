@@ -69,6 +69,16 @@ Identical to upstream — it reads the same `~/.claude/coralline.conf` (and its
 [main README](../README.md) for the full configuration reference and theme
 gallery, and [`INSTALL.md`](INSTALL.md) for the guided (AI-agent) installer.
 
+## Beyond upstream
+
+One additive segment not in upstream coralline:
+
+- **`worktree`** — when you're in a linked git worktree, shows its name as its own
+  `⑂` pill (background `VL_BG_WT`). Compose with `project` (stable repo-root name)
+  and `dir`, e.g. `VL_SEGMENTS="project worktree dir git …"`. Hidden in the main
+  worktree / outside a repo. `test-parity.sh` includes a dedicated check for it
+  (there's no upstream output to diff against).
+
 ## Credits
 
 A port of [coralline](https://github.com/Nanako0129/coralline) by Nanako0129,
