@@ -1,0 +1,256 @@
+//! coralline — native (Rust) statusline renderer for Claude Code.
+//!
+//! A single self-contained exe, byte-identical in output to the bash
+//! statusline.sh, but spawning ~100x faster (no bash + jq + git subprocess
+//! chain per render — critical on Windows, where each spawn is scanned/forked
+//! expensively, and when many sessions render every second).
+//!
+//! Contract: read the statusline JSON payload on stdin, print the rendered bar
+//! on stdout. Per-session output cache + blanking guard so a killed/errored
+//! render never blanks the bar. Branch comes from .git/HEAD instantly; dirty
+//! marks / ahead-behind ride a background cache refreshed by a detached
+//! `--git-refresh` child (a native-port enhancement; output matches upstream).
+use std::io::Read;
+use std::panic::AssertUnwindSafe;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+mod config;
+mod git;
+mod json;
+mod render;
+
+use config::Config;
+use json::Json;
+
+pub struct Payload {
+    pub cwd: String,
+    pub model: String,
+    pub ctx_pct: Option<f64>,
+    pub tok_in: i64,
+    pub tok_out: i64,
+    pub tok_cr: i64,
+    pub tok_cw: i64,
+    pub fh_pct: Option<f64>,
+    pub fh_rst: String,
+    pub wd_pct: Option<f64>,
+    pub wd_rst: String,
+    pub cost: Option<f64>,
+    pub lines_add: i64,
+    pub lines_del: i64,
+    pub out_style: String,
+    pub dur_ms: i64,
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--git-refresh" {
+        let coralline_dir = format!("{}/.claude/coralline", home_dir());
+        git::refresh(&args[2], &coralline_dir);
+        return;
+    }
+    run();
+}
+
+fn run() {
+    let mut payload = String::new();
+    let _ = std::io::stdin().read_to_string(&mut payload);
+
+    let home = home_dir();
+    let coralline_dir = format!("{home}/.claude/coralline");
+    let cache_dir = format!("{coralline_dir}/.cache/out-native");
+    let _ = std::fs::create_dir_all(&cache_dir);
+
+    let parsed = json::parse(&payload);
+    let sid = session_key(parsed.as_ref());
+    let cache = format!("{cache_dir}/{sid}");
+
+    let out = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        render_all(parsed.as_ref(), &home, &coralline_dir)
+    }))
+    .unwrap_or_default();
+
+    if !out.is_empty() {
+        println!("{out}");
+        let tmp = format!("{cache}.tmp");
+        if std::fs::write(&tmp, format!("{out}\n")).is_ok() {
+            let _ = std::fs::rename(&tmp, &cache);
+        }
+    } else if let Ok(c) = std::fs::read_to_string(&cache) {
+        print!("{c}");
+    }
+}
+
+fn render_all(j: Option<&Json>, home: &str, coralline_dir: &str) -> String {
+    let j = match j {
+        Some(x) => x,
+        None => return String::new(),
+    };
+    let cfg = Config::load(home);
+    let p = extract(j);
+
+    let all_segs = format!(" {} {} {} ", cfg.segments, cfg.segments2, cfg.segments3);
+    let uses = |name: &str| all_segs.contains(&format!(" {name} "));
+    let use_git = uses("git") || uses("stash") || uses("project");
+
+    let git = git::gather(&p.cwd, coralline_dir, use_git);
+    let (h, m, s) = local_hms();
+    let now = now_epoch();
+    // seg_dir collapses the *shell* $HOME (matches upstream `${cwd/#$HOME/~}`),
+    // which differs from the Windows USERPROFILE used for filesystem paths.
+    render::render(&cfg, &p, &git, &shell_home(), h, m, s, now)
+}
+
+fn extract(j: &Json) -> Payload {
+    let s = |path: &[&str]| {
+        j.path(path)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let f = |path: &[&str]| j.path(path).and_then(|v| v.as_f64());
+    let i = |path: &[&str]| f(path).map(|x| x as i64).unwrap_or(0);
+    let tok = |path: &[&str]| match j.path(path) {
+        Some(Json::Str(st)) => st.clone(),
+        Some(Json::Num(n)) => fmt_num(*n),
+        _ => String::new(),
+    };
+
+    let cwd = {
+        let w = s(&["workspace", "current_dir"]);
+        if !w.is_empty() {
+            w
+        } else {
+            s(&["cwd"])
+        }
+    };
+
+    Payload {
+        cwd,
+        model: s(&["model", "display_name"]),
+        ctx_pct: f(&["context_window", "used_percentage"]),
+        tok_in: i(&["context_window", "total_input_tokens"]),
+        tok_out: i(&["context_window", "total_output_tokens"]),
+        tok_cr: i(&["context_window", "current_usage", "cache_read_input_tokens"]),
+        tok_cw: i(&["context_window", "current_usage", "cache_creation_input_tokens"]),
+        fh_pct: f(&["rate_limits", "five_hour", "used_percentage"]),
+        fh_rst: tok(&["rate_limits", "five_hour", "resets_at"]),
+        wd_pct: f(&["rate_limits", "seven_day", "used_percentage"]),
+        wd_rst: tok(&["rate_limits", "seven_day", "resets_at"]),
+        cost: f(&["cost", "total_cost_usd"]),
+        lines_add: i(&["cost", "total_lines_added"]),
+        lines_del: i(&["cost", "total_lines_removed"]),
+        out_style: s(&["output_style", "name"]),
+        dur_ms: i(&["cost", "total_duration_ms"]),
+    }
+}
+
+/// Format a JSON number the way jq's tostring would (integer if whole).
+fn fmt_num(n: f64) -> String {
+    if n.fract() == 0.0 {
+        format!("{}", n as i64)
+    } else {
+        format!("{}", n)
+    }
+}
+
+fn session_key(j: Option<&Json>) -> String {
+    let mut sid = String::new();
+    if let Some(j) = j {
+        if let Some(s) = j.path(&["session_id"]).and_then(|v| v.as_str()) {
+            sid = s.to_string();
+        }
+        if sid.is_empty() {
+            let cwd = j
+                .path(&["workspace", "current_dir"])
+                .and_then(|v| v.as_str())
+                .or_else(|| j.path(&["cwd"]).and_then(|v| v.as_str()))
+                .unwrap_or("");
+            sid = format!("cwd-{cwd}");
+        }
+    }
+    let sanitized: String = sid
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "default".into()
+    } else {
+        sanitized
+    }
+}
+
+/// Home directory for filesystem paths (config, cache). USERPROFILE is a native
+/// Windows path Rust's std::fs understands (unlike MSYS `/c/...`).
+fn home_dir() -> String {
+    if let Ok(u) = std::env::var("USERPROFILE") {
+        if !u.is_empty() {
+            return u;
+        }
+    }
+    if let (Ok(d), Ok(p)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
+        if !d.is_empty() {
+            return format!("{d}{p}");
+        }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        return h;
+    }
+    "C:\\Users\\Default".into()
+}
+
+/// Shell $HOME, used only by seg_dir's `~` collapse to match upstream's
+/// `${cwd/#$HOME/~}`. Falls back to the filesystem home if HOME is unset.
+fn shell_home() -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => h,
+        _ => home_dir(),
+    }
+}
+
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn local_hms() -> (u32, u32, u32) {
+    #[repr(C)]
+    struct SystemTimeW {
+        w_year: u16,
+        w_month: u16,
+        w_day_of_week: u16,
+        w_day: u16,
+        w_hour: u16,
+        w_minute: u16,
+        w_second: u16,
+        w_milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocalTime(lp: *mut SystemTimeW);
+    }
+    unsafe {
+        let mut st: SystemTimeW = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        (st.w_hour as u32, st.w_minute as u32, st.w_second as u32)
+    }
+}
+
+#[cfg(not(windows))]
+fn local_hms() -> (u32, u32, u32) {
+    let secs = now_epoch();
+    let day = secs.rem_euclid(86400);
+    (
+        (day / 3600) as u32,
+        ((day % 3600) / 60) as u32,
+        (day % 60) as u32,
+    )
+}
