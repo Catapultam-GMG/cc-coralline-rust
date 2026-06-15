@@ -20,13 +20,23 @@ binary in `settings.json`:
 
 ## Step 1 — Get the binary
 
-Prefer a prebuilt release asset if one exists for the user's platform. Otherwise
-build from source (needs the Rust toolchain — `rustup`):
+Prefer a prebuilt release asset for the user's platform from
+<https://github.com/Catapultam-GMG/cc-coralline-rust/releases> (one archive per
+platform: `linux-x86_64`, `macos-arm64`, `macos-x86_64`, `windows-x86_64`).
+Download, extract the `coralline[.exe]` binary, and place it on PATH:
+
+```bash
+# example: Linux x86_64 latest release
+mkdir -p ~/bin
+curl -fsSL https://github.com/Catapultam-GMG/cc-coralline-rust/releases/latest/download/cc-coralline-rust-vX.Y-linux-x86_64.tar.gz | tar -xz -C ~/bin
+```
+
+Or build from source (needs the Rust toolchain — `rustup`):
 
 ```bash
 command -v cargo || echo "MISSING: install Rust from https://rustup.rs"
-git clone https://github.com/Nanako0129/coralline   # or the user's fork
-cd coralline/rust && cargo build --release
+git clone https://github.com/Catapultam-GMG/cc-coralline-rust
+cd cc-coralline-rust/rust && cargo build --release
 mkdir -p ~/bin && cp target/release/coralline* ~/bin/
 ```
 

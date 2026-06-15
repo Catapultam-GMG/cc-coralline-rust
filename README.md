@@ -16,7 +16,7 @@ This fork ships **[coralline-rs](./rust/)** — a single self-contained native b
   the cost no longer multiplies across many parallel sessions at `refreshInterval: 1`.
 - **No `jq` dependency** (`git` optional) — one static binary, nothing to install.
 - **Cross-platform**: Linux, macOS (arm64 + x86_64), Windows — verified byte-identical
-  to the bash renderer by CI on all three, plus no-console-window flashing on Windows.
+  to the bash renderer by CI on all three.
 - **Extra segment** beyond upstream: `worktree` — the linked-worktree name as its own
   `⑂` pill (compose with `project` + `dir`).
 
@@ -29,8 +29,8 @@ remains fully supported.
 Paste this into Claude Code:
 
 ```text
-Please install coralline for me:
-fetch https://raw.githubusercontent.com/Nanako0129/coralline/main/INSTALL.md
+Please install coralline-rs (the native Rust build) for me:
+fetch https://raw.githubusercontent.com/Catapultam-GMG/cc-coralline-rust/rust/rust/INSTALL.md
 and follow the playbook in it.
 ```
 
@@ -180,6 +180,10 @@ glyphs, gauges that shift color as they fill — is a loving tribute to
 can be. Thanks also to the wider [powerline](https://github.com/powerline/powerline) lineage
 that started it all, and to [Nerd Fonts](https://www.nerdfonts.com/) for the glyphs that make
 the pill shapes possible.
+
+Above all, this fork stands on [coralline](https://github.com/Nanako0129/coralline) by
+[@Nanako0129](https://github.com/Nanako0129) — coralline-rs is a Rust port of that project,
+and the bash statusline here is their original work.
 
 As for the name: coralline algae build reefs one thin, colorful layer at a time —
 and **coral·line** is exactly what this is: a line, in Claude's coral.
