@@ -48,6 +48,7 @@ config editing required.
 |---|---|
 | `dir` | current directory, long paths collapsed to `~/a/…/z` |
 | `project` | repo name (`⬢`), stable across every worktree; hidden outside a git repo |
+| `worktree` | linked-worktree name (`⑂`) — coralline-rs addition; hidden in the main worktree |
 | `git` | branch, staged `+` / modified `!` / untracked `?`, ahead `⇡` behind `⇣` |
 | `model` | active Claude model |
 | `ctx` | context-window gauge, input/output/cache token counts |

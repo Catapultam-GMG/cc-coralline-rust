@@ -54,8 +54,8 @@ plain text. Ask these five, showing theme previews from the
 3. **Layout** — `auto` (responsive, wraps when narrow) or `fixed` (pinned rows)
 4. **Clock** — `12h` / `24h` / `off`, and seconds on/off
 5. **Segments** — default `dir git model ctx limit5h limit7d cost clock`; offer
-   the extras `project worktree`(n/a) `lines style duration stash`, and
-   `VL_NAME_MAX` if they have long branch/repo names.
+   the extras `project worktree lines style duration stash` (`worktree` is a
+   coralline-rs addition), and `VL_NAME_MAX` if they have long branch/repo names.
 
 ## Step 3 — Install the chosen theme
 
