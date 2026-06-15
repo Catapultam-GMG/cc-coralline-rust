@@ -17,7 +17,6 @@ concurrency:
 
 env:
   VER: v0.1.${{ github.run_number }}
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # run JS actions on Node 24 (clears the Node 20 deprecation notice)
 
 jobs:
   # Gate: the release only builds/publishes if parity passes on all platforms.
@@ -63,7 +62,7 @@ jobs:
             rm -f "dist/$bin"
           done
           ls -la dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.os }}
           path: rust/dist/*
@@ -72,13 +71,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - run: ls -la dist
       - name: Publish GitHub Release (changelog = merged PRs)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.VER }}
           name: cc-coralline-rust ${{ env.VER }}
