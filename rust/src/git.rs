@@ -284,7 +284,17 @@ fn run_status(cwd: &str) -> (String, String, bool) {
 fn git_status_output(cwd: &str) -> Option<String> {
     let args = ["-C", cwd, "status", "--porcelain=v2", "--branch"];
     for git in ["git", "C:\\Program Files\\Git\\cmd\\git.exe"] {
-        if let Ok(out) = std::process::Command::new(git).args(args).output() {
+        let mut cmd = std::process::Command::new(git);
+        cmd.args(args);
+        // git is a console app; without this it flashes a console window when
+        // spawned from our windowless (detached) refresh child.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        if let Ok(out) = cmd.output() {
             if out.status.success() {
                 return String::from_utf8(out.stdout).ok();
             }

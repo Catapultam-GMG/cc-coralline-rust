@@ -1,3 +1,9 @@
+// Build as a Windows GUI-subsystem binary so the OS never allocates (or briefly
+// flashes) a console window for this process. stdout still works — the launcher
+// gives us a redirected pipe whose handle we inherit regardless of subsystem.
+// No-op off Windows.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! coralline — native (Rust) statusline renderer for Claude Code.
 //!
 //! A single self-contained exe, byte-identical in output to the bash

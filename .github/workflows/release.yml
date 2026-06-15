@@ -17,6 +17,7 @@ concurrency:
 
 env:
   VER: v0.1.${{ github.run_number }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # run JS actions on Node 24 (clears the Node 20 deprecation notice)
 
 jobs:
   # Gate: the release only builds/publishes if parity passes on all platforms.
