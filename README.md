@@ -6,6 +6,24 @@
 
 ![All six coralline themes rendered side by side](./assets/hero.png)
 
+## 🦀 Rust rewrite (this fork)
+
+This fork ships **[coralline-rs](./rust/)** — a single self-contained native binary,
+**byte-identical in output** to the bash `statusline.sh`, but far cheaper to run:
+
+- **~100× faster spawn** — ~10 ms vs ~1–5 s for the `bash` + `jq` + `git` chain on
+  Windows under load (every process launch is AV-scanned + fork-emulated there), and
+  the cost no longer multiplies across many parallel sessions at `refreshInterval: 1`.
+- **No `jq` dependency** (`git` optional) — one static binary, nothing to install.
+- **Cross-platform**: Linux, macOS (arm64 + x86_64), Windows — verified byte-identical
+  to the bash renderer by CI on all three, plus no-console-window flashing on Windows.
+- **Extra segment** beyond upstream: `worktree` — the linked-worktree name as its own
+  `⑂` pill (compose with `project` + `dir`).
+
+Prebuilt binaries: [Releases](../../releases). Details: **[rust/README.md](./rust/README.md)**
+and the AI installer **[rust/INSTALL.md](./rust/INSTALL.md)**. The bash statusline below
+remains fully supported.
+
 ## Install (the fun way)
 
 Paste this into Claude Code:

@@ -18,7 +18,8 @@ pub struct GitInfo {
     pub marks: String,
     pub ab: String,
     pub dirty: bool,
-    pub root: String, // stable main-repo basename, for seg_project
+    pub root: String,    // stable main-repo basename, for seg_project
+    pub wt_name: String, // linked-worktree name (empty in the main worktree), for seg_worktree
 }
 
 fn djb2(s: &str) -> String {
@@ -124,6 +125,11 @@ pub fn gather(cwd: &str, coralline_dir: &str, segments_use_git: bool) -> GitInfo
     let gitdir_s = norm(&gitdir.to_string_lossy());
 
     gi.root = repo_root_name(&gitdir_s);
+    // Linked-worktree name: a worktree's git dir is <repo>/.git/worktrees/<name>.
+    if let Some(i) = gitdir_s.find("/worktrees/") {
+        let after = &gitdir_s[i + "/worktrees/".len()..];
+        gi.wt_name = after.split('/').next().unwrap_or("").to_string();
+    }
     gi.branch = read_branch(&gitdir).unwrap_or_default();
     if gi.branch.is_empty() {
         return gi;

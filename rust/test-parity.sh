@@ -40,6 +40,22 @@ printf '. %s/themes/claude-coral.conf\nVL_LAYOUT="auto"\nVL_SEGMENTS="%s"\n' "$R
 printf '. %s/themes/claude-coral.conf\nVL_ASCII=1\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "ascii mode"
 printf '. %s/themes/claude-coral.conf\nVL_CLOCK="24h"\nVL_SEGMENTS="clock"\n' "$RT" > "$tmp/conf"; check "clock: 24h"
 
+# Feature check (NO upstream oracle — the worktree segment is a coralline-rs
+# extension): create a real linked worktree and assert its ⑂ pill renders.
+wtroot=$(mktemp -d)
+git init -q "$wtroot/repo"
+git -C "$wtroot/repo" -c user.email=a@b.c -c user.name=ci commit -q --allow-empty -m init
+git -C "$wtroot/repo" worktree add -q "$wtroot/feature-x" -b feature-x >/dev/null 2>&1
+if command -v cygpath >/dev/null 2>&1; then wtp=$(cygpath -m "$wtroot/feature-x"); else wtp="$wtroot/feature-x"; fi
+printf 'VL_SEGMENTS="worktree"\n' > "$tmp/conf"
+got=$(printf '{"cwd":"%s"}' "$wtp" | CORALLINE_CONFIG="$tmp/conf" "$EXE" 2>/dev/null)
+if printf '%s' "$got" | grep -q 'feature-x'; then
+  printf '  ✓ %s\n' "feature: worktree segment"; pass=$((pass+1))
+else
+  printf '  ✗ %s\n' "feature: worktree segment"; printf '%s' "$got" | cat -v | head -1; fail=$((fail+1))
+fi
+rm -rf "$wtroot"
+
 rm -rf "$tmp" "$HOME/.claude/coralline/.cache/out-native" 2>/dev/null
 echo "── $pass passed, $fail failed ──"
 [ "$fail" -eq 0 ]

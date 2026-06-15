@@ -235,6 +235,17 @@ impl<'a> Ctx<'a> {
                     ),
                 );
             }
+            // Extension (not in upstream): the linked-worktree name as its own pill.
+            "worktree" => {
+                if self.git.wt_name.is_empty() {
+                    return;
+                }
+                self.push(
+                    segs,
+                    &cfg.bg_wt,
+                    format!("{BOLD}{} \u{2442} {} {NORM}", self.fg_text, self.git.wt_name),
+                );
+            }
             "dir" => {
                 if p.cwd.is_empty() {
                     return;
