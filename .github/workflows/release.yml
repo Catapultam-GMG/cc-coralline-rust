@@ -1,18 +1,22 @@
 name: release
 
-# Cut a release by pushing a version tag:  git tag v0.1 && git push origin v0.1
-# Builds the binary natively per OS and attaches one archive PER PLATFORM to a
-# GitHub Release. macOS x86_64 is cross-built on the arm64 runner (Apple's
-# toolchain compiles it natively), so no Intel runner is needed — GitHub removed
-# the macos-13 Intel image in Dec 2025. workflow_dispatch builds + uploads run
-# artifacts only (no Release), so you can verify the matrix without publishing.
+# Every push to the default branch (i.e. a merged PR) cuts a release: builds one
+# archive per platform and publishes a GitHub Release whose notes are the merged
+# PRs since the last release (generate_release_notes). Version is v0.1.<run>.
 on:
   push:
-    tags: ['v*']
+    branches: [rust]
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  VER: v0.1.${{ github.run_number }}
 
 jobs:
   build:
@@ -32,36 +36,45 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v5
-      - name: Build + package each target
+      - name: Build + package each target (one archive per platform)
         working-directory: rust
         run: |
-          ver="${GITHUB_REF_NAME:-dev}"
           mkdir -p dist
           for t in ${{ matrix.targets }}; do
             rustup target add "$t"
             cargo build --release --target "$t"
             case "$t" in
-              x86_64-unknown-linux-gnu) label=linux-x86_64; bin=coralline; ext=tar.gz;;
+              x86_64-unknown-linux-gnu) label=linux-x86_64;   bin=coralline;     ext=tar.gz;;
               x86_64-pc-windows-msvc)   label=windows-x86_64; bin=coralline.exe; ext=zip;;
-              aarch64-apple-darwin)     label=macos-arm64; bin=coralline; ext=tar.gz;;
-              x86_64-apple-darwin)      label=macos-x86_64; bin=coralline; ext=tar.gz;;
-              *)                        label="$t"; bin=coralline; ext=tar.gz;;
+              aarch64-apple-darwin)     label=macos-arm64;    bin=coralline;     ext=tar.gz;;
+              x86_64-apple-darwin)      label=macos-x86_64;   bin=coralline;     ext=tar.gz;;
+              *)                        label="$t";           bin=coralline;     ext=tar.gz;;
             esac
-            name="cc-coralline-rust-${ver}-${label}"
+            name="cc-coralline-rust-${VER}-${label}"
             cp "target/$t/release/$bin" "dist/$bin"
-            if [ "$ext" = "zip" ]; then (cd dist && 7z a "${name}.zip" "$bin" >/dev/null);
-            else                        (cd dist && tar czf "${name}.tar.gz" "$bin"); fi
+            if [ "$ext" = zip ]; then (cd dist && 7z a "${name}.zip" "$bin" >/dev/null)
+            else                       (cd dist && tar czf "${name}.tar.gz" "$bin"); fi
             rm -f "dist/$bin"
           done
           ls -la dist
-      - name: Upload run artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}
           path: rust/dist/*
-      - name: Attach to GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist
+      - name: Publish GitHub Release (changelog = merged PRs)
         uses: softprops/action-gh-release@v2
         with:
-          files: rust/dist/*
+          tag_name: ${{ env.VER }}
+          name: cc-coralline-rust ${{ env.VER }}
+          files: dist/*
           generate_release_notes: true

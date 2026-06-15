@@ -4,7 +4,7 @@ name: rust-parity
 # statusline.sh across every theme / style / layout (rust/test-parity.sh).
 on:
   push:
-    branches: [rust-rewrite, main]
+    branches: [rust]
   pull_request:
   workflow_dispatch:
 
