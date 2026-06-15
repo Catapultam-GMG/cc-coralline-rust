@@ -4,8 +4,6 @@
 > Code that **installs itself through your AI** — paste one prompt, answer a few questions
 > about colors and layout, done.
 
-[繁體中文說明](./README.zh-TW.md)
-
 ![All six coralline themes rendered side by side](./assets/hero.png)
 
 ## Install (the fun way)

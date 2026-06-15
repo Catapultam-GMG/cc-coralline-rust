@@ -7,9 +7,6 @@ on:
   workflow_dispatch:
   workflow_call:        # invoked as the gate before release.yml builds/publishes
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # run JS actions on Node 24 (clears the Node 20 deprecation notice)
-
 jobs:
   parity:
     strategy:
