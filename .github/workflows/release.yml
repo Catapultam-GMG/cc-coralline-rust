@@ -55,7 +55,9 @@ jobs:
               x86_64-apple-darwin)      label=macos-x86_64;   bin=coralline;     ext=tar.gz;;
               *)                        label="$t";           bin=coralline;     ext=tar.gz;;
             esac
-            name="cc-coralline-rust-${VER}-${label}"
+            # Version-less name so https://github.com/<repo>/releases/latest/download/<name>
+            # is a stable link to the newest build (version lives in the release tag/title).
+            name="cc-coralline-rust-${label}"
             cp "target/$t/release/$bin" "dist/$bin"
             if [ "$ext" = zip ]; then (cd dist && 7z a "${name}.zip" "$bin" >/dev/null)
             else                       (cd dist && tar czf "${name}.tar.gz" "$bin"); fi
