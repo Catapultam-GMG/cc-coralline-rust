@@ -3,10 +3,9 @@ name: rust-parity
 # Builds the Rust port on Linux and proves it is byte-identical to the bash
 # statusline.sh across every theme / style / layout (rust/test-parity.sh).
 on:
-  push:
-    branches: [rust]
-  pull_request:
+  pull_request:        # required check on PRs into the default branch
   workflow_dispatch:
+  workflow_call:        # invoked as the gate before release.yml builds/publishes
 
 jobs:
   parity:

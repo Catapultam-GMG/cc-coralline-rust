@@ -19,7 +19,12 @@ env:
   VER: v0.1.${{ github.run_number }}
 
 jobs:
+  # Gate: the release only builds/publishes if parity passes on all platforms.
+  parity:
+    uses: ./.github/workflows/rust-parity.yml
+
   build:
+    needs: parity
     strategy:
       fail-fast: false
       matrix:
