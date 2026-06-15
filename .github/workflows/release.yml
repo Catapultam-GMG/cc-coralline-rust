@@ -1,0 +1,65 @@
+name: release
+
+# Cut a release by pushing a version tag:  git tag v0.1.0 && git push origin v0.1.0
+# Builds the binary natively on each OS and attaches the archives to a GitHub
+# Release. workflow_dispatch builds + uploads run artifacts only (no Release),
+# so you can verify the matrix without publishing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: macos-latest
+            label: macos-arm64
+          - os: macos-13
+            label: macos-x86_64
+          - os: windows-latest
+            label: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build (release)
+        working-directory: rust
+        run: cargo build --release
+      - name: Package
+        id: pkg
+        working-directory: rust
+        run: |
+          ver="${GITHUB_REF_NAME:-dev}"
+          # One archive per platform, named cc-coralline-rust-<version>-<platform>.
+          name="cc-coralline-rust-${ver}-${{ matrix.label }}"
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/release/coralline.exe "dist/coralline.exe"
+            (cd dist && 7z a "${name}.zip" coralline.exe >/dev/null)
+            echo "asset=rust/dist/${name}.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp target/release/coralline "dist/coralline"
+            (cd dist && tar czf "${name}.tar.gz" coralline)
+            echo "asset=rust/dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: ${{ steps.pkg.outputs.asset }}
+      - name: Attach to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.asset }}
+          generate_release_notes: true

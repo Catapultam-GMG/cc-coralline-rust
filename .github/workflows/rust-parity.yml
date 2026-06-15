@@ -19,7 +19,7 @@ jobs:
       run:
         shell: bash   # use Git Bash on Windows so test-parity.sh runs everywhere
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Tooling versions
         run: |
           jq --version
