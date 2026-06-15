@@ -1,4 +1,9 @@
-# coralline — AI Installation Playbook
+# coralline — AI Installation Playbook (bash)
+
+> **⚠️ This installs the original bash statusline.** The recommended build is the native
+> binary **coralline-rs** — faster, no `jq` dependency, cross-platform. Prefer
+> **[rust/INSTALL.md](./rust/INSTALL.md)**. This bash playbook is kept for users who can't
+> run a binary or want the pure-shell version.
 
 > **You are an AI coding assistant** (Claude Code or similar) and a user asked you to install
 > coralline. Follow this playbook top to bottom. Do not skip the interview step — letting the
@@ -146,7 +151,7 @@ otherwise. Show the user the generated palette before writing it.
 
 ```bash
 mkdir -p ~/.claude/coralline/themes
-BASE="https://raw.githubusercontent.com/Nanako0129/coralline/main"
+BASE="https://raw.githubusercontent.com/Catapultam-GMG/cc-coralline-rust/rust"
 curl -fsSL "$BASE/statusline.sh"            -o ~/.claude/coralline/statusline.sh
 curl -fsSL "$BASE/themes/<CHOSEN>.conf"     -o ~/.claude/coralline/themes/<CHOSEN>.conf
 chmod +x ~/.claude/coralline/statusline.sh

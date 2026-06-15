@@ -1,8 +1,8 @@
 # coralline
 
-> A [Powerlevel10k](https://github.com/romkatv/powerlevel10k)-inspired statusline for Claude
-> Code that **installs itself through your AI** — paste one prompt, answer a few questions
-> about colors and layout, done.
+> A fast, [Powerlevel10k](https://github.com/romkatv/powerlevel10k)-inspired statusline for
+> Claude Code — a single **native binary** that **installs itself through your AI**: paste one
+> prompt, answer a few questions about colors and layout, done.
 
 ![All six coralline themes rendered side by side](./assets/hero.png)
 
@@ -16,7 +16,7 @@ This fork ships **[coralline-rs](./rust/)** — a single self-contained native b
   the cost no longer multiplies across many parallel sessions at `refreshInterval: 1`.
 - **No `jq` dependency** (`git` optional) — one static binary, nothing to install.
 - **Cross-platform**: Linux, macOS (arm64 + x86_64), Windows — verified byte-identical
-  to the bash renderer by CI on all three, plus no-console-window flashing on Windows.
+  to the bash renderer by CI on all three.
 - **Extra segment** beyond upstream: `worktree` — the linked-worktree name as its own
   `⑂` pill (compose with `project` + `dir`).
 
@@ -29,8 +29,8 @@ remains fully supported.
 Paste this into Claude Code:
 
 ```text
-Please install coralline for me:
-fetch https://raw.githubusercontent.com/Nanako0129/coralline/main/INSTALL.md
+Please install coralline-rs (the native Rust build) for me:
+fetch https://raw.githubusercontent.com/Catapultam-GMG/cc-coralline-rust/rust/rust/INSTALL.md
 and follow the playbook in it.
 ```
 
@@ -48,6 +48,7 @@ config editing required.
 |---|---|
 | `dir` | current directory, long paths collapsed to `~/a/…/z` |
 | `project` | repo name (`⬢`), stable across every worktree; hidden outside a git repo |
+| `worktree` | linked-worktree name (`⑂`) — coralline-rs addition; hidden in the main worktree |
 | `git` | branch, staged `+` / modified `!` / untracked `?`, ahead `⇡` behind `⇣` |
 | `model` | active Claude model |
 | `ctx` | context-window gauge, input/output/cache token counts |
@@ -63,37 +64,54 @@ Gauges change color as they fill: green → yellow at 50% → red at 75% (thresh
 
 ## Why it's fast
 
-The statusline is just a local shell script: it makes no network or API calls and uses zero
-tokens. Claude Code pipes the session JSON to it on stdin and renders whatever it prints.
-
-It runs every second (`refreshInterval: 1`), so the script is built to be cheap on CPU: one
-`jq` invocation extracts every field at once, and one `git status --porcelain=v2 --branch`
-call provides branch, dirty state, and ahead/behind together. No `bc`, no per-field subprocess
-spam. Works on stock macOS bash 3.2 and any Linux bash.
+coralline-rs is a single native binary — no `bash`, no `jq`, no per-render subprocess chain. It
+makes no network or API calls and uses zero tokens: Claude Code pipes the session JSON to it on
+stdin and renders whatever it prints. A render is a native process spawn (~10 ms) plus a
+sub-millisecond parse, so it stays cheap at `refreshInterval: 1` even across many parallel
+sessions. Git is read straight from `.git` — the branch instantly from `HEAD`, and dirty marks /
+ahead-behind from a cache refreshed in the background — so the foreground never blocks on `git`.
 
 ## Manual install
 
+Grab the binary for your platform (these are stable always-latest links) and put it on `PATH`:
+
 ```bash
-git clone https://github.com/Nanako0129/coralline ~/.claude/coralline-src
-mkdir -p ~/.claude/coralline/themes
-cp ~/.claude/coralline-src/statusline.sh ~/.claude/coralline/
-cp ~/.claude/coralline-src/themes/claude-coral.conf ~/.claude/coralline/themes/
+# Linux x86_64 — see Releases for macOS arm64/x86_64 and Windows
+mkdir -p ~/bin
+curl -fsSL https://github.com/Catapultam-GMG/cc-coralline-rust/releases/latest/download/cc-coralline-rust-linux-x86_64.tar.gz | tar -xz -C ~/bin
 ```
 
-Then add to `~/.claude/settings.json`:
+Or build it yourself: `cd rust && cargo build --release` (see [rust/README.md](./rust/README.md)).
+Then register it in `~/.claude/settings.json`:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "bash ~/.claude/coralline/statusline.sh",
+    "command": "/home/you/bin/coralline",
     "refreshInterval": 1
   }
 }
 ```
 
-> **Note:** requires `jq` and a [Nerd Font](https://www.nerdfonts.com/) terminal.
-> No Nerd Font? Set `VL_ASCII=1` in your config for a glyph-free rendering.
+> On **Windows**, use a forward-slash path (`C:/Users/you/bin/coralline.exe`) — Claude Code runs
+> the command through Git Bash, which eats backslashes. A [Nerd Font](https://www.nerdfonts.com/)
+> terminal is recommended; without one, set `VL_ASCII=1`.
+
+<details>
+<summary>Prefer the original bash statusline?</summary>
+
+It's still here — no compiler needed, but it requires `jq`:
+
+```bash
+git clone https://github.com/Catapultam-GMG/cc-coralline-rust ~/.claude/coralline-src
+mkdir -p ~/.claude/coralline/themes
+cp ~/.claude/coralline-src/statusline.sh ~/.claude/coralline/
+cp ~/.claude/coralline-src/themes/claude-coral.conf ~/.claude/coralline/themes/
+```
+
+…then set `"command": "bash ~/.claude/coralline/statusline.sh"` in `settings.json`.
+</details>
 
 ## Configuration
 
@@ -180,6 +198,10 @@ glyphs, gauges that shift color as they fill — is a loving tribute to
 can be. Thanks also to the wider [powerline](https://github.com/powerline/powerline) lineage
 that started it all, and to [Nerd Fonts](https://www.nerdfonts.com/) for the glyphs that make
 the pill shapes possible.
+
+Above all, this fork stands on [coralline](https://github.com/Nanako0129/coralline) by
+[@Nanako0129](https://github.com/Nanako0129) — coralline-rs is a Rust port of that project,
+and the bash statusline here is their original work.
 
 As for the name: coralline algae build reefs one thin, colorful layer at a time —
 and **coral·line** is exactly what this is: a line, in Claude's coral.
