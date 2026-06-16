@@ -49,7 +49,7 @@ Use your interactive question tool (e.g. `AskUserQuestion`); otherwise ask in
 plain text. Ask these five, showing theme previews from the
 [main README](../README.md) gallery so they can compare:
 
-1. **Theme** — claude-coral · catppuccin-mocha · nord · gruvbox-dark · tokyo-night · mono
+1. **Theme** — claude-coral · catppuccin-mocha · nord · gruvbox-dark · tokyo-night · dracula · mono
 2. **Style** — `pill` (powerline) or `lean` (flat p10k text)
 3. **Layout** — `auto` (responsive, wraps when narrow) or `fixed` (pinned rows)
 4. **Clock** — `12h` / `24h` / `off`, and seconds on/off

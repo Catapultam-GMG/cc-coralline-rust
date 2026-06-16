@@ -217,17 +217,58 @@ impl<'a> Ctx<'a> {
         });
     }
 
+    fn seg_dir(&self, segs: &mut Vec<Seg>) {
+        let cfg = self.cfg;
+        let p = self.p;
+        if p.cwd.is_empty() {
+            return;
+        }
+        let short = if !self.home.is_empty() && p.cwd.starts_with(self.home) {
+            format!("~{}", &p.cwd[self.home.len()..])
+        } else {
+            p.cwd.clone()
+        };
+        // Split like bash `set -- $short` with IFS=/: a leading '/' yields
+        // a leading empty field, so "/a/b/c/d" counts as 5 fields (and the
+        // rebuilt "$1/$2/…/$last" keeps the leading slash). Don't drop empties.
+        let parts: Vec<&str> = short.split('/').collect();
+        let disp = if parts.len() as i64 > cfg.path_depth && parts.len() >= 2 {
+            format!("{}/{}/\u{2026}/{}", parts[0], parts[1], parts[parts.len() - 1])
+        } else {
+            short
+        };
+        self.push(
+            segs,
+            &cfg.bg_dir,
+            format!("{BOLD}{} {} {NORM}", self.fg_text, disp),
+        );
+    }
+
     fn seg(&self, name: &str, segs: &mut Vec<Seg>) {
         let cfg = self.cfg;
         let p = self.p;
         match name {
             "project" => {
+                // Repo-root name in a repo; outside one fall back to `dir` so a
+                // `project`-in-place-of-`dir` layout still shows a path — unless
+                // `dir` is already in the active layout (avoids rendering twice).
                 if self.git.root.is_empty() {
+                    let active =
+                        format!(" {} {} {} ", cfg.segments, cfg.segments2, cfg.segments3);
+                    if active.contains(" dir ") {
+                        return;
+                    }
+                    self.seg_dir(segs);
                     return;
                 }
+                let bg = if cfg.bg_project.is_empty() {
+                    &cfg.bg_dir
+                } else {
+                    &cfg.bg_project
+                };
                 self.push(
                     segs,
-                    &cfg.bg_dir,
+                    bg,
                     format!(
                         "{BOLD}{} \u{2B22} {} {NORM}",
                         self.fg_text,
@@ -246,30 +287,7 @@ impl<'a> Ctx<'a> {
                     format!("{BOLD}{} \u{2442} {} {NORM}", self.fg_text, self.git.wt_name),
                 );
             }
-            "dir" => {
-                if p.cwd.is_empty() {
-                    return;
-                }
-                let short = if !self.home.is_empty() && p.cwd.starts_with(self.home) {
-                    format!("~{}", &p.cwd[self.home.len()..])
-                } else {
-                    p.cwd.clone()
-                };
-                // Split like bash `set -- $short` with IFS=/: a leading '/' yields
-                // a leading empty field, so "/a/b/c/d" counts as 5 fields (and the
-                // rebuilt "$1/$2/…/$last" keeps the leading slash). Don't drop empties.
-                let parts: Vec<&str> = short.split('/').collect();
-                let disp = if parts.len() as i64 > cfg.path_depth && parts.len() >= 2 {
-                    format!("{}/{}/\u{2026}/{}", parts[0], parts[1], parts[parts.len() - 1])
-                } else {
-                    short
-                };
-                self.push(
-                    segs,
-                    &cfg.bg_dir,
-                    format!("{BOLD}{} {} {NORM}", self.fg_text, disp),
-                );
-            }
+            "dir" => self.seg_dir(segs),
             "git" => {
                 if self.git.branch.is_empty() {
                     return;

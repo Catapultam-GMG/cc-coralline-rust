@@ -31,7 +31,7 @@ check(){ # $1=label  (reads conf on stdin into $tmp/conf, COLUMNS via $2)
   else printf '  ✗ %s\n' "$label"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
 }
 
-for theme in claude-coral catppuccin-mocha nord gruvbox-dark tokyo-night mono; do
+for theme in claude-coral catppuccin-mocha nord gruvbox-dark tokyo-night mono dracula; do
   printf '. %s/themes/%s.conf\nVL_SEGMENTS="%s"\n' "$RT" "$theme" "$SEGS" > "$tmp/conf"
   check "theme: $theme"
 done
@@ -39,6 +39,26 @@ printf '. %s/themes/claude-coral.conf\nVL_STYLE="lean"\nVL_LEAN_SEP=" "\nVL_SEGM
 printf '. %s/themes/claude-coral.conf\nVL_LAYOUT="auto"\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "layout: auto wrap (COLUMNS=50)" 50
 printf '. %s/themes/claude-coral.conf\nVL_ASCII=1\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "ascii mode"
 printf '. %s/themes/claude-coral.conf\nVL_CLOCK="24h"\nVL_SEGMENTS="clock"\n' "$RT" > "$tmp/conf"; check "clock: 24h"
+
+# project segment, git-less fallback (sample cwd is not a repo here, so GIT_ROOT
+# is empty for both renderers): bare `project` falls back to the dir pill, but
+# `dir project` suppresses the fallback so the path renders only once.
+printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="project"\n' "$RT" > "$tmp/conf"; check "project: git-less fallback to dir"
+printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="dir project"\n' "$RT" > "$tmp/conf"; check "project: no double-dir when dir present"
+
+# project segment, in a real repo with VL_BG_PROJECT (dracula's pink ≠ dir cyan):
+# create a repo and diff bash vs rust on a cwd inside it, so the project pill's
+# own background color is exercised end-to-end.
+prroot=$(mktemp -d)
+git init -q "$prroot/repo"
+git -C "$prroot/repo" -c user.email=a@b.c -c user.name=ci commit -q --allow-empty -m init
+if command -v cygpath >/dev/null 2>&1; then prp=$(cygpath -m "$prroot/repo"); else prp="$prroot/repo"; fi
+printf '. %s/themes/dracula.conf\nVL_SEGMENTS="project"\n' "$RT" > "$tmp/conf"
+printf '{"cwd":"%s"}' "$prp" | CORALLINE_CONFIG="$tmp/conf" bash "$US" 2>/dev/null | mask > "$tmp/b"
+printf '{"cwd":"%s"}' "$prp" | CORALLINE_CONFIG="$tmp/conf" "$EXE"      2>/dev/null | mask > "$tmp/e"
+if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "project: in-repo VL_BG_PROJECT pill"; pass=$((pass+1))
+else printf '  ✗ %s\n' "project: in-repo VL_BG_PROJECT pill"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+rm -rf "$prroot"
 
 # Feature check (NO upstream oracle — the worktree segment is a coralline-rs
 # extension): create a real linked worktree and assert its ⑂ pill renders.

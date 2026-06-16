@@ -31,6 +31,7 @@ pub struct Config {
     pub sep: String,
     pub git_ttl: i64,
     pub bg_dir: String,
+    pub bg_project: String,
     pub bg_wt: String,
     pub bg_git_ok: String,
     pub bg_git_dirty: String,
@@ -78,6 +79,7 @@ impl Default for Config {
             sep: "\u{E0B0}".into(),
             git_ttl: 300,
             bg_dir: "81,166,199".into(),
+            bg_project: "".into(), // optional; falls back to bg_dir when empty
             bg_wt: "152,130,190".into(),
             bg_git_ok: "65".into(),
             bg_git_dirty: "130".into(),
@@ -173,6 +175,7 @@ impl Config {
             "VL_CAP_R" => self.cap_r = v,
             "VL_SEP" => self.sep = v,
             "VL_BG_DIR" => self.bg_dir = v,
+            "VL_BG_PROJECT" => self.bg_project = v,
             "VL_BG_WT" => self.bg_wt = v,
             "VL_BG_GIT_OK" => self.bg_git_ok = v,
             "VL_BG_GIT_DIRTY" => self.bg_git_dirty = v,
