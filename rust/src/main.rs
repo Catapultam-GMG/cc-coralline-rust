@@ -45,6 +45,7 @@ pub struct Payload {
     pub lines_del: i64,
     pub out_style: String,
     pub dur_ms: i64,
+    pub effort: String,
 }
 
 fn main() {
@@ -147,6 +148,7 @@ fn extract(j: &Json) -> Payload {
         lines_del: i(&["cost", "total_lines_removed"]),
         out_style: s(&["output_style", "name"]),
         dur_ms: i(&["cost", "total_duration_ms"]),
+        effort: s(&["effort", "level"]),
     }
 }
 
