@@ -35,7 +35,38 @@ fn bg(spec: &str) -> String {
     color(spec, 48)
 }
 
-/// Visible width: char count with ANSI escape sequences (ESC…m) stripped.
+/// Terminal display columns of a code point, matching upstream statusline.sh's
+/// seg_len(): wide CJK / kana / Hangul / fullwidth / emoji count as 2, combining
+/// and zero-width marks as 0, everything else as 1.
+fn char_width(cp: u32) -> usize {
+    if cp < 768 {
+        return 1; // ASCII + Latin fast path
+    }
+    let in_range = |lo: u32, hi: u32| cp >= lo && cp <= hi;
+    // combining / ZWSP / variation selector → 0 columns
+    if in_range(768, 879) || in_range(8203, 8207) || in_range(65024, 65039) {
+        0
+    // East-Asian wide / fullwidth / emoji → 2 columns
+    } else if in_range(4352, 4447)
+        || in_range(11904, 42191)
+        || in_range(44032, 55203)
+        || in_range(63744, 64255)
+        || in_range(65040, 65049)
+        || in_range(65072, 65103)
+        || in_range(65280, 65376)
+        || in_range(65504, 65510)
+        || in_range(127744, 129791)
+        || in_range(131072, 262143)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+/// Visible display width (terminal columns) with ANSI escape sequences (ESC…m)
+/// stripped. Counts columns, not code points, so wide CJK/emoji and zero-width
+/// marks measure correctly — drives auto-layout wrapping in parity with bash.
 fn seg_len(s: &str) -> usize {
     let mut n = 0usize;
     let mut chars = s.chars().peekable();
@@ -47,7 +78,7 @@ fn seg_len(s: &str) -> usize {
                 }
             }
         } else {
-            n += 1;
+            n += char_width(c as u32);
         }
     }
     n
