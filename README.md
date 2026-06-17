@@ -58,6 +58,7 @@ config editing required.
 | `lines` | lines added/removed this session |
 | `style` | active output style |
 | `duration` | session wall-clock duration |
+| `effort` | reasoning effort level (`ψ`) — `low` / `med` / `high` / `xhigh` / `max` |
 | `stash` | git stash count |
 
 Gauges change color as they fill: green → yellow at 50% → red at 75% (thresholds configurable).
@@ -112,6 +113,22 @@ cp ~/.claude/coralline-src/themes/claude-coral.conf ~/.claude/coralline/themes/
 
 …then set `"command": "bash ~/.claude/coralline/statusline.sh"` in `settings.json`.
 </details>
+
+### Platform support
+
+The native binary is a self-contained executable — no shell, no `jq`, no Git Bash:
+
+| Platform | Native binary | Bash fallback |
+|---|---|---|
+| macOS | ✅ supported | ✅ supported (stock bash 3.2) |
+| Linux | ✅ supported | ✅ supported |
+| Windows + Git Bash | ✅ supported | ✅ supported (needs `jq`) |
+| Windows without Git Bash | ✅ supported — Claude Code runs the `.exe` directly | ❌ Claude Code falls back to PowerShell, which can't run the bash script |
+
+> **Windows note:** the native `.exe` is the recommended path — it runs directly from
+> `settings.json` with no Git Bash or `jq` dependency. The bash fallback still works under Git
+> Bash; its render path stays cheap under Git Bash's emulated `fork()` — one `jq`, one `git`, and
+> no per-field subprocess spawning.
 
 ## Configuration
 

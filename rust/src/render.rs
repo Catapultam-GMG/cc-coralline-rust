@@ -391,6 +391,18 @@ impl<'a> Ctx<'a> {
                     format!("{} \u{29D6} {} ", self.fg_text, fmt_duration(p.dur_ms)),
                 );
             }
+            // reasoning effort level (low/medium/high/xhigh/max); glyph ψ is editable
+            "effort" => {
+                if p.effort.is_empty() {
+                    return;
+                }
+                let label = if p.effort == "medium" { "med" } else { p.effort.as_str() };
+                self.push(
+                    segs,
+                    &cfg.bg_effort,
+                    format!("{} \u{3C8} {} ", self.fg_text, label),
+                );
+            }
             "stash" => {
                 if self.git.branch.is_empty() {
                     return;

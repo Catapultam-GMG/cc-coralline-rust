@@ -20,7 +20,19 @@ binary in `settings.json`:
 
 ## Step 1 — Get the binary
 
-Prefer a prebuilt release asset for the user's platform from
+**Ask the user how they want the binary** (use your interactive question tool if
+you have one, otherwise ask in plain text):
+
+> Do you want me to **(A) download the prebuilt release** binary (built by CI — fastest, no
+> toolchain needed), or **(B) build it locally** from source with `cargo` (needs the Rust
+> toolchain, but you compile it yourself)?
+
+Then follow the matching path. If the user has no preference, default to **(A)
+download the release** — it's faster and needs no toolchain.
+
+### Option A — Download the CI-built release
+
+Grab the prebuilt asset for the user's platform from
 <https://github.com/Catapultam-GMG/cc-coralline-rust/releases> (one archive per
 platform: `linux-x86_64`, `macos-arm64`, `macos-x86_64`, `windows-x86_64`).
 Download, extract the `coralline[.exe]` binary, and place it on PATH:
@@ -28,10 +40,12 @@ Download, extract the `coralline[.exe]` binary, and place it on PATH:
 ```bash
 # example: Linux x86_64 latest release
 mkdir -p ~/bin
-curl -fsSL https://github.com/Catapultam-GMG/cc-coralline-rust/releases/latest/download/cc-coralline-rust-vX.Y-linux-x86_64.tar.gz | tar -xz -C ~/bin
+curl -fsSL https://github.com/Catapultam-GMG/cc-coralline-rust/releases/latest/download/cc-coralline-rust-linux-x86_64.tar.gz | tar -xz -C ~/bin
 ```
 
-Or build from source (needs the Rust toolchain — `rustup`):
+### Option B — Build locally from source
+
+Needs the Rust toolchain (`rustup`):
 
 ```bash
 command -v cargo || echo "MISSING: install Rust from https://rustup.rs"
@@ -41,7 +55,7 @@ mkdir -p ~/bin && cp target/release/coralline* ~/bin/
 ```
 
 `git` is optional (the git/project/stash segments silently disappear without it).
-There is **no `jq` dependency**.
+There is **no `jq` dependency** either way.
 
 ## Step 2 — Interview the user
 
@@ -54,8 +68,9 @@ plain text. Ask these five, showing theme previews from the
 3. **Layout** — `auto` (responsive, wraps when narrow) or `fixed` (pinned rows)
 4. **Clock** — `12h` / `24h` / `off`, and seconds on/off
 5. **Segments** — default `dir git model ctx limit5h limit7d cost clock`; offer
-   the extras `project worktree lines style duration stash` (`worktree` is a
-   coralline-rs addition), and `VL_NAME_MAX` if they have long branch/repo names.
+   the extras `project worktree lines style duration effort stash` (`worktree` is a
+   coralline-rs addition; `effort` shows the reasoning effort level), and
+   `VL_NAME_MAX` if they have long branch/repo names.
 
 ## Step 3 — Install the chosen theme
 

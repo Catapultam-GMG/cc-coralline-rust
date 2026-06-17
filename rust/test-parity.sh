@@ -21,7 +21,7 @@ command -v perl >/dev/null || { echo "need perl (for masking)"; exit 2; }
 [ -x "$EXE" ] || { echo "build first: cargo build --release"; exit 2; }
 
 mask(){ perl -CSD -pe 's/\d{1,2}:\d{2}:\d{2}/TIME/g; s/\x{21ba}[0-9a-z]+/CD/g'; }
-SEGS="dir model ctx limit5h limit7d cost clock lines style duration"
+SEGS="dir model ctx limit5h limit7d cost clock lines style duration effort"
 tmp=$(mktemp -d); pass=0; fail=0
 check(){ # $1=label  (reads conf on stdin into $tmp/conf, COLUMNS via $2)
   local label="$1" cols="${2:-}"
