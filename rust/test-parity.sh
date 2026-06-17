@@ -40,6 +40,16 @@ printf '. %s/themes/claude-coral.conf\nVL_LAYOUT="auto"\nVL_SEGMENTS="%s"\n' "$R
 printf '. %s/themes/claude-coral.conf\nVL_ASCII=1\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "ascii mode"
 printf '. %s/themes/claude-coral.conf\nVL_CLOCK="24h"\nVL_SEGMENTS="clock"\n' "$RT" > "$tmp/conf"; check "clock: 24h"
 
+# Display-width wrapping: a CJK + emoji path must wrap at the same point in both
+# renderers. seg_len counts terminal columns (wide chars = 2), so a byte- or
+# code-point count would mis-wrap here and the diff would catch it.
+printf '. %s/themes/claude-coral.conf\nVL_LAYOUT="auto"\nVL_SEGMENTS="dir model ctx clock"\n' "$RT" > "$tmp/conf"
+WIN='{"workspace":{"current_dir":"/home/開発/プロジェクト/日本語🎌/src"},"model":{"display_name":"Claude Fable 5"},"context_window":{"used_percentage":62.4,"total_input_tokens":1234567,"total_output_tokens":2345}}'
+COLUMNS=40 CORALLINE_CONFIG="$tmp/conf" bash "$US" <<<"$WIN" 2>/dev/null | mask > "$tmp/b"
+COLUMNS=40 CORALLINE_CONFIG="$tmp/conf" "$EXE"      <<<"$WIN" 2>/dev/null | mask > "$tmp/e"
+if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "width: CJK+emoji auto-wrap (COLUMNS=40)"; pass=$((pass+1))
+else printf '  ✗ %s\n' "width: CJK+emoji auto-wrap (COLUMNS=40)"; diff "$tmp/b" "$tmp/e" | head -6; fail=$((fail+1)); fi
+
 # project segment, git-less fallback (sample cwd is not a repo here, so GIT_ROOT
 # is empty for both renderers): bare `project` falls back to the dir pill, but
 # `dir project` suppresses the fallback so the path renders only once.
