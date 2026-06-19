@@ -71,13 +71,29 @@ gallery, and [`INSTALL.md`](INSTALL.md) for the guided (AI-agent) installer.
 
 ## Beyond upstream
 
-One additive segment not in upstream coralline:
+Additive features not in upstream coralline (inert by default, so output stays
+byte-identical until you opt in):
 
-- **`worktree`** — when you're in a linked git worktree, shows its name as its own
-  `⑂` pill (background `VL_BG_WT`). Compose with `project` (stable repo-root name)
-  and `dir`, e.g. `VL_SEGMENTS="project worktree dir git …"`. Hidden in the main
-  worktree / outside a repo. `test-parity.sh` includes a dedicated check for it
+- **`worktree` segment** — when you're in a linked git worktree, shows its name as
+  its own `⑂` pill (background `VL_BG_WT`). Compose with `project` (stable repo-root
+  name) and `dir`, e.g. `VL_SEGMENTS="project worktree dir git …"`. Hidden in the
+  main worktree / outside a repo. `test-parity.sh` has a dedicated check for it
   (there's no upstream output to diff against).
+
+- **`VL_PROJECT_ROOTS`** — a comma/semicolon list of project-root prefixes (e.g.
+  `VL_PROJECT_ROOTS="D:/GitHub;C:/work"`) that the `dir` segment strips so deep
+  repo paths render relative to their root, marked with a `⌂` house glyph
+  (suppressed under `VL_ASCII=1`). `$HOME`→`~` collapsing still takes precedence;
+  depth elision (`VL_PATH_DEPTH`) still applies to the shortened result. Unset by
+  default → `dir` stays byte-identical to bash.
+
+- **Native float carrier** — the float readout (`VL_FLOAT=1`, writing
+  `VL_FLOAT_FILE`) is emitted by the binary just like upstream's bash. The example
+  iTerm2 carrier in [`../example/float-display-iterm2/`](../example/float-display-iterm2/)
+  is also built into the binary: run `coralline --float-carrier` (loop, clears the
+  bar on exit) or `coralline --float-carrier --once` from an interactive shell, no
+  bash dependency. Honors the same `CORALLINE_FLOAT_FILE` / `_INTERVAL` / `_STALE`
+  / `_TTY` env knobs as the script.
 
 ## Credits
 

@@ -31,7 +31,7 @@ check(){ # $1=label  (reads conf on stdin into $tmp/conf, COLUMNS via $2)
   else printf '  ✗ %s\n' "$label"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
 }
 
-for theme in claude-coral catppuccin-mocha nord gruvbox-dark tokyo-night mono dracula; do
+for theme in claude-coral catppuccin-mocha nord gruvbox-dark tokyo-night mono dracula reverie lunar-pink; do
   printf '. %s/themes/%s.conf\nVL_SEGMENTS="%s"\n' "$RT" "$theme" "$SEGS" > "$tmp/conf"
   check "theme: $theme"
 done

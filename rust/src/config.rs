@@ -15,12 +15,17 @@ pub struct Config {
     pub segments: String,
     pub segments2: String,
     pub segments3: String,
+    pub float: bool,
+    pub float_segments: String,
+    pub float_sep: String,
+    pub float_file: String,
     pub bar_width: i64,
     pub bar_fill: String,
     pub bar_empty: String,
     pub clock: String,
     pub clock_seconds: bool,
     pub path_depth: i64,
+    pub project_roots: Vec<String>,
     pub name_max: i64,
     pub cost_decimals: usize,
     pub warn_pct: i64,
@@ -35,6 +40,7 @@ pub struct Config {
     pub bg_wt: String,
     pub bg_git_ok: String,
     pub bg_git_dirty: String,
+    pub bg_stash: String,
     pub bg_model: String,
     pub bg_ctx: String,
     pub bg_5h: String,
@@ -64,12 +70,17 @@ impl Default for Config {
             segments: "dir git model ctx limit5h limit7d cost clock".into(),
             segments2: "".into(),
             segments3: "".into(),
+            float: false,
+            float_segments: "model ctx cost".into(),
+            float_sep: "  \u{b7}  ".into(),
+            float_file: "".into(), // resolved to $HOME/.claude/coralline/float.txt in load()
             bar_width: 5,
             bar_fill: "▰".into(),
             bar_empty: "▱".into(),
             clock: "12h".into(),
             clock_seconds: true,
             path_depth: 4,
+            project_roots: Vec::new(),
             name_max: 0,
             cost_decimals: 2,
             warn_pct: 50,
@@ -84,6 +95,7 @@ impl Default for Config {
             bg_wt: "152,130,190".into(),
             bg_git_ok: "65".into(),
             bg_git_dirty: "130".into(),
+            bg_stash: "".into(), // optional; falls back to bg_git_ok when empty
             bg_model: "173".into(),
             bg_ctx: "238".into(),
             bg_5h: "237".into(),
@@ -111,6 +123,11 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("{home}/.claude/coralline.conf")));
         c.apply_file(&conf, home, 0);
+        if c.float_file.is_empty() {
+            c.float_file = format!("{home}/.claude/coralline/float.txt");
+        } else {
+            c.float_file = expand(&c.float_file, home);
+        }
         c.post();
         c
     }
@@ -161,12 +178,23 @@ impl Config {
             "VL_SEGMENTS" => self.segments = v,
             "VL_SEGMENTS2" => self.segments2 = v,
             "VL_SEGMENTS3" => self.segments3 = v,
+            "VL_FLOAT" => self.float = v == "1",
+            "VL_FLOAT_SEGMENTS" => self.float_segments = v,
+            "VL_FLOAT_SEP" => self.float_sep = v,
+            "VL_FLOAT_FILE" => self.float_file = v,
             "VL_BAR_WIDTH" => self.bar_width = v.parse().unwrap_or(self.bar_width),
             "VL_BAR_FILL" => self.bar_fill = v,
             "VL_BAR_EMPTY" => self.bar_empty = v,
             "VL_CLOCK" => self.clock = v,
             "VL_CLOCK_SECONDS" => self.clock_seconds = v == "1",
             "VL_PATH_DEPTH" => self.path_depth = v.parse().unwrap_or(self.path_depth),
+            "VL_PROJECT_ROOTS" => {
+                self.project_roots = v
+                    .split([',', ';'])
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
             "VL_NAME_MAX" => self.name_max = v.parse().unwrap_or(self.name_max),
             "VL_COST_DECIMALS" => self.cost_decimals = v.parse().unwrap_or(self.cost_decimals),
             "VL_WARN_PCT" => self.warn_pct = v.parse().unwrap_or(self.warn_pct),
@@ -181,6 +209,7 @@ impl Config {
             "VL_BG_WT" => self.bg_wt = v,
             "VL_BG_GIT_OK" => self.bg_git_ok = v,
             "VL_BG_GIT_DIRTY" => self.bg_git_dirty = v,
+            "VL_BG_STASH" => self.bg_stash = v,
             "VL_BG_MODEL" => self.bg_model = v,
             "VL_BG_CTX" => self.bg_ctx = v,
             "VL_BG_5H" => self.bg_5h = v,
