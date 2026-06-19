@@ -21,6 +21,7 @@ use std::panic::AssertUnwindSafe;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod config;
+mod float;
 mod git;
 mod json;
 mod render;
@@ -53,6 +54,11 @@ fn main() {
     if args.len() >= 3 && args[1] == "--git-refresh" {
         let coralline_dir = format!("{}/.claude/coralline", home_dir());
         git::refresh(&args[2], &coralline_dir);
+        return;
+    }
+    if args.len() >= 2 && args[1] == "--float-carrier" {
+        let once = args.iter().any(|a| a == "--once");
+        float::carrier(once);
         return;
     }
     run();
@@ -95,7 +101,13 @@ fn render_all(j: Option<&Json>, home: &str, coralline_dir: &str) -> String {
     let cfg = Config::load(home);
     let p = extract(j);
 
-    let all_segs = format!(" {} {} {} ", cfg.segments, cfg.segments2, cfg.segments3);
+    // Float segments also drive git gathering when VL_FLOAT is on, matching
+    // upstream's `_SEG_SCAN` (so a `git`/`project` float segment has data).
+    let float_segs = if cfg.float { cfg.float_segments.as_str() } else { "" };
+    let all_segs = format!(
+        " {} {} {} {} ",
+        cfg.segments, cfg.segments2, cfg.segments3, float_segs
+    );
     let uses = |name: &str| all_segs.contains(&format!(" {name} "));
     let use_git = uses("git") || uses("stash") || uses("project") || uses("worktree");
 

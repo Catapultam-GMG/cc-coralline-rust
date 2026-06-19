@@ -84,6 +84,66 @@ fn seg_len(s: &str) -> usize {
     n
 }
 
+/// Normalize a path prefix for matching: backslashes → '/', and an MSYS-style
+/// leading "/c/Users" drive → "c:/Users".
+fn normalize_prefix(dir: &str) -> String {
+    let mut h = dir.replace('\\', "/");
+    let hb = h.as_bytes();
+    if hb.len() >= 3 && hb[0] == b'/' && hb[1].is_ascii_alphabetic() && hb[2] == b'/' {
+        h = format!("{}:{}", &h[1..2], &h[2..]);
+    }
+    h
+}
+
+/// If `short` is under one of the configured project roots, rewrite it relative
+/// to that root in place and return true. Matching is case-insensitive (Windows
+/// paths) on '/'-normalized forms. Returns false (leaving `short` untouched) when
+/// no root is configured or matches. Native-only extension over upstream.
+fn strip_project_root(short: &mut String, roots: &[String]) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    let low = short.to_lowercase();
+    for root in roots {
+        if root.is_empty() {
+            continue;
+        }
+        let h = normalize_prefix(root);
+        let hlow = h.to_lowercase();
+        if low == hlow {
+            // Sitting in the root itself: keep just its basename.
+            if let Some(base) = short.rsplit('/').find(|p| !p.is_empty()) {
+                *short = base.to_string();
+            }
+            return true;
+        } else if low.starts_with(&format!("{hlow}/")) {
+            let cut = (h.len() + 1).min(short.len());
+            *short = short[cut..].to_string();
+            return true;
+        }
+    }
+    false
+}
+
+/// Plain text of `s` with ANSI escape sequences (ESC…m) removed. Mirrors
+/// upstream statusline.sh's strip_ansi, used to build the float readout.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for d in chars.by_ref() {
+                if d == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn make_bar(pct: i64, width: i64, fill: &str, empty: &str) -> String {
     let mut filled = (pct * width + 50) / 100;
     if filled > width {
@@ -254,20 +314,28 @@ impl<'a> Ctx<'a> {
         if p.cwd.is_empty() {
             return;
         }
-        let short = if !self.home.is_empty() && p.cwd.starts_with(self.home) {
+        let mut short = if !self.home.is_empty() && p.cwd.starts_with(self.home) {
             format!("~{}", &p.cwd[self.home.len()..])
         } else {
             p.cwd.clone()
         };
+        // VL_PROJECT_ROOTS (native-only extension): when home didn't already win,
+        // strip a configured project-root prefix (e.g. D:/GitHub) so deep repo
+        // paths render relative to it, marked with a house glyph. With no roots
+        // configured this is inert and output stays byte-identical to bash.
+        let in_root = !short.starts_with('~') && strip_project_root(&mut short, &cfg.project_roots);
         // Split like bash `set -- $short` with IFS=/: a leading '/' yields
         // a leading empty field, so "/a/b/c/d" counts as 5 fields (and the
         // rebuilt "$1/$2/…/$last" keeps the leading slash). Don't drop empties.
         let parts: Vec<&str> = short.split('/').collect();
-        let disp = if parts.len() as i64 > cfg.path_depth && parts.len() >= 2 {
+        let mut disp = if parts.len() as i64 > cfg.path_depth && parts.len() >= 2 {
             format!("{}/{}/\u{2026}/{}", parts[0], parts[1], parts[parts.len() - 1])
         } else {
             short
         };
+        if in_root && !cfg.ascii {
+            disp = format!("\u{2302} {disp}"); // ⌂ marks a stripped project root
+        }
         self.push(
             segs,
             &cfg.bg_dir,
@@ -440,11 +508,12 @@ impl<'a> Ctx<'a> {
                 }
                 let n = self.stash_count();
                 if n > 0 {
-                    self.push(
-                        segs,
-                        &cfg.bg_git_ok,
-                        format!("{} \u{2691} {} ", self.fg_text, n),
-                    );
+                    let bgc = if cfg.bg_stash.is_empty() {
+                        &cfg.bg_git_ok
+                    } else {
+                        &cfg.bg_stash
+                    };
+                    self.push(segs, bgc, format!("{} \u{2691} {} ", self.fg_text, n));
                 }
             }
             _ => {}
@@ -502,6 +571,37 @@ impl<'a> Ctx<'a> {
             &cfg.bg_clock,
             format!("{} \u{2299} {}{} ", self.fg_text, t, ap),
         );
+    }
+
+    /// Build VL_FLOAT_SEGMENTS as a single plain-text (ANSI-stripped) line and
+    /// write it atomically to VL_FLOAT_FILE. Mirrors upstream emit_float: a
+    /// "bring your own carrier" hook (see `coralline --float-carrier`).
+    fn emit_float(&self) {
+        let cfg = self.cfg;
+        let segs = self.build(&cfg.float_segments);
+        let mut line = String::new();
+        for s in &segs {
+            let plain = strip_ansi(&s.txt);
+            let t = plain.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if !line.is_empty() {
+                line.push_str(&cfg.float_sep);
+            }
+            line.push_str(t);
+        }
+        let path = std::path::Path::new(&cfg.float_file);
+        let Some(dir) = path.parent() else { return };
+        let _ = std::fs::create_dir_all(dir);
+        let tmp = dir.join(format!(".float.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp, format!("{line}\n")).is_ok() {
+            if std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     fn stash_count(&self) -> i64 {
@@ -594,6 +694,11 @@ pub fn render(
         fg_warn: fg(&cfg.fg_warn),
         fg_hot: fg(&cfg.fg_hot),
     };
+
+    // Side effect before the main render: emit the plain-text float readout.
+    if cfg.float {
+        ctx.emit_float();
+    }
 
     let mut rows: Vec<String> = Vec::new();
 
