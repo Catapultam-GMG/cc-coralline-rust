@@ -31,7 +31,13 @@ FAKE_HOME = Path(tempfile.gettempdir()) / "vl-home"
 DEMO = FAKE_HOME / "dev" / "coralline"
 
 THEMES = ["claude-coral", "catppuccin-mocha", "nord",
-          "gruvbox-dark", "tokyo-night", "mono", "dracula"]
+          "gruvbox-dark", "tokyo-night", "mono", "dracula",
+          "lunar-pink", "reverie"]
+
+# hero.png is a curated sampler frozen to the original six themes; new themes go
+# in the per-theme gallery (theme-<name>.png) only, so the banner doesn't grow.
+HERO_THEMES = ["claude-coral", "catppuccin-mocha", "nord",
+               "gruvbox-dark", "tokyo-night", "mono"]
 
 # ── Geometry (S = supersampling factor, downscaled at save time) ─────────────
 S = 2
@@ -79,7 +85,8 @@ def pick_glyph(candidates, fallback):
 
 GLYPH_FIX = {
     "⎇": pick_glyph([0xE0A0], "Y"),            # ⎇ → powerline branch
-    "⬡": pick_glyph([0x2B22, 0x25C7], "#"),    # ⬡ → hexagon/diamond
+    "⬡": pick_glyph([0x2B22, 0x25C7], "#"),    # ⬡ → hexagon/diamond (ctx)
+    "⬢": pick_glyph([0x2B22, 0x25CF], "#"),    # ⬢ → filled hexagon/circle (project)
     "⧖": pick_glyph([0xF252, 0xF017, 0x231B], "~"),  # ⧖ → hourglass/clock
 }
 
@@ -281,13 +288,13 @@ def theme_blocks(theme):
         ("limits & cost · low", run_bar(theme, "limit5h limit7d cost", LOW)),
         ("context · running hot", run_bar(theme, "ctx", HIGH)),
         ("limits & cost · running hot", run_bar(theme, "limit5h limit7d cost", HIGH)),
-        ("extras",             run_bar(theme, "lines style duration effort stash", HIGH)),
+        ("extras",             run_bar(theme, "effort lines style duration stash", HIGH)),
     ]
 
 def hero_blocks():
     return [(theme, run_bar(theme, "dir git model clock", MID)
                     + run_bar(theme, "ctx limit5h cost", MID))
-            for theme in THEMES]
+            for theme in HERO_THEMES]
 
 def lean_blocks():
     lean = 'VL_STYLE="lean"\n'
@@ -295,7 +302,7 @@ def lean_blocks():
         ("daily drive",       run_bar("claude-coral", "dir git model clock", LOW, lean)),
         ("context & limits",  run_bar("claude-coral", "ctx limit5h limit7d cost", MID, lean)),
         ("running hot",       run_bar("claude-coral", "ctx limit5h limit7d cost", HIGH, lean)),
-        ("extras",            run_bar("claude-coral", "lines style duration stash", HIGH, lean)),
+        ("extras",            run_bar("claude-coral", "effort lines style duration stash", HIGH, lean)),
         ("same data, pill style", run_bar("claude-coral", "dir git model clock", LOW)),
     ]
 
