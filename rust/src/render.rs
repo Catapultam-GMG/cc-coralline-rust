@@ -103,7 +103,10 @@ fn strip_project_root(short: &mut String, roots: &[String]) -> bool {
     if roots.is_empty() {
         return false;
     }
-    let low = short.to_lowercase();
+    // Normalize the cwd side too: real Windows payloads use backslashes, so match
+    // (and emit the stripped remainder) on a '/'-normalized form.
+    let norm = normalize_prefix(short);
+    let low = norm.to_lowercase();
     for root in roots {
         if root.is_empty() {
             continue;
@@ -112,13 +115,13 @@ fn strip_project_root(short: &mut String, roots: &[String]) -> bool {
         let hlow = h.to_lowercase();
         if low == hlow {
             // Sitting in the root itself: keep just its basename.
-            if let Some(base) = short.rsplit('/').find(|p| !p.is_empty()) {
+            if let Some(base) = norm.rsplit('/').find(|p| !p.is_empty()) {
                 *short = base.to_string();
             }
             return true;
         } else if low.starts_with(&format!("{hlow}/")) {
-            let cut = (h.len() + 1).min(short.len());
-            *short = short[cut..].to_string();
+            let cut = (h.len() + 1).min(norm.len());
+            *short = norm[cut..].to_string();
             return true;
         }
     }
