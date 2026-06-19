@@ -41,6 +41,13 @@ command -v git && bash --version | head -1
 > `apt/dnf install jq` on Linux) before continuing. `git` is optional — the git segment
 > silently disappears without it.
 
+> **Windows:** coralline is a bash script. Claude Code runs it through **Git Bash** when
+> installed, or PowerShell otherwise. If the user is on Windows, confirm Git Bash is present
+> (`git --version` from a Claude Code shell, or check for `C:/Program Files/Git`). If Git Bash
+> is absent, tell the user coralline needs [Git for Windows](https://git-scm.com/download/win)
+> plus `jq`; there is no native PowerShell version yet. Use forward slashes in the
+> `settings.json` command path on Windows.
+
 ## Step 2 — Interview the user
 
 Use your interactive question tool (e.g. `AskUserQuestion`). If you have no such tool, ask in
@@ -96,6 +103,7 @@ lean:   ~/proj  ⎇ main  ◆ Fable 5  ⊙ 14:45     (no backgrounds, colored te
 | `lines` | lines added/removed this session | off |
 | `style` | active output style | off |
 | `duration` | session wall-clock duration | off |
+| `effort` | reasoning effort level (`ψ`) | off |
 | `stash` | git stash count | off |
 | `project` | stable repo name (`⬢`), same across all git worktrees | off |
 

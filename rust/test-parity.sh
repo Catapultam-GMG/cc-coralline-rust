@@ -21,7 +21,7 @@ command -v perl >/dev/null || { echo "need perl (for masking)"; exit 2; }
 [ -x "$EXE" ] || { echo "build first: cargo build --release"; exit 2; }
 
 mask(){ perl -CSD -pe 's/\d{1,2}:\d{2}:\d{2}/TIME/g; s/\x{21ba}[0-9a-z]+/CD/g'; }
-SEGS="dir model ctx limit5h limit7d cost clock lines style duration"
+SEGS="dir model ctx limit5h limit7d cost clock lines style duration effort"
 tmp=$(mktemp -d); pass=0; fail=0
 check(){ # $1=label  (reads conf on stdin into $tmp/conf, COLUMNS via $2)
   local label="$1" cols="${2:-}"
@@ -39,6 +39,16 @@ printf '. %s/themes/claude-coral.conf\nVL_STYLE="lean"\nVL_LEAN_SEP=" "\nVL_SEGM
 printf '. %s/themes/claude-coral.conf\nVL_LAYOUT="auto"\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "layout: auto wrap (COLUMNS=50)" 50
 printf '. %s/themes/claude-coral.conf\nVL_ASCII=1\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "ascii mode"
 printf '. %s/themes/claude-coral.conf\nVL_CLOCK="24h"\nVL_SEGMENTS="clock"\n' "$RT" > "$tmp/conf"; check "clock: 24h"
+
+# Display-width wrapping: a CJK + emoji path must wrap at the same point in both
+# renderers. seg_len counts terminal columns (wide chars = 2), so a byte- or
+# code-point count would mis-wrap here and the diff would catch it.
+printf '. %s/themes/claude-coral.conf\nVL_LAYOUT="auto"\nVL_SEGMENTS="dir model ctx clock"\n' "$RT" > "$tmp/conf"
+WIN='{"workspace":{"current_dir":"/home/開発/プロジェクト/日本語🎌/src"},"model":{"display_name":"Claude Fable 5"},"context_window":{"used_percentage":62.4,"total_input_tokens":1234567,"total_output_tokens":2345}}'
+COLUMNS=40 CORALLINE_CONFIG="$tmp/conf" bash "$US" <<<"$WIN" 2>/dev/null | mask > "$tmp/b"
+COLUMNS=40 CORALLINE_CONFIG="$tmp/conf" "$EXE"      <<<"$WIN" 2>/dev/null | mask > "$tmp/e"
+if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "width: CJK+emoji auto-wrap (COLUMNS=40)"; pass=$((pass+1))
+else printf '  ✗ %s\n' "width: CJK+emoji auto-wrap (COLUMNS=40)"; diff "$tmp/b" "$tmp/e" | head -6; fail=$((fail+1)); fi
 
 # project segment, git-less fallback (sample cwd is not a repo here, so GIT_ROOT
 # is empty for both renderers): bare `project` falls back to the dir pill, but
