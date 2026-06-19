@@ -327,6 +327,13 @@ impl<'a> Ctx<'a> {
         // paths render relative to it, marked with a house glyph. With no roots
         // configured this is inert and output stays byte-identical to bash.
         let in_root = !short.starts_with('~') && strip_project_root(&mut short, &cfg.project_roots);
+        if in_root {
+            // Under a project root, show just the repo name (the first path
+            // component); deeper location lives in the worktree/git segments.
+            if let Some(repo) = short.split('/').find(|s| !s.is_empty()) {
+                short = repo.to_string();
+            }
+        }
         // Split like bash `set -- $short` with IFS=/: a leading '/' yields
         // a leading empty field, so "/a/b/c/d" counts as 5 fields (and the
         // rebuilt "$1/$2/…/$last" keeps the leading slash). Don't drop empties.
