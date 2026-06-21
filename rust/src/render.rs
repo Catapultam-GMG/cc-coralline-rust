@@ -103,7 +103,10 @@ fn strip_project_root(short: &mut String, roots: &[String]) -> bool {
     if roots.is_empty() {
         return false;
     }
-    let low = short.to_lowercase();
+    // Normalize the cwd side too: real Windows payloads use backslashes, so match
+    // (and emit the stripped remainder) on a '/'-normalized form.
+    let norm = normalize_prefix(short);
+    let low = norm.to_lowercase();
     for root in roots {
         if root.is_empty() {
             continue;
@@ -112,13 +115,13 @@ fn strip_project_root(short: &mut String, roots: &[String]) -> bool {
         let hlow = h.to_lowercase();
         if low == hlow {
             // Sitting in the root itself: keep just its basename.
-            if let Some(base) = short.rsplit('/').find(|p| !p.is_empty()) {
+            if let Some(base) = norm.rsplit('/').find(|p| !p.is_empty()) {
                 *short = base.to_string();
             }
             return true;
         } else if low.starts_with(&format!("{hlow}/")) {
-            let cut = (h.len() + 1).min(short.len());
-            *short = short[cut..].to_string();
+            let cut = (h.len() + 1).min(norm.len());
+            *short = norm[cut..].to_string();
             return true;
         }
     }
@@ -324,6 +327,13 @@ impl<'a> Ctx<'a> {
         // paths render relative to it, marked with a house glyph. With no roots
         // configured this is inert and output stays byte-identical to bash.
         let in_root = !short.starts_with('~') && strip_project_root(&mut short, &cfg.project_roots);
+        if in_root {
+            // Under a project root, show just the repo name (the first path
+            // component); deeper location lives in the worktree/git segments.
+            if let Some(repo) = short.split('/').find(|s| !s.is_empty()) {
+                short = repo.to_string();
+            }
+        }
         // Split like bash `set -- $short` with IFS=/: a leading '/' yields
         // a leading empty field, so "/a/b/c/d" counts as 5 fields (and the
         // rebuilt "$1/$2/…/$last" keeps the leading slash). Don't drop empties.
