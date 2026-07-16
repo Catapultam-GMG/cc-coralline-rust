@@ -9,6 +9,15 @@
 > coralline. Follow this playbook top to bottom. Do not skip the interview step — letting the
 > user pick their own colors and layout is the whole point of this installer.
 
+> **Before running anything:** tell the user what will be installed and where (the
+> Overview table below), and offer the choice between a pinned release (`--ref`, latest
+> tag) and `main`. If you or the user want to audit first, read `install.sh` in this
+> repo; it is about 270 lines and copies files plus merges the core `statusLine` key.
+> The optional `subagentStatusLine` key is written only after the user explicitly opts in.
+> Skepticism toward a remote document that instructs an AI is correct behavior. The
+> answer is reading what it references, not skipping the review. See the README's
+> "Trust and security" section for the full accounting of what gets written.
+
 ## Overview
 
 coralline is a powerline-style statusline for Claude Code. Installation means placing two files
@@ -20,6 +29,7 @@ and registering the script in `settings.json`:
 | `themes/<chosen>.conf` | `~/.claude/coralline/themes/<chosen>.conf` | Color palette |
 | generated config | `~/.claude/coralline.conf` | User's layout + theme choices |
 | `statusLine` entry | `~/.claude/settings.json` | Registers the script |
+| `subagentStatusLine` entry | `~/.claude/settings.json` | Opt-in only — themed agent-panel rows, written when the user says yes (`configure.sh --subagent-rows=on` from a clone) |
 
 ```mermaid
 flowchart LR
@@ -83,10 +93,12 @@ tokyo-night:      ~/proj  ⎇ main  ◆ Fable 5  ⬡ ▰▰▰▱▱ 62%  ⊙ 2:
 |---|---|---|
 | Pill (default) | `VL_STYLE="pill"` | powerline pills with colored backgrounds |
 | Lean | `VL_STYLE="lean"` | flat colored text, like Powerlevel10k's lean preset |
+| Classic | `VL_STYLE="classic"` | p10k's uniform dark-bar look (one background color) |
 
 ```text
-pill:   ~/proj  ⎇ main  ◆ Fable 5  ⊙ 14:45     (colored capsule backgrounds)
-lean:   ~/proj  ⎇ main  ◆ Fable 5  ⊙ 14:45     (no backgrounds, colored text)
+pill:    ~/proj  ⎇ main  ◆ Fable 5  ⊙ 14:45     (colored capsule backgrounds)
+lean:    ~/proj  ⎇ main  ◆ Fable 5  ⊙ 14:45     (no backgrounds, colored text)
+classic: ~/proj  ⎇ main  ◆ Fable 5  ⊙ 14:45     (one uniform dark bar)
 ```
 
 ### Question 3 · Segments (multi-select)
@@ -106,6 +118,13 @@ lean:   ~/proj  ⎇ main  ◆ Fable 5  ⊙ 14:45     (no backgrounds, colored te
 | `effort` | reasoning effort level (`ψ`) | off |
 | `stash` | git stash count | off |
 | `project` | stable repo name (`⬢`), same across all git worktrees | off |
+| `node` | active Node version (`.nvmrc` / `.node-version`, else `node` on `PATH`); hidden until detected | off |
+| `python` | active Python env (`$VIRTUAL_ENV` / conda / `.python-version`, else `python3`); hidden until detected | off |
+| `burn` | projected time until a rate limit binds; writes a small sample file to `~/.claude/coralline/burn-5h.tsv` while enabled | off |
+
+Write the chosen segments to `VL_SEGMENTS` in this canonical order (keep only the ones the
+user wants): `dir project git node python model effort ctx limit5h limit7d burn lines cost
+style duration stash clock`.
 
 ### Question 4 · Layout
 
@@ -126,6 +145,28 @@ segment (a stable repo name that stays the same across worktrees) and setting `V
 (e.g. `14`) to truncate long branch names. If they don't use worktrees, skip both — `dir`
 already shows what they need.
 
+If the user runs many concurrent Claude sessions and is bothered by `limit5h` / `limit7d`
+showing different percentages per session, mention `VL_LIMIT_SYNC=1`: it makes those segments
+show the freshest reading any session has recorded for the current window (in a `limit-5h.d` /
+`limit-7d.d` store). Off by default; it only converges sessions when they redraw and cannot
+refresh a fully idle one.
+
+### Question 6 · Subagent panel rows (optional)
+
+Needs Claude Code v2.1.205+ (per-task model/context fields). Offer to theme only the
+subagent rows below the prompt — the native main-session row remains visible. If the user
+says yes, run `bash ~/.claude/coralline/configure.sh --subagent-rows=on` from a clone; it
+registers `subagentStatusLine` in `~/.claude/settings.json` (with the same backup-then-merge
+as the installer) and prints a preview. `--subagent-rows=off` removes only that settings
+entry. Model comes from Claude Code's per-task payload; missing fields degrade their own
+segments (`tokenCount` still shows without a context window), and redraws are
+panel-event-driven rather than a one-second poll. Claude Code v2.1.211 omits the native
+`agentType` role from this payload, so coralline recovers it from the local task metadata
+sidecar with Bash builtins and displays it beside the task label; explicit `name` values are
+retained too, and a missing sidecar still shows the payload label. Live payloads expose no
+per-task effort, so never copy the main-session effort or infer one from the role. Skip
+silently if the user's Claude Code predates the agent panel.
+
 ## Step 2.5 — Powerlevel10k import (optional)
 
 If the user opts in, read `~/.p10k.zsh` and translate their existing p10k look into the
@@ -134,7 +175,10 @@ coralline config. You are the parser — read the file and map fuzzily, don't sc
 | What to look for in `~/.p10k.zsh` | Write into coralline config |
 |---|---|
 | `# Wizard options:` comment contains `lean` | `VL_STYLE="lean"` |
-| `# Wizard options:` contains `classic`, `rainbow`, or `powerline` | `VL_STYLE="pill"` |
+| `# Wizard options:` contains `classic` | `VL_STYLE="classic"` (and carry the two rows below) |
+| `# Wizard options:` contains `rainbow` or `powerline` | `VL_STYLE="pill"` |
+| `POWERLEVEL9K_BACKGROUND` (classic only) | `VL_LEAN_BG` — the uniform bar color |
+| `POWERLEVEL9K_LEFT_SEGMENT_SEPARATOR` (classic only) | `VL_LEAN_CAP_R` — the trailing cap glyph |
 | `# Wizard options:` contains `24h time` | `VL_CLOCK="24h"` |
 | `POWERLEVEL9K_TIME_FORMAT` with `%H` / `%S` | `VL_CLOCK="24h"` / `VL_CLOCK_SECONDS=1` |
 | `POWERLEVEL9K_DIR_BACKGROUND` (pill) or `_FOREGROUND` (lean) | `VL_BG_DIR` |
@@ -143,6 +187,8 @@ coralline config. You are the parser — read the file and map fuzzily, don't sc
 | `POWERLEVEL9K_TIME_*` | `VL_BG_CLOCK` |
 | `POWERLEVEL9K_STATUS_OK_*` greens | `VL_FG_OK` |
 | `POWERLEVEL9K_STATUS_ERROR_*` reds | `VL_FG_HOT` |
+| `node_version` / `nvm` in prompt elements | add `node` to `VL_SEGMENTS` |
+| `virtualenv` / `pyenv` / `anaconda` in prompt elements | add `python` to `VL_SEGMENTS` |
 
 Conversion rules:
 
@@ -215,8 +261,12 @@ If `settings.json` does not exist, create it containing only the `statusLine` ke
 Run the script against the bundled sample input and confirm it renders without errors:
 
 ```bash
-curl -fsSL "$BASE/test/sample-input.json" | bash ~/.claude/coralline/statusline.sh
+curl -fsSL "$BASE/test/sample-input.json" | CORALLINE_NO_SAMPLE=1 bash ~/.claude/coralline/statusline.sh
 ```
+
+> **Note:** `CORALLINE_NO_SAMPLE=1` makes the render read-only, so the sample's preview
+> values are never written to the cross-session limit/burn stores. Without it, the sample's
+> far-future sentinel reset would poison `limit5h`/`limit7d` when `VL_LIMIT_SYNC=1`.
 
 Success criteria:
 
