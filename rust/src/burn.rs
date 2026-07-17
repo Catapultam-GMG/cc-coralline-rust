@@ -88,18 +88,20 @@ pub fn rl_latest(file: &str, max_ahead: i64, now: i64) -> Option<(String, i64)> 
     if snap.is_empty() {
         return None;
     }
+    // Entry name is "<reset>_<pct>": reset = everything before the LAST '_'
+    // (bash ${d%_*}), pct = everything after the FIRST '_' (bash ${d#*_}).
+    let reset_of = |d: &str| -> Option<i64> { d.rsplit_once('_')?.0.parse().ok() };
     let cut = now + max_ahead;
     let mut kept: Vec<String> = Vec::new();
     for d in snap {
-        let reset: i64 = d.split('_').next()?.parse().ok()?;
-        if reset > cut {
+        if reset_of(&d)? > cut {
             let _ = std::fs::remove_dir(dpath.join(&d)); // purge the poisoned sentinel
         } else {
             kept.push(d);
         }
     }
     let hi = kept.last()?.clone();
-    let reset: i64 = hi.split('_').next()?.parse().ok()?;
+    let reset: i64 = reset_of(&hi)?;
     let pct = hi.splitn(2, '_').nth(1).unwrap_or("").to_string();
     for d in &kept {
         if *d != hi {
@@ -256,19 +258,22 @@ fn burn_eta_5h(cfg: &Config, now: i64) -> Eta5 {
             if std::fs::write(&tmp, out).is_ok() {
                 let _ = std::fs::rename(&tmp, &path);
             }
-            // Sweep tmps orphaned by dead sessions.
-            let p = std::path::Path::new(&path);
-            if let (Some(parent), Some(base)) =
-                (p.parent(), p.file_name().and_then(|s| s.to_str()))
-            {
-                if let Ok(rd) = std::fs::read_dir(parent) {
-                    for e in rd.flatten() {
-                        let name = e.file_name();
-                        let name = name.to_string_lossy().to_string();
-                        if name.starts_with(&format!("{base}.")) && name.ends_with(".tmp") {
-                            let _ = std::fs::remove_file(e.path());
-                        }
-                    }
+        }
+    }
+    // Sweep tmps orphaned by dead sessions — every call, like upstream (the
+    // sweep sits after the awk, outside the trim condition).
+    let own = format!("{path}.{}.tmp", std::process::id());
+    let p = std::path::Path::new(&path);
+    if let (Some(parent), Some(base)) = (p.parent(), p.file_name().and_then(|s| s.to_str())) {
+        if let Ok(rd) = std::fs::read_dir(parent) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy().to_string();
+                if name.starts_with(&format!("{base}."))
+                    && name.ends_with(".tmp")
+                    && e.path() != std::path::Path::new(&own)
+                {
+                    let _ = std::fs::remove_file(e.path());
                 }
             }
         }

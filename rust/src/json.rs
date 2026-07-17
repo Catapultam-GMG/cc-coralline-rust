@@ -50,7 +50,8 @@ pub fn parse(s: &str) -> Option<Json> {
 }
 
 /// Parse a stream of concatenated JSON documents (no separators required),
-/// like `jq -s`. Stops at the first malformed document.
+/// like `jq -s`. Like jq, a malformed document poisons the whole stream —
+/// callers get nothing rather than a truncated prefix.
 pub fn parse_all(s: &str) -> Vec<Json> {
     let mut p = Parser { b: s.as_bytes(), i: 0 };
     let mut docs = Vec::new();
@@ -61,7 +62,7 @@ pub fn parse_all(s: &str) -> Vec<Json> {
         }
         match p.value() {
             Some(v) => docs.push(v),
-            None => break,
+            None => return Vec::new(),
         }
     }
     docs
