@@ -206,7 +206,7 @@ stable always-latest). The bash statusline: re-run the installer — it preserve
 installed copy" report when something new shipped:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Catapultam-GMG/cc-coralline-rust/rust/install.sh | bash -s -- --repo Catapultam-GMG/cc-coralline-rust --install-only
+curl -fsSL https://raw.githubusercontent.com/Catapultam-GMG/cc-coralline-rust/rust/install.sh | bash -s -- --repo Catapultam-GMG/cc-coralline-rust --ref rust --install-only
 ```
 
 Or paste this into Claude Code and let it drive:
