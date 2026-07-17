@@ -21,7 +21,7 @@ preserved; the prior `statusline.sh` is backed up to
 
 Re-install the runtime without opening the wizard, capturing its stdout:
 
-    curl -fsSL https://raw.githubusercontent.com/Nanako0129/coralline/main/install.sh | bash -s -- --install-only
+    curl -fsSL https://raw.githubusercontent.com/Catapultam-GMG/cc-coralline-rust/rust/install.sh | bash -s -- --repo Catapultam-GMG/cc-coralline-rust --install-only
 
 From a local clone instead:
 
