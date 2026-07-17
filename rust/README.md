@@ -1,8 +1,10 @@
 # coralline-rs — coralline, rewritten in Rust 🦀
 
 A single self-contained native binary that is **byte-identical in output** to
-coralline's bash [`statusline.sh`](../statusline.sh) — same segments, themes,
-styles, layouts, glyphs, escape codes. Just faster to spawn and dependency-free.
+coralline's bash [`statusline.sh`](../statusline.sh) — same segments (including
+`node`/`python`, `burn`, and cross-session limit sync), themes, styles (pill,
+lean, classic), layouts, glyphs, escape codes, and the same `--subagent`
+panel-row protocol. Just faster to spawn and dependency-free.
 
 ## Why
 
@@ -21,10 +23,13 @@ needs **no `jq`**, and parses JSON + renders in well under a millisecond.
 
 ## Parity
 
-`test-parity.sh` diffs this binary against the bash renderer across all 6 themes,
-both styles, both layouts, ASCII mode, and the clock variants, using upstream's
-own `test/sample-input.json`. Volatile fields (wall-clock, rate-limit countdowns)
-are masked. Run it:
+`test-parity.sh` diffs this binary against the bash renderer across every theme,
+all three styles (pill/lean/classic), both layouts, ASCII mode, the clock
+variants, the `node`/`python`/`burn` segments, cross-session limit sync
+(including shared-store interop: each renderer reads state the other wrote, and
+the burn-file trim rewrite is compared byte-for-byte), and `--subagent` panel
+rows, using upstream's own `test/sample-input.json`. Volatile fields
+(wall-clock, rate-limit countdowns) are masked. Run it:
 
 ```bash
 ./test-parity.sh            # from the rust/ directory

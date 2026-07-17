@@ -49,6 +49,24 @@ pub fn parse(s: &str) -> Option<Json> {
     Some(v)
 }
 
+/// Parse a stream of concatenated JSON documents (no separators required),
+/// like `jq -s`. Stops at the first malformed document.
+pub fn parse_all(s: &str) -> Vec<Json> {
+    let mut p = Parser { b: s.as_bytes(), i: 0 };
+    let mut docs = Vec::new();
+    loop {
+        p.ws();
+        if p.i >= p.b.len() {
+            break;
+        }
+        match p.value() {
+            Some(v) => docs.push(v),
+            None => break,
+        }
+    }
+    docs
+}
+
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,

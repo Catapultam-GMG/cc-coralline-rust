@@ -9,6 +9,10 @@ pub struct Config {
     pub style: String,
     pub lean_sep: String,
     pub lean_fg: String,
+    pub lean_bg: String,
+    pub lean_cap_l: String,
+    pub lean_cap_r: String,
+    pub bg_bar: String,
     pub layout: String,
     pub max_lines: i64,
     pub wrap_margin: i64,
@@ -51,6 +55,27 @@ pub struct Config {
     pub bg_style: String,
     pub bg_duration: String,
     pub bg_effort: String,
+    pub bg_node: String,
+    pub bg_python: String,
+    pub node_glyph: String,
+    pub py_glyph: String,
+    pub runtime_probe: bool,
+    // burn segment
+    pub burn_window: i64,
+    pub burn_glyph: String,
+    pub bg_burn: String,
+    pub burn_file: String,
+    pub burn_trim: i64,
+    // cross-session limit sync
+    pub limit_sync: bool,
+    pub rl5h_file: String,
+    pub rl7d_file: String,
+    // subagent panel rows
+    pub sub_segments: String,
+    pub bg_sub_name: String,
+    pub bg_sub_model: String,
+    pub bg_sub_ctx: String,
+    pub bg_sub_elapsed: String,
     pub fg_text: String,
     pub fg_dim: String,
     pub fg_ok: String,
@@ -64,6 +89,10 @@ impl Default for Config {
             style: "pill".into(),
             lean_sep: "".into(),
             lean_fg: "".into(),
+            lean_bg: "".into(),
+            lean_cap_l: "".into(),
+            lean_cap_r: "".into(),
+            bg_bar: "".into(),
             layout: "fixed".into(),
             max_lines: 3,
             wrap_margin: 4,
@@ -106,6 +135,24 @@ impl Default for Config {
             bg_style: "96".into(),
             bg_duration: "60".into(),
             bg_effort: "141".into(),
+            bg_node: "".into(),   // optional; falls back to bg_model when empty
+            bg_python: "".into(), // optional; falls back to bg_model when empty
+            node_glyph: "\u{E718}".into(),
+            py_glyph: "\u{E73C}".into(),
+            runtime_probe: false,
+            burn_window: 600,
+            burn_glyph: "\u{2197}".into(),
+            bg_burn: "".into(), // empty → inherits bg_5h at the use site
+            burn_file: "".into(), // resolved in load(): $CORALLINE_BURN_FILE or default
+            burn_trim: 1500,
+            limit_sync: false,
+            rl5h_file: "".into(), // resolved in load(): $CORALLINE_RL5H_FILE or default
+            rl7d_file: "".into(),
+            sub_segments: "name model ctx elapsed".into(),
+            bg_sub_name: "".into(), // panel-row colors; empty → main-bar counterparts
+            bg_sub_model: "".into(),
+            bg_sub_ctx: "".into(),
+            bg_sub_elapsed: "".into(),
             fg_text: "231".into(),
             fg_dim: "245".into(),
             fg_ok: "114".into(),
@@ -118,11 +165,33 @@ impl Default for Config {
 impl Config {
     pub fn load(home: &str) -> Config {
         let mut c = Config::default();
+        // Env-derived defaults land before the config file is sourced (upstream
+        // sets BURN_FILE / RL*_FILE from env in its defaults block), so a config
+        // assignment can still override them.
+        let envdef = |var: &str, def: String| match std::env::var(var) {
+            Ok(v) if !v.is_empty() => v,
+            _ => def,
+        };
+        c.burn_file = envdef(
+            "CORALLINE_BURN_FILE",
+            format!("{home}/.claude/coralline/burn-5h.tsv"),
+        );
+        c.rl5h_file = envdef(
+            "CORALLINE_RL5H_FILE",
+            format!("{home}/.claude/coralline/limit-5h.tsv"),
+        );
+        c.rl7d_file = envdef(
+            "CORALLINE_RL7D_FILE",
+            format!("{home}/.claude/coralline/limit-7d.tsv"),
+        );
         let conf = std::env::var("CORALLINE_CONFIG")
             .ok()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("{home}/.claude/coralline.conf")));
         c.apply_file(&conf, home, 0);
+        c.burn_file = expand(&c.burn_file, home);
+        c.rl5h_file = expand(&c.rl5h_file, home);
+        c.rl7d_file = expand(&c.rl7d_file, home);
         if c.float_file.is_empty() {
             c.float_file = format!("{home}/.claude/coralline/float.txt");
         } else {
@@ -172,6 +241,10 @@ impl Config {
             "VL_STYLE" => self.style = v,
             "VL_LEAN_SEP" => self.lean_sep = v,
             "VL_LEAN_FG" => self.lean_fg = v,
+            "VL_LEAN_BG" => self.lean_bg = v,
+            "VL_LEAN_CAP_L" => self.lean_cap_l = v,
+            "VL_LEAN_CAP_R" => self.lean_cap_r = v,
+            "VL_BG_BAR" => self.bg_bar = v,
             "VL_LAYOUT" => self.layout = v,
             "VL_MAX_LINES" => self.max_lines = v.parse().unwrap_or(self.max_lines),
             "VL_WRAP_MARGIN" => self.wrap_margin = v.parse().unwrap_or(self.wrap_margin),
@@ -220,6 +293,24 @@ impl Config {
             "VL_BG_STYLE" => self.bg_style = v,
             "VL_BG_DURATION" => self.bg_duration = v,
             "VL_BG_EFFORT" => self.bg_effort = v,
+            "VL_BG_NODE" => self.bg_node = v,
+            "VL_BG_PYTHON" => self.bg_python = v,
+            "VL_NODE_GLYPH" => self.node_glyph = v,
+            "VL_PY_GLYPH" => self.py_glyph = v,
+            "VL_RUNTIME_PROBE" => self.runtime_probe = v == "1",
+            "CORALLINE_BURN_WINDOW" => self.burn_window = v.parse().unwrap_or(self.burn_window),
+            "VL_BURN_GLYPH" => self.burn_glyph = v,
+            "VL_BG_BURN" => self.bg_burn = v,
+            "BURN_FILE" => self.burn_file = v,
+            "BURN_TRIM" => self.burn_trim = v.parse().unwrap_or(self.burn_trim),
+            "VL_LIMIT_SYNC" => self.limit_sync = v == "1",
+            "RL5H_FILE" => self.rl5h_file = v,
+            "RL7D_FILE" => self.rl7d_file = v,
+            "VL_SUB_SEGMENTS" => self.sub_segments = v,
+            "VL_BG_SUB_NAME" => self.bg_sub_name = v,
+            "VL_BG_SUB_MODEL" => self.bg_sub_model = v,
+            "VL_BG_SUB_CTX" => self.bg_sub_ctx = v,
+            "VL_BG_SUB_ELAPSED" => self.bg_sub_elapsed = v,
             "VL_FG_TEXT" => self.fg_text = v,
             "VL_FG_DIM" => self.fg_dim = v,
             "VL_FG_OK" => self.fg_ok = v,
@@ -236,6 +327,25 @@ impl Config {
             self.sep.clear();
             self.bar_fill = "#".into();
             self.bar_empty = "-".into();
+            self.node_glyph = "node".into();
+            self.py_glyph = "py".into();
+        }
+        // Classic = lean on one uniform dark bar with a trailing cap. Resolved
+        // after the ASCII block (so an ASCII render's cleared sep leaves the cap
+        // empty but the bar still paints) and before the lean block, exactly like
+        // upstream. Explicit VL_LEAN_BG / VL_LEAN_CAP_R win over the preset.
+        if self.style == "classic" {
+            self.style = "lean".into();
+            if self.lean_bg.is_empty() {
+                self.lean_bg = if self.bg_bar.is_empty() {
+                    "238".into()
+                } else {
+                    self.bg_bar.clone()
+                };
+            }
+            if self.lean_cap_r.is_empty() {
+                self.lean_cap_r = self.sep.clone();
+            }
         }
         if self.style == "lean" {
             self.cap_l.clear();
@@ -275,7 +385,7 @@ fn expand(s: &str, home: &str) -> String {
 /// std::fs can read it — a config might `. /c/...` instead of using ~. Windows
 /// only: on Linux/macOS `/x/...` is a legitimate native path, so leave it alone.
 #[cfg(windows)]
-fn msys_to_win(p: &str) -> String {
+pub(crate) fn msys_to_win(p: &str) -> String {
     let b = p.as_bytes();
     if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b'/' {
         format!("{}:{}", &p[1..2], &p[2..])
@@ -285,6 +395,6 @@ fn msys_to_win(p: &str) -> String {
 }
 
 #[cfg(not(windows))]
-fn msys_to_win(p: &str) -> String {
+pub(crate) fn msys_to_win(p: &str) -> String {
     p.to_string()
 }

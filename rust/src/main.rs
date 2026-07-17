@@ -20,11 +20,13 @@ use std::io::Read;
 use std::panic::AssertUnwindSafe;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod burn;
 mod config;
 mod float;
 mod git;
 mod json;
 mod render;
+mod subagent;
 
 use config::Config;
 use json::Json;
@@ -38,8 +40,10 @@ pub struct Payload {
     pub tok_cr: i64,
     pub tok_cw: i64,
     pub fh_pct: Option<f64>,
+    pub fh_pct_raw: String, // jq-tostring form, for burn/limit-sync sampling
     pub fh_rst: String,
     pub wd_pct: Option<f64>,
+    pub wd_pct_raw: String,
     pub wd_rst: String,
     pub cost: Option<f64>,
     pub lines_add: i64,
@@ -59,6 +63,19 @@ fn main() {
     if args.len() >= 2 && args[1] == "--float-carrier" {
         let once = args.iter().any(|a| a == "--once");
         float::carrier(once);
+        return;
+    }
+    if args.len() >= 2 && args[1] == "--subagent" {
+        // Panel mode exits before every main-bar side effect (git probe,
+        // burn/limit sampling, float readout, output cache) — same as upstream.
+        let mut payload = String::new();
+        let _ = std::io::stdin().read_to_string(&mut payload);
+        let cfg = Config::load(&home_dir());
+        let out = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            subagent::run(&payload, &cfg, now_epoch())
+        }))
+        .unwrap_or_default();
+        print!("{out}");
         return;
     }
     run();
@@ -114,9 +131,37 @@ fn render_all(j: Option<&Json>, home: &str, coralline_dir: &str) -> String {
     let git = git::gather(&p.cwd, coralline_dir, use_git);
     let (h, m, s) = local_hms();
     let now = now_epoch();
+
+    // Burn / limit-sync sampling, gated on the segment scan exactly like
+    // upstream (CORALLINE_NO_SAMPLE=1 makes a render read-only, so preview
+    // sentinels never poison the cross-session stores).
+    let uses_burn = uses("burn");
+    let no_sample = matches!(std::env::var("CORALLINE_NO_SAMPLE"), Ok(v) if v == "1");
+    if !no_sample {
+        if uses_burn {
+            burn::burn_sample(&cfg.burn_file, now, &p.fh_pct_raw, &p.fh_rst);
+        }
+        if cfg.limit_sync {
+            if uses("limit5h") {
+                burn::rl_sample(&cfg.rl5h_file, &p.fh_pct_raw, &p.fh_rst, burn::RL_MAX_5H, now);
+            }
+            // burn also consumes the synced 7d, so sample whenever burn shows too.
+            if uses("limit7d") || uses_burn {
+                burn::rl_sample(&cfg.rl7d_file, &p.wd_pct_raw, &p.wd_rst, burn::RL_MAX_7D, now);
+            }
+        }
+    }
+    let burn_est = if uses_burn {
+        Some(burn::burn_estimate(
+            &cfg, &p.fh_pct_raw, &p.fh_rst, &p.wd_pct_raw, &p.wd_rst, now,
+        ))
+    } else {
+        None
+    };
+
     // seg_dir collapses the *shell* $HOME (matches upstream `${cwd/#$HOME/~}`),
     // which differs from the Windows USERPROFILE used for filesystem paths.
-    render::render(&cfg, &p, &git, &shell_home(), h, m, s, now)
+    render::render(&cfg, &p, &git, &shell_home(), h, m, s, now, burn_est.as_ref())
 }
 
 fn extract(j: &Json) -> Payload {
@@ -152,8 +197,10 @@ fn extract(j: &Json) -> Payload {
         tok_cr: i(&["context_window", "current_usage", "cache_read_input_tokens"]),
         tok_cw: i(&["context_window", "current_usage", "cache_creation_input_tokens"]),
         fh_pct: f(&["rate_limits", "five_hour", "used_percentage"]),
+        fh_pct_raw: tok(&["rate_limits", "five_hour", "used_percentage"]),
         fh_rst: tok(&["rate_limits", "five_hour", "resets_at"]),
         wd_pct: f(&["rate_limits", "seven_day", "used_percentage"]),
+        wd_pct_raw: tok(&["rate_limits", "seven_day", "used_percentage"]),
         wd_rst: tok(&["rate_limits", "seven_day", "resets_at"]),
         cost: f(&["cost", "total_cost_usd"]),
         lines_add: i(&["cost", "total_lines_added"]),
@@ -165,7 +212,7 @@ fn extract(j: &Json) -> Payload {
 }
 
 /// Format a JSON number the way jq's tostring would (integer if whole).
-fn fmt_num(n: f64) -> String {
+pub(crate) fn fmt_num(n: f64) -> String {
     if n.fract() == 0.0 {
         format!("{}", n as i64)
     } else {

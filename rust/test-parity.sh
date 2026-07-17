@@ -86,6 +86,178 @@ else
 fi
 rm -rf "$wtroot"
 
+# ── Forward-ported upstream features ────────────────────────────────────────
+# checkp: like check() but with an explicit payload and optional extra env
+# (NAME=value pairs before the label). Both renderers get identical env/state.
+checkp() { # $1=label $2=payload [$3=cols] [$4...=env pairs]
+  local label="$1" payload="$2" cols="${3:-}"; shift; shift; [ $# -gt 0 ] && shift
+  env "$@" COLUMNS="$cols" CORALLINE_CONFIG="$tmp/conf" bash "$US" <<<"$payload" 2>/dev/null | mask > "$tmp/b"
+  env "$@" COLUMNS="$cols" CORALLINE_CONFIG="$tmp/conf" "$EXE"      <<<"$payload" 2>/dev/null | mask > "$tmp/e"
+  if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "$label"; pass=$((pass+1))
+  else printf '  ✗ %s\n' "$label"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+}
+
+# classic style + lean uniform background / caps
+printf '. %s/themes/claude-coral.conf\nVL_STYLE="classic"\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "style: classic"
+printf '. %s/themes/mono.conf\nVL_STYLE="classic"\nVL_BG_BAR="30,30,46"\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "style: classic custom VL_BG_BAR"
+printf '. %s/themes/claude-coral.conf\nVL_STYLE="classic"\nVL_ASCII=1\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "style: classic ascii"
+printf '. %s/themes/claude-coral.conf\nVL_STYLE="lean"\nVL_LEAN_SEP=" "\nVL_LEAN_BG="238"\nVL_LEAN_CAP_L="<"\nVL_LEAN_CAP_R=">"\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "style: lean bg + caps"
+printf '. %s/themes/claude-coral.conf\nVL_STYLE="classic"\nVL_LAYOUT="auto"\nVL_SEGMENTS="%s"\n' "$RT" "$SEGS" > "$tmp/conf"; check "style: classic auto wrap (COLUMNS=50)" 50
+
+# node / python runtime segments (pin files walking up from cwd; venv env)
+rtroot=$(mktemp -d); mkdir -p "$rtroot/proj/sub"
+printf 'v22.1.0\n' > "$rtroot/proj/.nvmrc"
+printf '3.12.4\n'  > "$rtroot/proj/sub/.python-version"
+if command -v cygpath >/dev/null 2>&1; then rtp=$(cygpath -m "$rtroot/proj/sub"); else rtp="$rtroot/proj/sub"; fi
+printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="node python model"\n' "$RT" > "$tmp/conf"
+checkp "runtime: node+python pin files" "{\"cwd\":\"$rtp\",\"model\":{\"display_name\":\"Claude Fable 5\"}}"
+printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="python"\n' "$RT" > "$tmp/conf"
+checkp "runtime: VIRTUAL_ENV basename" "{\"cwd\":\"$rtp\"}" "" VIRTUAL_ENV=/opt/venvs/myproj
+checkp "runtime: conda env (base hidden)" "{\"cwd\":\"$rtp\"}" "" CONDA_DEFAULT_ENV=base VIRTUAL_ENV=
+printf '. %s/themes/claude-coral.conf\nVL_ASCII=1\nVL_SEGMENTS="node python"\n' "$RT" > "$tmp/conf"
+checkp "runtime: ascii glyphs" "{\"cwd\":\"$rtp\"}"
+rm -rf "$rtroot"
+
+# cross-session limit sync (dir-set high-water store)
+lsd=$(mktemp -d); NOWT=$(date +%s)
+if command -v cygpath >/dev/null 2>&1; then lsp=$(cygpath -m "$lsd"); else lsp="$lsd"; fi
+seed_store() {  # fresh store: one real high-water + one poisoned sentinel per window
+  rm -rf "$lsd/limit-5h.d" "$lsd/limit-7d.d"
+  mkdir -p "$lsd/limit-5h.d/$(printf '%010d_%07.3f' $((NOWT+3600))  55.5)"
+  mkdir -p "$lsd/limit-5h.d/$(printf '%010d_%07.3f' $((NOWT+3600))  41.25)"
+  mkdir -p "$lsd/limit-5h.d/$(printf '%010d_%07.3f' 1900000000 99)"        # 2030 sentinel → pruned
+  mkdir -p "$lsd/limit-7d.d/$(printf '%010d_%07.3f' $((NOWT+300000)) 12)"
+}
+printf '. %s/themes/claude-coral.conf\nVL_LIMIT_SYNC=1\nVL_SEGMENTS="limit5h limit7d"\n' "$RT" > "$tmp/conf"
+LPAY="{\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":$((NOWT+3600))},\"seven_day\":{\"used_percentage\":10,\"resets_at\":$((NOWT+300000))}}}"
+seed_store
+env CORALLINE_RL5H_FILE="$lsp/limit-5h.tsv" CORALLINE_RL7D_FILE="$lsp/limit-7d.tsv" CORALLINE_NO_SAMPLE=1 \
+  CORALLINE_CONFIG="$tmp/conf" bash "$US" <<<"$LPAY" 2>/dev/null | mask > "$tmp/b"
+seed_store
+env CORALLINE_RL5H_FILE="$lsp/limit-5h.tsv" CORALLINE_RL7D_FILE="$lsp/limit-7d.tsv" CORALLINE_NO_SAMPLE=1 \
+  CORALLINE_CONFIG="$tmp/conf" "$EXE" <<<"$LPAY" 2>/dev/null | mask > "$tmp/e"
+if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "limit sync: high-water + sentinel prune"; pass=$((pass+1))
+else printf '  ✗ %s\n' "limit sync: high-water + sentinel prune"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+# write path: sampling on → this render's own 62% becomes the high-water
+seed_store
+env CORALLINE_RL5H_FILE="$lsp/limit-5h.tsv" CORALLINE_RL7D_FILE="$lsp/limit-7d.tsv" \
+  CORALLINE_CONFIG="$tmp/conf" bash "$US" <<<"${LPAY/40/62.4}" 2>/dev/null | mask > "$tmp/b"
+seed_store
+env CORALLINE_RL5H_FILE="$lsp/limit-5h.tsv" CORALLINE_RL7D_FILE="$lsp/limit-7d.tsv" \
+  CORALLINE_CONFIG="$tmp/conf" "$EXE" <<<"${LPAY/40/62.4}" 2>/dev/null | mask > "$tmp/e"
+if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "limit sync: own sample wins"; pass=$((pass+1))
+else printf '  ✗ %s\n' "limit sync: own sample wins"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+rm -rf "$lsd"
+
+# burn segment (range-to-empty): active / warming / idle / all-good / 7d binding
+bt=$(mktemp -d)
+if command -v cygpath >/dev/null 2>&1; then btp=$(cygpath -m "$bt"); else btp="$bt"; fi
+BRST=$((NOWT+7200))
+BPAY="{\"rate_limits\":{\"five_hour\":{\"used_percentage\":55,\"resets_at\":$BRST},\"seven_day\":{\"used_percentage\":50,\"resets_at\":$((NOWT+302400))}}}"
+printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="burn"\n' "$RT" > "$tmp/conf"
+burncheck() { # $1=label $2=payload
+  env CORALLINE_BURN_FILE="$btp/burn-5h.tsv" CORALLINE_NO_SAMPLE=1 \
+    CORALLINE_CONFIG="$tmp/conf" bash "$US" <<<"$2" 2>/dev/null | mask > "$tmp/b"
+  env CORALLINE_BURN_FILE="$btp/burn-5h.tsv" CORALLINE_NO_SAMPLE=1 \
+    CORALLINE_CONFIG="$tmp/conf" "$EXE" <<<"$2" 2>/dev/null | mask > "$tmp/e"
+  if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "$1"; pass=$((pass+1))
+  else printf '  ✗ %s\n' "$1"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+}
+: > "$btp/burn-5h.tsv"                                     # no samples yet
+burncheck "burn: warming (no samples)" "$BPAY"
+for i in 0 1 2 3 4 5; do                                   # steady climb → active ETA
+  printf '%s\t%s\t%s\n' $((NOWT-300+i*60)) $((40+i*3)) "$BRST"
+done > "$btp/burn-5h.tsv"
+burncheck "burn: active 5h ETA" "$BPAY"
+for i in 0 1 2 3 4 5; do                                   # crossings, all outside window
+  printf '%s\t%s\t%s\n' $((NOWT-2000+i*60)) $((40+i*3)) "$BRST"
+done > "$btp/burn-5h.tsv"
+burncheck "burn: idle (stopped burning)" "$BPAY"
+printf '%s\t40\t%s\n%s\t41\t%s\n%s\t42\t%s\n' \
+  $((NOWT-590)) "$BRST" $((NOWT-560)) "$BRST" $((NOWT-10)) "$BRST" > "$btp/burn-5h.tsv"
+burncheck "burn: all-good check (eta > window)" "$BPAY"
+: > "$btp/burn-5h.tsv"                                     # 7d binds when 5h has no slope
+burncheck "burn: 7d stateless binding" "{\"rate_limits\":{\"seven_day\":{\"used_percentage\":50,\"resets_at\":$((NOWT+302400))}}}"
+rm -rf "$bt"
+
+# --subagent panel mode
+sa=$(mktemp -d); mkdir -p "$sa/sess/subagents"
+printf '{"agentType":"scout","x":1}\n' > "$sa/sess/subagents/agent-task-1.meta.json"
+if command -v cygpath >/dev/null 2>&1; then sap=$(cygpath -m "$sa"); else sap="$sa"; fi
+SPAY="{\"transcript_path\":\"$sap/sess.jsonl\",\"columns\":100,\"tasks\":[
+ {\"id\":\"task-1\",\"type\":\"local_agent\",\"label\":\"Explore config sources\",\"status\":\"running\",\"model\":\"claude-haiku-4-5-20251001\",\"contextWindowSize\":200000,\"tokenCount\":42000},
+ {\"id\":\"task-2\",\"name\":\"big-refactor\",\"type\":\"local_agent\",\"label\":\"Refactor renderer\",\"status\":\"completed\",\"model\":\"claude-fable-5\",\"contextWindowSize\":200000,\"tokenCount\":155000},
+ {\"id\":\"task-3\",\"type\":\"local_agent\",\"label\":\"just-spawned\",\"status\":\"queued\"},
+ {\"id\":\"task-4\",\"label\":\"gateway\",\"status\":\"failed\",\"model\":\"gpt-5.6-luna\",\"tokenCount\":1234}
+]}"
+subcheck() { # $1=label $2=payload [$3=maskexpr]
+  local m="${3:-cat}"
+  bash "$US" --subagent <<<"$2" 2>/dev/null | eval "$m" > "$tmp/b"
+  "$EXE" --subagent <<<"$2" 2>/dev/null | eval "$m" > "$tmp/e"
+  if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "$1"; pass=$((pass+1))
+  else printf '  ✗ %s\n' "$1"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+}
+printf '. %s/themes/claude-coral.conf\nVL_SUB_SEGMENTS="name model ctx"\n' "$RT" > "$tmp/conf"
+export CORALLINE_CONFIG="$tmp/conf"
+subcheck "subagent: rows (name model ctx) + sidecar role" "$SPAY"
+printf '. %s/themes/claude-coral.conf\nVL_STYLE="classic"\nVL_SUB_SEGMENTS="name model ctx"\nVL_NAME_MAX=14\n' "$RT" > "$tmp/conf"
+subcheck "subagent: classic rows + VL_NAME_MAX" "$SPAY"
+printf '. %s/themes/claude-coral.conf\n' "$RT" > "$tmp/conf"
+SPAY2="{\"tasks\":[{\"id\":\"e1\",\"label\":\"timed\",\"status\":\"running\",\"startTime\":$(( (NOWT-3725) * 1000 ))}]}"
+subcheck "subagent: elapsed (seconds masked)" "$SPAY2" "sed -E 's/(⧖ [0-9]+h[0-9]+m)[0-9]+s/\\1XXs/'"
+subcheck "subagent: concatenated docs → last wins" "{\"tasks\":[{\"id\":\"old\",\"label\":\"stale\",\"status\":\"running\"}]}${SPAY}"
+subcheck "subagent: empty tasks → no output" "{\"tasks\":[]}"
+unset CORALLINE_CONFIG
+rm -rf "$sa"
+
+# cross-renderer state interop: bash WRITES the stores, rust READS them (and
+# vice versa for burn) — proves both speak the same on-disk format.
+ix=$(mktemp -d)
+if command -v cygpath >/dev/null 2>&1; then ixp=$(cygpath -m "$ix"); else ixp="$ix"; fi
+printf '. %s/themes/claude-coral.conf\nVL_LIMIT_SYNC=1\nVL_SEGMENTS="limit5h"\n' "$RT" > "$tmp/conf"
+IXPAY5="{\"rate_limits\":{\"five_hour\":{\"used_percentage\":62.4,\"resets_at\":$((NOWT+3600))}}}"
+IXPAY4="{\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":$((NOWT+3600))}}}"
+env CORALLINE_RL5H_FILE="$ixp/limit-5h.tsv" CORALLINE_CONFIG="$tmp/conf" \
+  bash "$US" <<<"$IXPAY5" 2>/dev/null | mask > "$tmp/b"        # bash records 62.4
+env CORALLINE_RL5H_FILE="$ixp/limit-5h.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
+  "$EXE" <<<"$IXPAY4" 2>/dev/null | mask > "$tmp/e"            # rust must read it back
+if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "interop: rust reads bash-written rl store"; pass=$((pass+1))
+else printf '  ✗ %s\n' "interop: rust reads bash-written rl store"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="burn"\n' "$RT" > "$tmp/conf"
+for i in 0 1 2 3 4; do printf '%s\t%s\t%s\n' $((NOWT-300+i*60)) $((40+i*3)) $((NOWT+7200)); done > "$ix/burn-5h.tsv"
+env CORALLINE_BURN_FILE="$ixp/burn-5h.tsv" CORALLINE_CONFIG="$tmp/conf" \
+  "$EXE" <<<"{\"rate_limits\":{\"five_hour\":{\"used_percentage\":55,\"resets_at\":$((NOWT+7200))}}}" 2>/dev/null | mask > "$tmp/e"   # rust appends its own sample
+env CORALLINE_BURN_FILE="$ixp/burn-5h.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
+  bash "$US" <<<"{\"rate_limits\":{\"five_hour\":{\"used_percentage\":55,\"resets_at\":$((NOWT+7200))}}}" 2>/dev/null | mask > "$tmp/b"
+if diff -q "$tmp/b" "$tmp/e" >/dev/null && grep -q "	55	" "$ix/burn-5h.tsv"; then
+  printf '  ✓ %s\n' "interop: bash reads rust-appended burn samples"; pass=$((pass+1))
+else printf '  ✗ %s\n' "interop: bash reads rust-appended burn samples"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+# trim rewrite equality: an over-cap file must be rewritten byte-identically
+# (this pins the awk CONVFMT %.6g stringification of fractional percents).
+mktrim() { for i in $(seq 1 1600); do printf '%s\t%s\t%s\n' $((NOWT-3200+i)) "4$((i%2)).${i}5" $((NOWT+7200)); done; }
+mktrim > "$ix/tb.tsv"; mktrim > "$ix/te.tsv"
+env CORALLINE_BURN_FILE="$ixp/tb.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
+  bash "$US" <<<"$BPAY" >/dev/null 2>&1
+env CORALLINE_BURN_FILE="$ixp/te.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
+  "$EXE" <<<"$BPAY" >/dev/null 2>&1
+if diff -q "$ix/tb.tsv" "$ix/te.tsv" >/dev/null && [ "$(wc -l < "$ix/tb.tsv")" -le 1500 ]; then
+  printf '  ✓ %s\n' "interop: burn trim rewrite is byte-identical"; pass=$((pass+1))
+else printf '  ✗ %s\n' "interop: burn trim rewrite is byte-identical"; diff "$ix/tb.tsv" "$ix/te.tsv" | head -4; fail=$((fail+1)); fi
+rm -rf "$ix"
+
+# HOME collapse: cwd under $HOME renders as ~/… with no stray characters.
+# MSYS path-converts a POSIX-looking HOME before a native exe sees it (and
+# normalizes slashes), so an identical HOME can't reach both renderers there —
+# run this one on Linux/macOS only.
+if ! command -v cygpath >/dev/null 2>&1; then
+  printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="dir"\n' "$RT" > "$tmp/conf"
+  env HOME=/Users/dev COLUMNS= CORALLINE_CONFIG="$tmp/conf" bash "$US" <<<'{"cwd":"/Users/dev/side-project"}' 2>/dev/null | mask > "$tmp/b"
+  env HOME=/Users/dev COLUMNS= CORALLINE_CONFIG="$tmp/conf" "$EXE" <<<'{"cwd":"/Users/dev/side-project"}' 2>/dev/null | mask > "$tmp/e"
+  if diff -q "$tmp/b" "$tmp/e" >/dev/null && grep -q '~/side-project' "$tmp/e"; then
+    printf '  ✓ %s\n' "dir: clean ~ collapse under \$HOME"; pass=$((pass+1))
+  else printf '  ✗ %s\n' "dir: clean ~ collapse under \$HOME"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+fi
+
 rm -rf "$tmp" "$HOME/.claude/coralline/.cache/out-native" 2>/dev/null
 echo "── $pass passed, $fail failed ──"
 [ "$fail" -eq 0 ]

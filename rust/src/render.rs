@@ -8,10 +8,10 @@ const R: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const NORM: &str = "\x1b[22m";
 
-struct Seg {
-    bg: String,
-    txt: String,
-    len: usize,
+pub(crate) struct Seg {
+    pub(crate) bg: String,
+    pub(crate) txt: String,
+    pub(crate) len: usize,
 }
 
 fn color(spec: &str, fgbg: u8) -> String {
@@ -28,7 +28,7 @@ fn color(spec: &str, fgbg: u8) -> String {
         format!("\x1b[{};5;{}m", fgbg, spec)
     }
 }
-fn fg(spec: &str) -> String {
+pub(crate) fn fg(spec: &str) -> String {
     color(spec, 38)
 }
 fn bg(spec: &str) -> String {
@@ -128,6 +128,96 @@ fn strip_project_root(short: &mut String, roots: &[String]) -> bool {
     false
 }
 
+/// First line of a pin file (.nvmrc / .python-version), whitespace-trimmed.
+/// `[ -f ]` semantics: a directory of the same name never matches.
+fn pin_file(dir: &str, name: &str) -> Option<String> {
+    let path = crate::config::msys_to_win(&format!("{dir}/{name}"));
+    let p = std::path::Path::new(&path);
+    if !p.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(p).ok()?;
+    let first = text.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        None
+    } else {
+        Some(first.to_string())
+    }
+}
+
+/// Walk `dir` and its ancestors exactly like upstream's runtime_* loop: step up
+/// by stripping the last '/'-component, stop when no '/' is left or the dir is
+/// "/" or empty. (A backslash-only Windows path therefore only checks the leaf
+/// directory — same as bash.)
+fn walk_up(dir: &str, mut probe: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    let mut d = dir.to_string();
+    while !d.is_empty() && d != "/" {
+        if let Some(v) = probe(&d) {
+            return Some(v);
+        }
+        match d.rfind('/') {
+            Some(i) => d.truncate(i),
+            None => break,
+        }
+    }
+    None
+}
+
+/// Active Node version label for `dir` (pin files first, PATH probe opt-in).
+fn runtime_node(dir: &str, probe: bool) -> Option<String> {
+    let hit = walk_up(dir, |d| {
+        for f in [".nvmrc", ".node-version"] {
+            if let Some(v) = pin_file(d, f) {
+                return Some(v.strip_prefix('v').unwrap_or(&v).to_string());
+            }
+        }
+        None
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    if probe {
+        let out = std::process::Command::new("node").arg("--version").output().ok()?;
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !v.is_empty() {
+            return Some(v.strip_prefix('v').unwrap_or(&v).to_string());
+        }
+    }
+    None
+}
+
+/// Active Python env/version label for `dir` (venv, conda, pin file, probe).
+fn runtime_python(dir: &str, probe: bool) -> Option<String> {
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        if !venv.is_empty() {
+            return Some(venv.rsplit('/').next().unwrap_or(&venv).to_string());
+        }
+    }
+    // conda auto-activates `base` for most users, so it is not a meaningful env.
+    if let Ok(conda) = std::env::var("CONDA_DEFAULT_ENV") {
+        if !conda.is_empty() && conda != "base" {
+            return Some(conda);
+        }
+    }
+    let hit = walk_up(dir, |d| pin_file(d, ".python-version"));
+    if hit.is_some() {
+        return hit;
+    }
+    if probe {
+        // some builds print the version to stderr
+        let out = std::process::Command::new("python3").arg("--version").output().ok()?;
+        let mut v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if v.is_empty() {
+            v = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        }
+        let v = v.strip_prefix("Python ").unwrap_or(&v).trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// Plain text of `s` with ANSI escape sequences (ESC…m) removed. Mirrors
 /// upstream statusline.sh's strip_ansi, used to build the float readout.
 fn strip_ansi(s: &str) -> String {
@@ -147,7 +237,7 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-fn make_bar(pct: i64, width: i64, fill: &str, empty: &str) -> String {
+pub(crate) fn make_bar(pct: i64, width: i64, fill: &str, empty: &str) -> String {
     let mut filled = (pct * width + 50) / 100;
     if filled > width {
         filled = width;
@@ -166,7 +256,7 @@ fn make_bar(pct: i64, width: i64, fill: &str, empty: &str) -> String {
 }
 
 /// 1234 → 1.2k · 1234567 → 1.2M (integer math only), matching upstream fmt_tok.
-fn fmt_tok(n: i64) -> String {
+pub(crate) fn fmt_tok(n: i64) -> String {
     if n >= 1_000_000 {
         format!("{}.{}M", n / 1_000_000, (n % 1_000_000) / 100_000)
     } else if n >= 1000 {
@@ -190,7 +280,7 @@ fn fmt_duration(ms: i64) -> String {
 }
 
 /// Middle-truncate to `max` visible chars with … ; max<=0 → unchanged.
-fn trunc(s: &str, max: i64) -> String {
+pub(crate) fn trunc(s: &str, max: i64) -> String {
     if max <= 0 {
         return s.to_string();
     }
@@ -210,7 +300,7 @@ fn trunc(s: &str, max: i64) -> String {
     format!("{h}\u{2026}{t}")
 }
 
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400;
@@ -219,7 +309,47 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-fn to_epoch(t: &str) -> Option<i64> {
+/// Canonical UTC ISO timestamp → epoch, strict (upstream iso_epoch): exact
+/// "####-##-##T##:##:##" shape after dropping a trailing Z / fraction, no
+/// timezone offset, calendar-validated. Returns None for everything else.
+pub(crate) fn iso_epoch_strict(t: &str) -> Option<i64> {
+    let tm = t.split_once('T')?.1;
+    if tm.contains('+') || tm.contains('-') {
+        return None;
+    }
+    let s = t.strip_suffix('Z').unwrap_or(t);
+    let s = s.split('.').next().unwrap_or(s);
+    let b = s.as_bytes();
+    if b.len() != 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    for (i, &c) in b.iter().enumerate() {
+        if ![4, 7, 10, 13, 16].contains(&i) && !c.is_ascii_digit() {
+            return None;
+        }
+    }
+    let g = |a: usize, z: usize| s[a..z].parse::<i64>().ok();
+    let (y, mo, d) = (g(0, 4)?, g(5, 7)?, g(8, 10)?);
+    let (h, mi, sec) = (g(11, 13)?, g(14, 16)?, g(17, 19)?);
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let dim = match mo {
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 31,
+    };
+    if !(1..=12).contains(&mo) || !(1..=dim).contains(&d) || h > 23 || mi > 59 || sec > 59 {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec)
+}
+
+pub(crate) fn to_epoch(t: &str) -> Option<i64> {
     let t = t.trim();
     if t.is_empty() {
         return None;
@@ -267,6 +397,20 @@ fn round_pct(v: f64) -> i64 {
     v.round() as i64
 }
 
+/// d/h/m rendering of a burn ETA in seconds (mirrors fmt_countdown's shapes).
+fn fmt_eta(s: i64) -> String {
+    let d = s / 86400;
+    let h = (s % 86400) / 3600;
+    let m = (s % 3600) / 60;
+    if d > 0 {
+        format!("{}d{:02}h", d, h)
+    } else if h > 0 {
+        format!("{}h{:02}m", h, m)
+    } else {
+        format!("{}m", m)
+    }
+}
+
 struct Ctx<'a> {
     cfg: &'a Config,
     p: &'a Payload,
@@ -276,6 +420,7 @@ struct Ctx<'a> {
     min: u32,
     sec: u32,
     now_epoch: i64,
+    burn: Option<&'a crate::burn::Burn>,
     fg_text: String,
     fg_dim: String,
     fg_ok: String,
@@ -418,6 +563,42 @@ impl<'a> Ctx<'a> {
                     ),
                 );
             }
+            "node" => {
+                if p.cwd.is_empty() {
+                    return;
+                }
+                let Some(v) = runtime_node(&p.cwd, cfg.runtime_probe) else {
+                    return;
+                };
+                let bgc = if cfg.bg_node.is_empty() {
+                    &cfg.bg_model
+                } else {
+                    &cfg.bg_node
+                };
+                self.push(
+                    segs,
+                    bgc,
+                    format!("{} {} {} ", self.fg_text, cfg.node_glyph, v),
+                );
+            }
+            "python" => {
+                if p.cwd.is_empty() {
+                    return;
+                }
+                let Some(v) = runtime_python(&p.cwd, cfg.runtime_probe) else {
+                    return;
+                };
+                let bgc = if cfg.bg_python.is_empty() {
+                    &cfg.bg_model
+                } else {
+                    &cfg.bg_python
+                };
+                self.push(
+                    segs,
+                    bgc,
+                    format!("{} {} {} ", self.fg_text, cfg.py_glyph, v),
+                );
+            }
             "model" => {
                 if p.model.is_empty() {
                     return;
@@ -453,8 +634,83 @@ impl<'a> Ctx<'a> {
                     ),
                 );
             }
-            "limit5h" => self.seg_limit(segs, "5h", p.fh_pct, &p.fh_rst, &cfg.bg_5h),
-            "limit7d" => self.seg_limit(segs, "7d", p.wd_pct, &p.wd_rst, &cfg.bg_7d),
+            "limit5h" => {
+                // With VL_LIMIT_SYNC, show the freshest cross-session value for
+                // the current window (falling back to this session's snapshot).
+                let (mut pv, mut rs) = (p.fh_pct, p.fh_rst.clone());
+                if cfg.limit_sync {
+                    if let Some((pct, rst)) =
+                        crate::burn::rl_latest(&cfg.rl5h_file, crate::burn::RL_MAX_5H, self.now_epoch)
+                    {
+                        pv = pct.parse().ok();
+                        rs = rst.to_string();
+                    }
+                }
+                self.seg_limit(segs, "5h", pv, &rs, &cfg.bg_5h)
+            }
+            "limit7d" => {
+                let (mut pv, mut rs) = (p.wd_pct, p.wd_rst.clone());
+                if cfg.limit_sync {
+                    if let Some((pct, rst)) =
+                        crate::burn::rl_latest(&cfg.rl7d_file, crate::burn::RL_MAX_7D, self.now_epoch)
+                    {
+                        pv = pct.parse().ok();
+                        rs = rst.to_string();
+                    }
+                }
+                self.seg_limit(segs, "7d", pv, &rs, &cfg.bg_7d)
+            }
+            "burn" => {
+                // range-to-empty ETA until the binding 5h/7d limit hits 100%
+                if p.fh_pct_raw.is_empty() && p.wd_pct_raw.is_empty() {
+                    return;
+                }
+                let Some(b) = self.burn else { return };
+                let bgc = if cfg.bg_burn.is_empty() {
+                    &cfg.bg_5h
+                } else {
+                    &cfg.bg_burn
+                };
+                if b.state != "active" {
+                    // Idle (stopped burning) is genuinely all-good → dim ✓;
+                    // warming (no samples yet) is "unknown" → a distinct dim ….
+                    let glyph = if b.state == "warming" { "\u{2026}" } else { "\u{2713}" };
+                    self.push(
+                        segs,
+                        bgc,
+                        format!("{} {} {} ", self.fg_dim, cfg.burn_glyph, glyph),
+                    );
+                    return;
+                }
+                // All good: projected empty exceeds the limit's whole window.
+                let win = if b.label == "5h" { 18000 } else { 604800 };
+                if b.eta > win {
+                    self.push(
+                        segs,
+                        bgc,
+                        format!("{} {} \u{2713} ", self.fg_ok, cfg.burn_glyph),
+                    );
+                    return;
+                }
+                let col = if b.eta <= b.ttr {
+                    &self.fg_hot
+                } else if 10 * b.ttr >= 8 * b.eta {
+                    &self.fg_warn
+                } else {
+                    &self.fg_ok
+                };
+                self.push(
+                    segs,
+                    bgc,
+                    format!(
+                        "{} {} {} \u{21E2} {} ",
+                        col,
+                        cfg.burn_glyph,
+                        b.label,
+                        fmt_eta(b.eta)
+                    ),
+                );
+            }
             "cost" => {
                 let c = match p.cost {
                     Some(v) if v != 0.0 => v,
@@ -647,21 +903,42 @@ fn print_range_pill(cfg: &Config, segs: &[Seg], start: usize, end: usize) -> Str
 }
 
 fn print_range_lean(cfg: &Config, segs: &[Seg], start: usize, end: usize) -> String {
+    // VL_LEAN_BG paints one uniform background behind the row (the p10k
+    // "classic" look); re-asserted after every reset so the bar stays
+    // continuous across separators. The caps bevel the bar into the terminal:
+    // the glyph is drawn in the bar colour on the default background.
+    let lbg = if cfg.lean_bg.is_empty() {
+        String::new()
+    } else {
+        bg(&cfg.lean_bg)
+    };
     let mut out = String::new();
+    if !lbg.is_empty() && !cfg.lean_cap_l.is_empty() {
+        out.push_str(R);
+        out.push_str(&fg(&cfg.lean_bg));
+        out.push_str(&cfg.lean_cap_l);
+    }
     for i in start..=end {
         out.push_str(R);
+        out.push_str(&lbg);
         out.push_str(&fg(&segs[i].bg));
         out.push_str(&segs[i].txt);
         if i < end {
             out.push_str(R);
+            out.push_str(&lbg);
             out.push_str(&cfg.lean_sep);
         }
+    }
+    if !lbg.is_empty() && !cfg.lean_cap_r.is_empty() {
+        out.push_str(R);
+        out.push_str(&fg(&cfg.lean_bg));
+        out.push_str(&cfg.lean_cap_r);
     }
     out.push_str(R);
     out
 }
 
-fn print_range(cfg: &Config, segs: &[Seg], start: usize, end: usize) -> String {
+pub(crate) fn print_range(cfg: &Config, segs: &[Seg], start: usize, end: usize) -> String {
     if cfg.style == "lean" {
         print_range_lean(cfg, segs, start, end)
     } else {
@@ -688,6 +965,7 @@ pub fn render(
     min: u32,
     sec: u32,
     now_epoch: i64,
+    burn: Option<&crate::burn::Burn>,
 ) -> String {
     let ctx = Ctx {
         cfg,
@@ -698,6 +976,7 @@ pub fn render(
         min,
         sec,
         now_epoch,
+        burn,
         fg_text: fg(&cfg.fg_text),
         fg_dim: fg(&cfg.fg_dim),
         fg_ok: fg(&cfg.fg_ok),
@@ -727,7 +1006,10 @@ pub fn render(
                 w = 1;
             }
             let (cap_w, sep_w): (i64, i64) = if cfg.style == "lean" {
-                (0, cfg.lean_sep.chars().count() as i64)
+                (
+                    (cfg.lean_cap_l.chars().count() + cfg.lean_cap_r.chars().count()) as i64,
+                    cfg.lean_sep.chars().count() as i64,
+                )
             } else {
                 (2, 1)
             };
