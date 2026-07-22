@@ -177,6 +177,42 @@ Then add to `~/.claude/settings.json`:
 > installers bundle every theme; after a manual install, copy the rest of
 > `~/.claude/coralline-src/themes/*.conf` into `~/.claude/coralline/themes/` to switch themes.
 
+### Windows without Git Bash
+
+`statusline.sh` needs a bash to run it, so a PowerShell-only Windows machine (no Git for
+Windows, no WSL) cannot use it at all — `install.sh` is itself a bash script. `statusline.ps1` is
+a native Windows PowerShell 5.1 port that needs neither: no bash, no `jq`, only `git.exe` on
+`PATH` for the `git`/`stash`/`project` segments (already required for those segments in the bash
+version too).
+
+It reads the exact same `~/.claude/coralline.conf` (and theme file) a bash install already
+wrote, so nothing about the config format changes; only the renderer is new. See
+[coralline-8-scope.md](../../handoff/coralline-8-scope.md) in the factory notes for the segment
+parity matrix and what is not ported yet (`lean`/`classic` styles, the `auto` responsive-wrap
+layout, the `burn` segment, and the `--subagent` panel-row protocol; unsupported style/layout
+values fall back to `pill`/`fixed` instead of erroring).
+
+```powershell
+git clone https://github.com/Nanako0129/coralline C:\Users\you\.claude\coralline-src
+New-Item -ItemType Directory -Force C:\Users\you\.claude\coralline\themes
+Copy-Item C:\Users\you\.claude\coralline-src\statusline.ps1 C:\Users\you\.claude\coralline\
+Copy-Item C:\Users\you\.claude\coralline-src\themes\*.conf C:\Users\you\.claude\coralline\themes\
+```
+
+Then add to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "powershell -NoProfile -File C:/Users/you/.claude/coralline/statusline.ps1"
+  }
+}
+```
+
+Run the wizard-written config from a bash install, or write `~/.claude/coralline.conf` by hand
+(see any file under `themes/` for the shape); both work with `statusline.ps1` unchanged.
+
 ### Updating
 
 Two ways to update, both driven by the same installer. Either way your
