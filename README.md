@@ -101,7 +101,8 @@ The renderer shares your config file but reads only the knobs that shape a row:
 `VL_LEAN_CAP_L`/`VL_LEAN_CAP_R`, `VL_LEAN_FG`, `VL_BG_BAR`) — `VL_ASCII`,
 `VL_NAME_MAX` (recommended — panel labels are long, and overlong rows are
 clipped from the right, hiding model/ctx first), the gauge knobs
-(`VL_BAR_WIDTH`, `VL_BAR_FILL`, `VL_BAR_EMPTY`, `VL_WARN_PCT`, `VL_HOT_PCT`),
+(`VL_BAR_WIDTH`, `VL_BAR_FILL`, `VL_BAR_EMPTY`, `VL_CTX_GLYPH`, `VL_WARN_PCT`,
+`VL_HOT_PCT`),
 the shared palette (`VL_FG_TEXT`, `VL_FG_DIM`, `VL_FG_OK`, `VL_FG_WARN`,
 `VL_FG_HOT`), and the row colors `VL_BG_SUB_NAME` / `VL_BG_SUB_MODEL` /
 `VL_BG_SUB_CTX` / `VL_BG_SUB_ELAPSED` (empty = fall back to `VL_BG_DIR` /
@@ -330,6 +331,9 @@ Everything lives in `~/.claude/coralline.conf` (plain bash, sourced by the scrip
 | `VL_CLOCK` | `12h` | `12h` / `24h` / `off` |
 | `VL_CLOCK_SECONDS` | `1` | show seconds in the clock |
 | `VL_BAR_WIDTH` | `5` | gauge width in cells |
+| `VL_BAR_FILL` / `VL_BAR_EMPTY` | `▰` / `▱` | gauge glyphs |
+| `VL_CTX_GLYPH` | `⬡` | glyph for the `ctx` segment |
+| `VL_PROJECT_GLYPH` | `⬢` | glyph for the `project` segment |
 | `VL_PATH_DEPTH` | `4` | collapse paths deeper than this |
 | `VL_NAME_MAX` | `0` | max chars for the `project` / `git` names before `…` truncation (`0` = off) |
 | `VL_COST_DECIMALS` | `2` | decimal places for the cost segment |
@@ -337,6 +341,18 @@ Everything lives in `~/.claude/coralline.conf` (plain bash, sourced by the scrip
 | `VL_ASCII` | `0` | `1` disables Nerd Font glyphs |
 | `VL_RUNTIME_PROBE` | `0` | `node` / `python`: `1` = also detect via `node` / `python3` on `PATH` when no pin file (forks per render) |
 | `VL_BG_*` / `VL_FG_*` | theme | colors — `256`-color index or `"R,G,B"` |
+
+The four glyph settings above — `VL_BAR_FILL`, `VL_BAR_EMPTY`, `VL_CTX_GLYPH`,
+`VL_PROJECT_GLYPH` — are plain Unicode, not Nerd Font icons, so Nerd Fonts does not patch
+them in and a font that lacks them leaves the substitution to your terminal's own font
+fallback. If the substitute is wider than one cell it shoves the rest of the row out
+of alignment — a squashed gauge, or a missing space before the percentage. Override them
+with characters your terminal font actually carries. `▪` / `▫` for the gauge and `◔` for
+`ctx` are present at exactly one cell in both Meslo and JetBrainsMono Nerd Font:
+
+```sh
+VL_BAR_FILL="▪" ; VL_BAR_EMPTY="▫" ; VL_CTX_GLYPH="◔"
+```
 
 ### Burn-rate segment
 
@@ -511,6 +527,20 @@ It runs every second (`refreshInterval: 1`), so the script is built to be cheap 
 `jq` invocation extracts every field at once, and one `git status --porcelain=v2 --branch`
 call provides branch, dirty state, and ahead/behind together. No `bc`, no per-field subprocess
 spam. Works on stock macOS bash 3.2 and any Linux bash.
+
+## Support coralline
+
+coralline makes no network or API calls and uses zero tokens at runtime. The
+maintenance work is elsewhere: tracking Claude Code payload changes, optional
+live subagent-panel checks, shell regressions, nine-theme screenshot and font
+QA, and installer verification across macOS, Linux, and Windows with Git Bash.
+
+Sponsorship helps cover the Claude access and maintainer time behind that
+compatibility work while coralline remains MIT-licensed and free. If the
+statusline makes your daily sessions clearer, you can support its continued
+development on Ko-fi.
+
+[![Support coralline on Ko-fi](https://img.shields.io/badge/Support_on_Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/nanako0129)
 
 ## Acknowledgements
 

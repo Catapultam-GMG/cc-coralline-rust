@@ -98,7 +98,7 @@ subagent renderer 與主列共用同一份 config，但只讀取與「單列外�
 `VL_LEAN_CAP_L`/`VL_LEAN_CAP_R`、`VL_LEAN_FG`、`VL_BG_BAR`）——`VL_ASCII`、
 `VL_NAME_MAX`（建議設定——面板 label 通常很長，列過寬時 Claude Code 從右側裁切，
 最先消失的就是 model/ctx）、用量條參數（`VL_BAR_WIDTH`、`VL_BAR_FILL`、
-`VL_BAR_EMPTY`、`VL_WARN_PCT`、`VL_HOT_PCT`）、共用色盤（`VL_FG_TEXT`、
+`VL_BAR_EMPTY`、`VL_CTX_GLYPH`、`VL_WARN_PCT`、`VL_HOT_PCT`）、共用色盤（`VL_FG_TEXT`、
 `VL_FG_DIM`、`VL_FG_OK`、`VL_FG_WARN`、`VL_FG_HOT`），以及列顏色
 `VL_BG_SUB_NAME` / `VL_BG_SUB_MODEL` / `VL_BG_SUB_CTX` / `VL_BG_SUB_ELAPSED`
 （留空 = 分別退回 `VL_BG_DIR` / `VL_BG_MODEL` / `VL_BG_CTX` /
@@ -278,6 +278,9 @@ curl -fsSL https://raw.githubusercontent.com/YOU/coralline/main/install.sh | bas
 | `VL_CLOCK` | `12h` | `12h` / `24h` / `off` |
 | `VL_CLOCK_SECONDS` | `1` | 時鐘是否顯示秒數 |
 | `VL_BAR_WIDTH` | `5` | 量表寬度（格數） |
+| `VL_BAR_FILL` / `VL_BAR_EMPTY` | `▰` / `▱` | 量表字符 |
+| `VL_CTX_GLYPH` | `⬡` | `ctx` 區段的字符 |
+| `VL_PROJECT_GLYPH` | `⬢` | `project` 區段的字符 |
 | `VL_PATH_DEPTH` | `4` | 路徑超過此深度即摺疊 |
 | `VL_NAME_MAX` | `0` | `project` / `git` 名稱超過此字數即以 `…` 截斷（`0` = 關閉） |
 | `VL_COST_DECIMALS` | `2` | 費用顯示的小數位數 |
@@ -285,6 +288,16 @@ curl -fsSL https://raw.githubusercontent.com/YOU/coralline/main/install.sh | bas
 | `VL_ASCII` | `0` | 設為 `1` 停用 Nerd Font 字符 |
 | `VL_RUNTIME_PROBE` | `0` | `node` / `python`：設為 `1` 時，若無 pin 檔則改用 `PATH` 上的 `node` / `python3` 偵測（每次繪製會 fork） |
 | `VL_BG_*` / `VL_FG_*` | 依主題 | 顏色——256 色編號或 `"R,G,B"` |
+
+上述四個字符設定（`VL_BAR_FILL`、`VL_BAR_EMPTY`、`VL_CTX_GLYPH`、`VL_PROJECT_GLYPH`）
+屬於一般 Unicode，並非 Nerd Font 圖示，因此 Nerd Fonts 不會補進字型；
+若你的字型沒有這些字，替代就交給終端機自己的 fallback 決定。一旦替代字寬於一格，整列
+就會被推歪——量表擠成一團，或百分比前面的空格被吃掉。此時請改成終端機字型確實具備的字符。
+`▪` / `▫`（量表）與 `◔`（`ctx`）在 Meslo 與 JetBrainsMono Nerd Font 中都存在且剛好一格寬：
+
+```sh
+VL_BAR_FILL="▪" ; VL_BAR_EMPTY="▫" ; VL_CTX_GLYPH="◔"
+```
 
 ### 消耗率區段
 

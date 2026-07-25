@@ -44,6 +44,7 @@ VL_NOCOLOR=0                    # internal: fg()/bg() emit nothing when 1
 # Cross-session limit sync (opt-in). Records high-water across sessions so
 # idle sessions converge when they next redraw.
 VL_LIMIT_SYNC=0
+VL_CTX_GLYPH="⬡"                # glyph for the ctx segment
 NEW
 
 # ---- Section A: name extractors ------------------------------------------
@@ -57,6 +58,12 @@ case "$knobs" in *" VL_LIMIT_SYNC "*) check "knob_names finds VL_LIMIT_SYNC" 1 ;
 case "$knobs" in *" VL_BG_BURN "*)    check "knob_names EXCLUDES color knob (non-0 default)" 0 ;; *) check "knob_names EXCLUDES color knob (non-0 default)" 1 ;; esac
 case "$knobs" in *" VL_NOCOLOR "*)    check "knob_names EXCLUDES internal-tagged knob" 0 ;; *) check "knob_names EXCLUDES internal-tagged knob" 1 ;; esac
 case "$knobs" in *" VL_NAME_MAX "*)   check "knob_names EXCLUDES numeric 0=off value knob" 0 ;; *) check "knob_names EXCLUDES numeric 0=off value knob" 1 ;; esac
+
+# A glyph knob must never reach the option list. Its token would be the exact
+# assignment the UPGRADE.md playbook appends, and the shipped default is a no-op
+# while a replacement would change the look of an install that renders fine, so
+# the font check lives in UPGRADE.md's verification step instead (#47).
+case "$knobs" in *" VL_CTX_GLYPH "*)  check "knob_names EXCLUDES glyph knob (string default)"  0 ;; *) check "knob_names EXCLUDES glyph knob (string default)"  1 ;; esac
 
 # ---- Section B: description extractors ------------------------------------
 eval "$(sed -n '/^segment_desc() {/,/^}/p' "$CONF")"
@@ -80,6 +87,7 @@ printf '%s\n' "$rep" | grep -q 'new since your installed copy' && check "report 
 printf '%s\n' "$rep" | grep -qE 'segment +burn'                 && check "report lists burn segment" 1 || check "report lists burn segment" 0
 printf '%s\n' "$rep" | grep -qE 'option +VL_FLOAT=1'            && check "report lists VL_FLOAT=1" 1 || check "report lists VL_FLOAT=1" 0
 printf '%s\n' "$rep" | grep -q 'also write a plain-text readout' && check "report shows knob desc" 1 || check "report shows knob desc" 0
+printf '%s\n' "$rep" | grep -q 'VL_CTX_GLYPH'                   && check "report omits glyph knobs entirely" 0 || check "report omits glyph knobs entirely" 1
 printf '%s\n' "$rep" | grep -q 'backup at /home/u/.claude/coralline/statusline.sh.bak.20260622-100501' && check "report names backup path" 1 || check "report names backup path" 0
 printf '%s\n' "$rep" | grep -qE 'option +VL_BG_BURN' && check "report omits filtered color knob" 0 || check "report omits filtered color knob" 1
 
@@ -196,6 +204,10 @@ for h in '## Overview' '## Fast Path' '## Read the delta' '## Enable interview' 
 done
 grep -q -- '--install-only' "$UP" 2>/dev/null && check "UPGRADE.md drives --install-only" 1 || check "UPGRADE.md drives --install-only" 0
 grep -q 'VL_SEGMENTS2' "$UP" 2>/dev/null && check "UPGRADE.md handles VL_SEGMENTS2/3" 1 || check "UPGRADE.md handles VL_SEGMENTS2/3" 0
+# The glyph/font check has to live here precisely because the delta cannot carry
+# it (#47), so pin that the playbook keeps it and names all four knobs.
+grep -q 'VL_CTX_GLYPH' "$UP" 2>/dev/null && grep -q 'VL_BAR_EMPTY' "$UP" 2>/dev/null \
+  && check "UPGRADE.md carries the glyph/font check" 1 || check "UPGRADE.md carries the glyph/font check" 0
 grep -qi 'AI coding assistant' "$UP" 2>/dev/null && check "UPGRADE.md has AI callout" 1 || check "UPGRADE.md has AI callout" 0
 
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "SOME FAILED"; exit 1; fi
