@@ -1175,25 +1175,27 @@ fi
 IFS=$'\037' read -r cwd model ctx_pct tok_in tok_out tok_cr tok_cw \
                  fh_pct fh_rst wd_pct wd_rst cost \
                  lines_add lines_del out_style dur_ms effort <<JSON
-$(printf '%s' "$input" | jq -r '[
-  (.workspace.current_dir // .cwd // ""),
-  (.model.display_name // ""),
-  (.context_window.used_percentage // "" | tostring),
-  (.context_window.total_input_tokens // 0),
-  (.context_window.total_output_tokens // 0),
-  (.context_window.current_usage.cache_read_input_tokens // 0),
-  (.context_window.current_usage.cache_creation_input_tokens // 0),
-  (.rate_limits.five_hour.used_percentage // "" | tostring),
-  (.rate_limits.five_hour.resets_at // "" | tostring),
-  (.rate_limits.seven_day.used_percentage // "" | tostring),
-  (.rate_limits.seven_day.resets_at // "" | tostring),
-  (.cost.total_cost_usd // "" | tostring),
-  (.cost.total_lines_added // 0),
-  (.cost.total_lines_removed // 0),
-  (.output_style.name // ""),
-  (.cost.total_duration_ms // 0),
-  (.effort.level // "")
-] | map(tostring) | join("")' 2>/dev/null)
+$(printf '%s' "$input" | jq -r '
+  def scrub: tostring | gsub("[\\x00-\\x1f\\x7f\u0080-\u009f]"; "");
+  [
+    (.workspace.current_dir // .cwd // ""),
+    (.model.display_name // ""),
+    (.context_window.used_percentage // "" | tostring),
+    (.context_window.total_input_tokens // 0),
+    (.context_window.total_output_tokens // 0),
+    (.context_window.current_usage.cache_read_input_tokens // 0),
+    (.context_window.current_usage.cache_creation_input_tokens // 0),
+    (.rate_limits.five_hour.used_percentage // "" | tostring),
+    (.rate_limits.five_hour.resets_at // "" | tostring),
+    (.rate_limits.seven_day.used_percentage // "" | tostring),
+    (.rate_limits.seven_day.resets_at // "" | tostring),
+    (.cost.total_cost_usd // "" | tostring),
+    (.cost.total_lines_added // 0),
+    (.cost.total_lines_removed // 0),
+    (.output_style.name // ""),
+    (.cost.total_duration_ms // 0),
+    (.effort.level // "")
+  ] | map(scrub) | join("")' 2>/dev/null)
 JSON
 
 _SEG_SCAN=" $VL_SEGMENTS $VL_SEGMENTS2 $VL_SEGMENTS3 "
