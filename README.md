@@ -187,17 +187,24 @@ a native Windows PowerShell 5.1 port that needs neither: no bash, no `jq`, only 
 version too).
 
 It reads the exact same `~/.claude/coralline.conf` (and theme file) a bash install already
-wrote, so nothing about the config format changes; only the renderer is new. See
-[coralline-8-scope.md](../../handoff/coralline-8-scope.md) in the factory notes for the segment
-parity matrix and what is not ported yet (`lean`/`classic` styles, the `auto` responsive-wrap
-layout, the `burn` segment, and the `--subagent` panel-row protocol; unsupported style/layout
-values fall back to `pill`/`fixed` instead of erroring).
+wrote, so nothing about the config format changes; only the renderer is new. The native main
+bar supports the same segments, `pill`/`lean`/`classic` styles, `fixed`/`auto` layouts, burn
+history, limit sync, and float publication as the bash renderer. The `--subagent` panel-row
+protocol remains bash-only and exits without output in `statusline.ps1`.
 
 ```powershell
-git clone https://github.com/Nanako0129/coralline C:\Users\you\.claude\coralline-src
-New-Item -ItemType Directory -Force C:\Users\you\.claude\coralline\themes
-Copy-Item C:\Users\you\.claude\coralline-src\statusline.ps1 C:\Users\you\.claude\coralline\
-Copy-Item C:\Users\you\.claude\coralline-src\themes\*.conf C:\Users\you\.claude\coralline\themes\
+$download = Join-Path $env:TEMP ("coralline-" + [guid]::NewGuid())
+$archive = Join-Path $download "coralline-main.zip"
+New-Item -ItemType Directory -Force $download | Out-Null
+Invoke-WebRequest https://github.com/Nanako0129/coralline/archive/refs/heads/main.zip -UseBasicParsing -OutFile $archive
+Expand-Archive $archive -DestinationPath $download
+
+$source = Join-Path $download "coralline-main"
+$target = Join-Path $HOME ".claude\coralline"
+New-Item -ItemType Directory -Force (Join-Path $target "themes") | Out-Null
+Copy-Item (Join-Path $source "statusline.ps1") $target
+Copy-Item (Join-Path $source "themes\*.conf") (Join-Path $target "themes")
+Remove-Item $download -Recurse -Force
 ```
 
 Then add to `~/.claude/settings.json`:
@@ -206,13 +213,16 @@ Then add to `~/.claude/settings.json`:
 {
   "statusLine": {
     "type": "command",
-    "command": "powershell -NoProfile -File C:/Users/you/.claude/coralline/statusline.ps1"
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/you/.claude/coralline/statusline.ps1"
   }
 }
 ```
 
 Run the wizard-written config from a bash install, or write `~/.claude/coralline.conf` by hand
-(see any file under `themes/` for the shape); both work with `statusline.ps1` unchanged.
+(see any file under `themes/` for the shape); both work with `statusline.ps1` unchanged. The
+per-process `ExecutionPolicy Bypass` lets the unsigned local renderer start when the normal
+session default would otherwise be `Restricted`; it does not change any persisted policy, and
+an enforced Group Policy still takes precedence.
 
 ### Updating
 
@@ -511,12 +521,11 @@ The wizard discovers themes automatically from `themes/*.conf` and nested collec
 | macOS | ✅ supported (works on the stock bash 3.2) |
 | Linux | ✅ supported |
 | Windows + Git Bash | ✅ supported — Claude Code runs the status line through Git Bash when it's installed |
-| Windows without Git Bash | ❌ not yet — Claude Code falls back to PowerShell, which can't run the bash script ([roadmap](https://github.com/Nanako0129/coralline/issues)) |
+| Windows without Git Bash | ✅ supported for the main bar through native Windows PowerShell 5.1 |
 
-> **Windows note:** install [Git for Windows](https://git-scm.com/download/win) (which bundles
-> Git Bash) and `jq`, and coralline runs natively. A native PowerShell port for the no-Git-Bash
-> case is on the roadmap. The render path is built to stay cheap under Git Bash's emulated
-> `fork()` — one `jq`, one `git`, and no per-field subprocess spawning.
+> **Windows note:** the native PowerShell renderer needs neither Git Bash nor `jq`. `git.exe`
+> is optional and only enables the `git`, `stash`, and `project` segments. The interactive
+> wizard and themed `--subagent` rows remain bash-only.
 
 ## Why it's fast
 

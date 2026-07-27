@@ -148,6 +148,8 @@ $Defaults = [ordered]@{
 
 $PathConfigKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
 foreach ($key in @('VL_FLOAT_FILE', 'BURN_FILE', 'RL5H_FILE', 'RL7D_FILE')) { [void]$PathConfigKeys.Add($key) }
+$ConfigKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+foreach ($key in $Defaults.Keys) { [void]$ConfigKeys.Add([string]$key) }
 
 function Add-Utf8Text([System.Collections.Generic.List[byte]]$Bytes, [string]$Text) {
     try {
@@ -551,7 +553,10 @@ function Import-ConfigFile(
                 }
                 continue
             }
-            $candidate[$name] = $decoded.Value
+            # Bash variable names are case-sensitive. OrderedDictionary is not,
+            # so ignore unknown and case-variant keys instead of letting them
+            # overwrite a supported setting.
+            if ($ConfigKeys.Contains($name)) { $candidate[$name] = $decoded.Value }
             continue
         }
 
@@ -758,11 +763,24 @@ function Get-PctFg([int]$Pct) {
 
 function Get-Trunc([string]$S, [int]$Max) {
     if ($null -eq $S) { return '' }
-    if ($Max -le 0 -or $S.Length -le $Max) { return $S }
-    if ($Max -lt 3) { return $S.Substring(0, $Max) }
+    if ($Max -le 0) { return $S }
+    $offsets = New-Object 'System.Collections.Generic.List[int]'
+    for ($i = 0; $i -lt $S.Length) {
+        [void]$offsets.Add($i)
+        if ([char]::IsHighSurrogate($S[$i]) -and ($i + 1) -lt $S.Length -and [char]::IsLowSurrogate($S[$i + 1])) { $i += 2 }
+        else { $i++ }
+    }
+    $count = $offsets.Count
+    if ($count -le $Max) { return $S }
+    if ($Max -lt 3) {
+        $end = if ($Max -lt $count) { $offsets[$Max] } else { $S.Length }
+        return $S.Substring(0, $end)
+    }
     $head = [int][math]::Floor(($Max - 1) / 2)
     $tail = $Max - 1 - $head
-    return $S.Substring(0, $head) + $G.Ellipsis + $S.Substring($S.Length - $tail)
+    $headEnd = if ($head -lt $count) { $offsets[$head] } else { $S.Length }
+    $tailStart = $offsets[$count - $tail]
+    return $S.Substring(0, $headEnd) + $G.Ellipsis + $S.Substring($tailStart)
 }
 
 function ConvertTo-Epoch([string]$Raw) {
@@ -1414,8 +1432,30 @@ $effort = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('effort', '
 
 function ConvertTo-ProbePath([string]$Path) {
     if ([string]::IsNullOrEmpty($Path)) { return '' }
-    $full = ConvertTo-LocalFullPath $Path ([Environment]::CurrentDirectory)
-    if ($null -eq $full) { return '' }
+    if ($Path.Length -gt 4096 -or $Path -match '[\u0000-\u001f\u007f-\u009f]') { return '' }
+    $p = $Path.Replace('/', '\')
+    if ($p.StartsWith('\\?\', [System.StringComparison]::Ordinal) -or $p.StartsWith('\\.\', [System.StringComparison]::Ordinal)) { return '' }
+    if (-not $p.StartsWith('\\', [System.StringComparison]::Ordinal)) {
+        $local = ConvertTo-LocalFullPath $Path ([Environment]::CurrentDirectory)
+        if ($null -eq $local) { return '' }
+        return $local
+    }
+
+    # Workspace probes are read-only and may follow a normal UNC path. Config,
+    # include, float, burn, and rate-limit paths keep using the stricter local
+    # validator above and therefore still reject every UNC form.
+    $parts = $p.Substring(2).Split(@('\'), [System.StringSplitOptions]::None)
+    if ($parts.Length -lt 2 -or [string]::IsNullOrEmpty($parts[0]) -or [string]::IsNullOrEmpty($parts[1])) { return '' }
+    for ($i = 0; $i -lt $parts.Length; $i++) {
+        $component = $parts[$i]
+        if ([string]::IsNullOrEmpty($component)) { continue }
+        if (($i -lt 2) -and ($component -eq '.' -or $component -eq '..')) { return '' }
+        if ($component -eq '.' -or $component -eq '..') { continue }
+        if ($component.EndsWith('.') -or $component.EndsWith(' ')) { return '' }
+        if ($component -match '[<>"\|\?\*:]' -or (Test-DosDeviceComponent $component)) { return '' }
+    }
+    try { $full = [System.IO.Path]::GetFullPath($p) } catch { return '' }
+    if ([string]::IsNullOrEmpty($full) -or $full.Length -gt 4096 -or -not $full.StartsWith('\\', [System.StringComparison]::Ordinal)) { return '' }
     return $full
 }
 

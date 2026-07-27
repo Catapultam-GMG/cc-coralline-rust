@@ -638,6 +638,30 @@ fi
     Check-Exact 'Unicode Git repository differential is byte exact' $unicodePs $unicodeBash
     Check 'Unicode Git keeps project and branch text' ((Plain $unicodePs.Stdout).Contains($unicodeLeaf) -and (Plain $unicodePs.Stdout).Contains($unicodeBranch))
 
+    $scalar = Glyph 0x1F600
+    $scalarRoot = Join-Path $TempRoot ($scalar + 'repo')
+    [void][System.IO.Directory]::CreateDirectory($scalarRoot)
+    Write-Utf8 (Join-Path $scalarRoot 'tracked.txt') "tracked`n"
+    [void](Run-Git $scalarRoot 'init -q')
+    [void](Run-Git $scalarRoot ('checkout -q -b ' + $scalar + 'branch'))
+    [void](Run-Git $scalarRoot 'config user.email test@example.com')
+    [void](Run-Git $scalarRoot 'config user.name test')
+    [void](Run-Git $scalarRoot 'add tracked.txt')
+    [void](Run-Git $scalarRoot 'commit -q -m init')
+    $scalarPayload = New-Payload (Forward-Path $scalarRoot)
+    $scalarOneConfig = New-Config 'unicode-scalar-max-one' @('VL_SEGMENTS=project\ git','VL_CLOCK=off','VL_NAME_MAX=1')
+    $scalarOnePs = Invoke-Statusline (Json $scalarPayload) $scalarOneConfig @{} '' 5000
+    Check-Run 'PowerShell Unicode scalar max one' $scalarOnePs
+    Check 'Unicode scalar max one preserves the complete scalar' ((Plain $scalarOnePs.Stdout).Contains($scalar))
+    Check 'Unicode scalar max one emits no replacement character' (-not $scalarOnePs.Stdout.Contains([char]0xFFFD))
+
+    [void](Run-Git $scalarRoot ('branch -m ' + 'ABCD' + $scalar + 'F'))
+    $scalarTailConfig = New-Config 'unicode-scalar-tail' @('VL_SEGMENTS=git','VL_CLOCK=off','VL_NAME_MAX=4')
+    $scalarTailPs = Invoke-Statusline (Json $scalarPayload) $scalarTailConfig @{} '' 5000
+    Check-Run 'PowerShell Unicode scalar tail boundary' $scalarTailPs
+    Check 'Unicode scalar tail keeps the complete suffix' ((Plain $scalarTailPs.Stdout).Contains('A' + (Glyph 0x2026) + $scalar + 'F'))
+    Check 'Unicode scalar tail emits no replacement character' (-not $scalarTailPs.Stdout.Contains([char]0xFFFD))
+
     $script:QuoteHelper = Join-Path $TempRoot 'configure-quote.sh'
     Write-Utf8 $script:QuoteHelper @'
 #!/usr/bin/env bash
@@ -651,6 +675,20 @@ shell_quote "$CORALLINE_Q_VALUE"
     Check-Run 'configure %q segment list' $quotedRun
     $quotedPlain = Plain $quotedRun.Stdout
     Check 'configure %q segment list renders every token' ($quotedPlain.Contains($repoLeaf) -and $quotedPlain.Contains('main') -and $quotedPlain.Contains('MODEL_SENTINEL') -and $quotedPlain.Contains('62%'))
+
+    $caseConfig = New-Config 'case-sensitive-keys' @(
+        'VL_SEGMENTS=model',
+        'vl_segments=clock',
+        'VL_CLOCK=off',
+        'VL_BG_MODEL=56',
+        'vl_bg_model=196'
+    )
+    $casePs = Invoke-Statusline (Json $basePayload) $caseConfig @{} '' 5000
+    $caseBash = Invoke-BashStatusline (Json $basePayload) $caseConfig @{}
+    Check-Run 'PowerShell case-sensitive config keys' $casePs
+    Check-Run 'Bash case-sensitive config keys' $caseBash
+    Check-Exact 'case-variant config keys cannot overwrite supported keys' $casePs $caseBash
+    Check 'case-sensitive config keeps the model segment' ((Plain $casePs.Stdout).Contains('MODEL_SENTINEL'))
 
     $paddedQuote = Quote-FromConfigure ' model '
     $paddedLine = 'VL_SEGMENTS=' + $paddedQuote
@@ -1788,6 +1826,16 @@ fi
         $uncRun = Invoke-Statusline (Json $statePayload) $uncConfig $stateEnvWrite '' 5000
         Check-Run 'WIN-02 UNC state rejection' $uncRun
         Check 'WIN-02 UNC state rejection is pre-I/O' (-not [IO.Directory]::Exists((Join-Path ([IO.Path]::GetDirectoryName($localStateBase)) 'burn.d')))
+
+        $uncGitRoot = '\\localhost\' + $driveRoot.Substring(0,1) + '$\' + $gitRoot.Substring($driveRoot.Length)
+        $uncPayload = New-Payload $uncGitRoot
+        $uncProbeConfig = New-Config 'win03-unc-read-probes' @('VL_SEGMENTS=git\ stash\ project\ node\ python','VL_CLOCK=off')
+        $uncProbeRun = Invoke-Statusline (Json $uncPayload) $uncProbeConfig @{} '' 10000
+        $uncProbePlain = Plain $uncProbeRun.Stdout
+        Check-Run 'WIN-03 UNC read-only workspace probes' $uncProbeRun
+        Check 'WIN-03 UNC git and project probes render' ($uncProbePlain.Contains('main') -and $uncProbePlain.Contains($repoLeaf))
+        Check 'WIN-03 UNC stash probe renders' ($uncProbePlain.Contains((Glyph 0x2691) + ' 1 '))
+        Check 'WIN-03 UNC runtime pin probes render' ($uncProbePlain.Contains('20.11.1') -and $uncProbePlain.Contains('3.12.2'))
     }
 
     foreach ($deviceBase in @('\\?\' + $localStateBase, '\\.\' + $localStateBase)) {

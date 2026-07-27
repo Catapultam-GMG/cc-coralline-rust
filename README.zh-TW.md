@@ -169,6 +169,49 @@ cp ~/.claude/coralline-src/themes/claude-coral.conf ~/.claude/coralline/themes/
 > **注意：** 上面的指令只複製 `claude-coral` 一個主題。「請 Claude 安裝」與一行安裝會帶上全部主題；
 > 手動安裝後若要換主題，把 `~/.claude/coralline-src/themes/*.conf` 其餘的也複製進 `~/.claude/coralline/themes/`。
 
+### Windows 無 Git Bash
+
+`statusline.sh` 本身需要 bash，因此只有 Windows PowerShell 5.1、沒有 Git for Windows
+或 WSL 的電腦無法執行它。`statusline.ps1` 是原生 Windows PowerShell 5.1 renderer，
+不需要 bash 或 `jq`；只有啟用 `git`／`stash`／`project` segments 時才需要 `PATH`
+中有 `git.exe`。
+
+它會讀取 bash 版本相同的 `~/.claude/coralline.conf` 與 theme 檔。原生主列與 bash
+renderer 支援相同的 segments、`pill`／`lean`／`classic` styles、
+`fixed`／`auto` layouts、burn history、limit sync 與 float publication。
+只有 `--subagent` 面板列協定仍限定使用 bash；`statusline.ps1 --subagent` 不會輸出內容。
+
+```powershell
+$download = Join-Path $env:TEMP ("coralline-" + [guid]::NewGuid())
+$archive = Join-Path $download "coralline-main.zip"
+New-Item -ItemType Directory -Force $download | Out-Null
+Invoke-WebRequest https://github.com/Nanako0129/coralline/archive/refs/heads/main.zip -UseBasicParsing -OutFile $archive
+Expand-Archive $archive -DestinationPath $download
+
+$source = Join-Path $download "coralline-main"
+$target = Join-Path $HOME ".claude\coralline"
+New-Item -ItemType Directory -Force (Join-Path $target "themes") | Out-Null
+Copy-Item (Join-Path $source "statusline.ps1") $target
+Copy-Item (Join-Path $source "themes\*.conf") (Join-Path $target "themes")
+Remove-Item $download -Recurse -Force
+```
+
+接著在 `~/.claude/settings.json` 加入：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/you/.claude/coralline/statusline.ps1"
+  }
+}
+```
+
+可以沿用 bash wizard 已寫好的設定，或參考 `themes/` 內任一檔案手動建立
+`~/.claude/coralline.conf`。per-process `ExecutionPolicy Bypass` 讓未簽章的本機
+renderer 在一般 session 預設為 `Restricted` 時仍能啟動；它不會修改任何持久化 policy，
+且強制套用的 Group Policy 仍具有最高優先權。
+
 ### 更新
 
 兩種更新方式，都由同一支 installer 驅動。無論哪種，你的 `~/.claude/coralline.conf`
@@ -421,11 +464,11 @@ wizard 會自動掃描 `themes/*.conf` 與 `themes/best-themes/*.conf` 這類巢
 | macOS | ✅ 支援（內建 bash 3.2 即可） |
 | Linux | ✅ 支援 |
 | Windows + Git Bash | ✅ 支援——有裝 Git Bash 時，Claude Code 會用它執行 statusline |
-| Windows 無 Git Bash | ❌ 暫不支援——Claude Code 會退回 PowerShell，跑不了 bash 腳本（[roadmap](https://github.com/Nanako0129/coralline/issues)） |
+| Windows 無 Git Bash | ✅ 原生 Windows PowerShell 5.1 支援主列 |
 
-> **Windows 提醒：** 裝 [Git for Windows](https://git-scm.com/download/win)（內含 Git Bash）和 `jq`，
-> coralline 即可原生運作。給「無 Git Bash」情境的原生 PowerShell 版本列在 roadmap 上。渲染流程
-> 特意設計成在 Git Bash 模擬的 `fork()` 下仍便宜——一個 `jq`、一個 `git`，沒有逐欄位的子程序開銷。
+> **Windows 提醒：** 原生 PowerShell renderer 不需要 Git Bash 或 `jq`。`git.exe`
+> 是選用項目，只用來啟用 `git`、`stash`、`project` segments。互動式 wizard 與套用
+> theme 的 `--subagent` 列仍限定使用 bash。
 
 ## 為什麼很快
 
