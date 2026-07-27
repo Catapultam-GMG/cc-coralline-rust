@@ -311,11 +311,15 @@ Claude 不需要操作這個人類 TUI。
 
 ### 重新設定
 
-每一種安裝方式都會把 wizard 複製到 `~/.claude/coralline`，所以你隨時可以重跑來重新調整外觀：
+兩種 Bash 安裝方式都會把 wizard 複製到 `~/.claude/coralline`，所以有 Bash 的環境可隨時
+重跑來重新調整外觀：
 
 ```bash
 bash ~/.claude/coralline/configure.sh
 ```
+
+PowerShell-only 安裝不含原生 wizard。請先備份再手動編輯
+`$HOME\.claude\coralline.conf`，或沿用在有 Bash 的環境產生的設定。
 
 ### 測試 fork
 

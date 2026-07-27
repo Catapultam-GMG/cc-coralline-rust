@@ -330,12 +330,15 @@ operate that TUI unless you explicitly ask for visual customization.
 
 ### Reconfigure
 
-Every install path copies the wizard into `~/.claude/coralline`, so you can rerun it anytime to
-restyle:
+Both Bash install paths copy the wizard into `~/.claude/coralline`, so Bash-capable users can
+rerun it anytime to restyle:
 
 ```bash
 bash ~/.claude/coralline/configure.sh
 ```
+
+PowerShell-only installs do not include a native wizard. Back up and edit
+`$HOME\.claude\coralline.conf` manually, or reuse a config produced on a Bash-capable host.
 
 ### Testing a fork
 
