@@ -690,6 +690,28 @@ shell_quote "$CORALLINE_Q_VALUE"
     Check-Exact 'case-variant config keys cannot overwrite supported keys' $casePs $caseBash
     Check 'case-sensitive config keeps the model segment' ((Plain $casePs.Stdout).Contains('MODEL_SENTINEL'))
 
+    $segmentCaseConfig = New-Config 'case-sensitive-segment-name' @('VL_SEGMENTS=CLOCK', 'VL_CLOCK=24h')
+    $segmentCasePs = Invoke-Statusline (Json $basePayload) $segmentCaseConfig @{} '' 5000
+    $segmentCaseBash = Invoke-BashStatusline (Json $basePayload) $segmentCaseConfig @{}
+    Check-Run 'PowerShell case-sensitive segment name' $segmentCasePs
+    Check-Run 'Bash case-sensitive segment name' $segmentCaseBash
+    Check-Exact 'case-variant segment name stays unknown' $segmentCasePs $segmentCaseBash
+    Check 'case-variant segment name renders nothing' ([string]::IsNullOrEmpty($segmentCasePs.Stdout))
+
+    $styleCaseConfig = New-Config 'case-sensitive-style-value' @('VL_SEGMENTS=model\ ctx', 'VL_CLOCK=off', 'VL_STYLE=CLASSIC')
+    $styleCasePs = Invoke-Statusline (Json $basePayload) $styleCaseConfig @{} '' 5000
+    $styleCaseBash = Invoke-BashStatusline (Json $basePayload) $styleCaseConfig @{}
+    Check-Run 'PowerShell case-sensitive style value' $styleCasePs
+    Check-Run 'Bash case-sensitive style value' $styleCaseBash
+    Check-Exact 'case-variant style value keeps pill fallback' $styleCasePs $styleCaseBash
+
+    $layoutCaseConfig = New-Config 'case-sensitive-layout-value' @('VL_LAYOUT=AUTO', 'VL_SEGMENTS=model', 'VL_SEGMENTS2=ctx', 'VL_CLOCK=off')
+    $layoutCasePs = Invoke-Statusline (Json $basePayload) $layoutCaseConfig @{ COLUMNS='1' } '' 5000
+    $layoutCaseBash = Invoke-BashStatusline (Json $basePayload) $layoutCaseConfig @{ COLUMNS='1' }
+    Check-Run 'PowerShell case-sensitive layout value' $layoutCasePs
+    Check-Run 'Bash case-sensitive layout value' $layoutCaseBash
+    Check-Exact 'case-variant layout value keeps fixed rows' $layoutCasePs $layoutCaseBash
+
     $paddedQuote = Quote-FromConfigure ' model '
     $paddedLine = 'VL_SEGMENTS=' + $paddedQuote
     $paddedConfig = New-Config 'configure-q-padded' @($paddedLine, 'VL_CLOCK=off')
@@ -754,6 +776,19 @@ shell_quote "$CORALLINE_Q_VALUE"
         Write-Utf8 $config ('. ' + $case.Word + "`nVL_SEGMENTS=model`nVL_CLOCK=off`n")
         [void](Run-ModelColor $case.Name $config '55' @{ HOME=$homeRoot; USERPROFILE=$homeRoot })
     }
+    $homePrefixTarget = $homeRoot + '_BACKUP'
+    [void][System.IO.Directory]::CreateDirectory($homePrefixTarget)
+    $homePrefixFloat = Join-Path $homePrefixTarget 'float.txt'
+    $homePrefixConfig = New-Config 'HOME-variable-boundary' @(
+        'VL_SEGMENTS=model',
+        'VL_CLOCK=off',
+        'VL_FLOAT=1',
+        'VL_FLOAT_SEGMENTS=model',
+        'VL_FLOAT_FILE=$HOME_BACKUP/float.txt'
+    )
+    $homePrefixRun = Invoke-Statusline (Json $basePayload) $homePrefixConfig @{ HOME=$homeRoot; USERPROFILE=$homeRoot } '' 5000
+    Check-Run 'PowerShell HOME variable boundary' $homePrefixRun
+    Check 'longer HOME-prefixed variable cannot authorize float output' (-not [System.IO.File]::Exists($homePrefixFloat))
 
     $driveConfig = New-Config 'msys-root' @('VL_SEGMENTS=model', 'VL_CLOCK=off', 'VL_BG_MODEL=56')
     $drivePath = Forward-Path $driveConfig

@@ -341,7 +341,10 @@ function Decode-ShellWord([string]$Text, [bool]$PathContext) {
         if ($ch -eq '$') {
             if (-not $PathContext) { return [pscustomobject]@{ Success = $false; Value = '' } }
             if ($Text.Substring($i).StartsWith('${HOME}', [System.StringComparison]::Ordinal)) { $i += 7 }
-            elseif ($Text.Substring($i).StartsWith('$HOME', [System.StringComparison]::Ordinal)) { $i += 5 }
+            elseif (
+                $Text.Substring($i).StartsWith('$HOME', [System.StringComparison]::Ordinal) -and
+                ($i + 5 -ge $Text.Length -or [string]$Text[$i + 5] -notmatch '[A-Za-z0-9_]')
+            ) { $i += 5 }
             else { return [pscustomobject]@{ Success = $false; Value = '' } }
             if (-not (Add-Utf8Text $bytes $HomeDir)) { return [pscustomobject]@{ Success = $false; Value = '' } }
             continue
@@ -658,13 +661,13 @@ foreach ($key in @($Cfg.Keys | Where-Object { $_ -like 'VL_BG_*' -or $_ -like 'V
 if (-not (Test-Color $Cfg.VL_LEAN_BG)) { $Cfg.VL_LEAN_BG = '' }
 if (-not (Test-Color $Cfg.VL_LEAN_FG)) { $Cfg.VL_LEAN_FG = '' }
 
-$Cfg.VL_STYLE = switch ([string]$Cfg.VL_STYLE) {
+$Cfg.VL_STYLE = switch -CaseSensitive ([string]$Cfg.VL_STYLE) {
     'pill' { 'pill'; break }
     'lean' { 'lean'; break }
     'classic' { 'classic'; break }
     default { 'pill' }
 }
-$Cfg.VL_LAYOUT = switch ([string]$Cfg.VL_LAYOUT) {
+$Cfg.VL_LAYOUT = switch -CaseSensitive ([string]$Cfg.VL_LAYOUT) {
     'fixed' { 'fixed'; break }
     'auto' { 'auto'; break }
     default { 'fixed' }
@@ -2018,13 +2021,15 @@ $SegmentBuilders = [ordered]@{
     stash = { Add-StashSegment }
     style = { Add-StyleSegment }
 }
+$SupportedSegmentNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+foreach ($name in $SegmentBuilders.Keys) { [void]$SupportedSegmentNames.Add([string]$name) }
 
 function Build-Segments([string]$List) {
     $SegBgs.Clear()
     $SegTxt.Clear()
     $SegLen.Clear()
     foreach ($name in (Get-SegmentTokens $List)) {
-        if ($SegmentBuilders.Contains($name)) { & $SegmentBuilders[$name] }
+        if ($SupportedSegmentNames.Contains($name)) { & $SegmentBuilders[$name] }
     }
 }
 
