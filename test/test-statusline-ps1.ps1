@@ -712,6 +712,19 @@ shell_quote "$CORALLINE_Q_VALUE"
         'VL_BG_MODEL=44'
     )
     [void](Run-ModelColor 'single and double shell words' $wordConfig '44' @{})
+    $windowsPathConfig = New-Config 'double-quoted-windows-path' @(
+        'VL_SEGMENTS=model',
+        'VL_CLOCK=off',
+        'VL_BG_MODEL=45',
+        'VL_FLOAT_FILE="C:\Users\Jane\.claude\float.txt"'
+    )
+    $windowsPathPs = Invoke-Statusline (Json $basePayload) $windowsPathConfig @{} '' 5000
+    $windowsPathBash = Invoke-BashStatusline (Json $basePayload) $windowsPathConfig @{}
+    Check-Run 'PowerShell double-quoted Windows path' $windowsPathPs
+    Check-Run 'Bash double-quoted Windows path' $windowsPathBash
+    Check-Exact 'double-quoted ordinary backslashes are byte exact' $windowsPathPs $windowsPathBash
+    Check 'double-quoted Windows path keeps the root config active' ($windowsPathPs.Stdout.Contains('48;5;45m'))
+
     $bareConfig = New-Config 'bare-escape' @('VL_SEGMENTS=model\ ctx', 'VL_CLOCK=off')
     $bareRun = Invoke-Statusline (Json $basePayload) $bareConfig @{} '' 5000
     Check-Run 'bare backslash shell word' $bareRun

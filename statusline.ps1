@@ -217,11 +217,20 @@ function Decode-ShellWord([string]$Text, [bool]$PathContext) {
                     $i++
                     if ($i -ge $Text.Length) { return [pscustomobject]@{ Success = $false; Value = '' } }
                     $next = $Text[$i]
-                    if ($next -ne '"' -and $next -ne '\' -and $next -ne '$' -and $next -ne '`') {
+                    if ($next -eq '"' -or $next -eq '\' -or $next -eq '$' -or $next -eq '`') {
+                        if (-not (Add-Utf8Text $bytes ([string]$next))) { return [pscustomobject]@{ Success = $false; Value = '' } }
+                        $i++
+                        continue
+                    }
+                    # In Bash double quotes, a backslash before an ordinary
+                    # character remains literal together with that character.
+                    if (-not (Add-Utf8Text $bytes '\')) { return [pscustomobject]@{ Success = $false; Value = '' } }
+                    $ri = [ref]$i
+                    $piece = Read-WordChar $Text $ri
+                    if ($null -eq $piece -or -not (Add-Utf8Text $bytes $piece)) {
                         return [pscustomobject]@{ Success = $false; Value = '' }
                     }
-                    if (-not (Add-Utf8Text $bytes ([string]$next))) { return [pscustomobject]@{ Success = $false; Value = '' } }
-                    $i++
+                    $i = $ri.Value
                     continue
                 }
                 if ($ch -eq '$') {

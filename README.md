@@ -202,7 +202,11 @@ Expand-Archive $archive -DestinationPath $download
 $source = Join-Path $download "coralline-main"
 $target = Join-Path $HOME ".claude\coralline"
 New-Item -ItemType Directory -Force (Join-Path $target "themes") | Out-Null
-Copy-Item (Join-Path $source "statusline.ps1") $target
+$runtime = Join-Path $target "statusline.ps1"
+if (Test-Path -LiteralPath $runtime) {
+  Copy-Item -LiteralPath $runtime -Destination ($runtime + ".bak." + (Get-Date -Format "yyyyMMdd-HHmmss"))
+}
+Copy-Item (Join-Path $source "statusline.ps1") $runtime
 Copy-Item (Join-Path $source "themes\*.conf") (Join-Path $target "themes")
 Remove-Item $download -Recurse -Force
 ```
@@ -213,7 +217,7 @@ Then add to `~/.claude/settings.json`:
 {
   "statusLine": {
     "type": "command",
-    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/you/.claude/coralline/statusline.ps1"
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/you/.claude/coralline/statusline.ps1\""
   }
 }
 ```
@@ -226,9 +230,17 @@ an enforced Group Policy still takes precedence.
 
 ### Updating
 
-Two ways to update, both driven by the same installer. Either way your
+The two installer-driven routes below update Bash-based installs. Either way your
 `~/.claude/coralline.conf` is preserved and the previous `statusline.sh` is backed up
 under `~/.claude/coralline/` (the 3 newest are kept).
+
+#### PowerShell-only update
+
+On a machine without Bash, re-run the PowerShell archive block under
+[Windows without Git Bash](#windows-without-git-bash). The same block is also the native
+update path: it downloads the current `main` archive, backs up an existing
+`statusline.ps1` as `statusline.ps1.bak.<timestamp>`, refreshes the renderer and all themes,
+and leaves `~/.claude/coralline.conf` plus `settings.json` unchanged.
 
 #### Ask Claude (recommended)
 

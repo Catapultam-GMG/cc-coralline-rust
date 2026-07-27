@@ -191,7 +191,11 @@ Expand-Archive $archive -DestinationPath $download
 $source = Join-Path $download "coralline-main"
 $target = Join-Path $HOME ".claude\coralline"
 New-Item -ItemType Directory -Force (Join-Path $target "themes") | Out-Null
-Copy-Item (Join-Path $source "statusline.ps1") $target
+$runtime = Join-Path $target "statusline.ps1"
+if (Test-Path -LiteralPath $runtime) {
+  Copy-Item -LiteralPath $runtime -Destination ($runtime + ".bak." + (Get-Date -Format "yyyyMMdd-HHmmss"))
+}
+Copy-Item (Join-Path $source "statusline.ps1") $runtime
 Copy-Item (Join-Path $source "themes\*.conf") (Join-Path $target "themes")
 Remove-Item $download -Recurse -Force
 ```
@@ -202,7 +206,7 @@ Remove-Item $download -Recurse -Force
 {
   "statusLine": {
     "type": "command",
-    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/you/.claude/coralline/statusline.ps1"
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/you/.claude/coralline/statusline.ps1\""
   }
 }
 ```
@@ -214,8 +218,15 @@ renderer 在一般 session 預設為 `Restricted` 時仍能啟動；它不會修
 
 ### 更新
 
-兩種更新方式，都由同一支 installer 驅動。無論哪種，你的 `~/.claude/coralline.conf`
+下方兩種 installer 流程用於更新 Bash 安裝。無論哪種，你的 `~/.claude/coralline.conf`
 都會被保留，舊的 `statusline.sh` 會備份在 `~/.claude/coralline/` 下（保留最近 3 份）。
+
+#### 僅 PowerShell 的更新方式
+
+沒有 Bash 的電腦請重新執行 [Windows 無 Git Bash](#windows-無-git-bash)
+小節中的 PowerShell archive 指令。該區塊同時就是原生更新流程：下載目前的 `main`
+archive、把既有 `statusline.ps1` 備份為 `statusline.ps1.bak.<timestamp>`、更新
+renderer 與全部 themes，並保留 `~/.claude/coralline.conf` 與 `settings.json`。
 
 #### 請 Claude 更新（推薦）
 
