@@ -697,6 +697,7 @@ state_sort_order() {  # → _SORT_ORDER; stable bottom-up merge sort of _SORT_KE
 state_sort_burn() {
   local i j n
   local names=() paths=() rsts=() samps=() pcts=() plaus=()
+  [ "${#_SB_NAMES[@]}" -gt 0 ] || return 0
   _SORT_KEYS=("${_SB_NAMES[@]}"); state_sort_order; n=${#_SORT_ORDER[@]}
   for ((i=0; i<n; i++)); do
     j=${_SORT_ORDER[$i]}; names[$i]="${_SB_NAMES[$j]}"; paths[$i]="${_SB_PATHS[$j]}"
@@ -711,7 +712,13 @@ state_sort_burn() {
 state_sort_limit() {  # $1=5|7
   local which="$1" i j n
   local names=() paths=() rsts=() pcts=() plaus=()
-  if [ "$which" = 5 ]; then _SORT_KEYS=("${_SL5_NAMES[@]}"); else _SORT_KEYS=("${_SL7_NAMES[@]}"); fi
+  if [ "$which" = 5 ]; then
+    [ "${#_SL5_NAMES[@]}" -gt 0 ] || return 0
+    _SORT_KEYS=("${_SL5_NAMES[@]}")
+  else
+    [ "${#_SL7_NAMES[@]}" -gt 0 ] || return 0
+    _SORT_KEYS=("${_SL7_NAMES[@]}")
+  fi
   state_sort_order; n=${#_SORT_ORDER[@]}
   for ((i=0; i<n; i++)); do
     j=${_SORT_ORDER[$i]}
