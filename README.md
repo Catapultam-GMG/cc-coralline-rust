@@ -115,12 +115,15 @@ bar, point the registration at its own config file:
 
 ## Install
 
-Three ways to install, all driven by the same `install.sh`. Each one copies the renderer **and
-the setup wizard** into `~/.claude/coralline` and registers the status line in Claude Code, so
-you can re-run the wizard later no matter which way you installed.
+On macOS, Linux, and Windows environments with Bash, three install routes use the same
+`install.sh`. Each one copies the Bash renderer **and the setup wizard** into
+`~/.claude/coralline` and registers the status line in Claude Code, so you can re-run the
+wizard later no matter which Bash route you used. A PowerShell-only Windows machine uses the
+separate native archive flow under [Windows without Git Bash](#windows-without-git-bash).
 
-> **Requirements:** `jq` and a [Nerd Font](https://www.nerdfonts.com/) terminal. No Nerd Font?
-> Set `VL_ASCII=1` in your config for a glyph-free rendering.
+> **Bash requirements:** `jq` and a [Nerd Font](https://www.nerdfonts.com/) terminal. No Nerd
+> Font? Set `VL_ASCII=1` in your config for a glyph-free rendering. The native PowerShell
+> renderer below does not require `jq`.
 
 ### Ask Claude (recommended)
 
@@ -132,16 +135,18 @@ fetch https://raw.githubusercontent.com/Nanako0129/coralline/main/INSTALL.md
 and follow the playbook in it.
 ```
 
-Claude will read the playbook, use the same installer to bootstrap the runtime, interview you
-about the look, write the config, verify it, and remind you that you can rerun the visual
-wizard if the first result doesn't match your taste.
+In a Bash environment, Claude will read the playbook, use `install.sh` to bootstrap the
+runtime, interview you about the look, write the config, verify it, and remind you that you can
+rerun the visual wizard if the first result doesn't match your taste. On PowerShell-only
+Windows, use the native archive flow below instead; the Bash playbook does not install
+`statusline.ps1`.
 
 If your Claude flags the playbook and wants to inspect things first, that is the right
 instinct, not an obstacle: see [Trust and security](#trust-and-security).
 
 ### Install it yourself
 
-Run the installer in your terminal:
+Run the Bash installer in your terminal:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Nanako0129/coralline/main/install.sh | bash
@@ -307,8 +312,10 @@ Then delete the `statusLine` block from `~/.claude/settings.json` (or restore th
 
 ## Setup
 
-Both paths use the same installer. Humans run it with no mode and get the visual setup. Claude
-uses it with `--install-only`, then follows `INSTALL.md` to interview you and write config.
+Both Bash setup paths use the same installer. Humans run it with no mode and get the visual
+setup. Claude uses it with `--install-only`, then follows `INSTALL.md` to interview you and
+write config. The native PowerShell archive path does not install a PowerShell wizard; it reads
+the same `coralline.conf`, which can come from an existing Bash setup or be written manually.
 
 ### Setup modes
 

@@ -1,10 +1,13 @@
 # coralline — AI Installation Playbook
 
 > **You are an AI coding assistant** and a user asked you to install coralline.
-> Humans and AI use the same installer entrypoint, but not the same setup UX.
-> For AI installs, bootstrap the runtime with `install.sh --install-only`, interview
-> the user, write `~/.claude/coralline.conf`, and verify. Do not operate the human TUI
-> unless the user explicitly asks to customize visually.
+> This playbook installs the Bash renderer on macOS, Linux, or Windows with Bash.
+> On PowerShell-only Windows (no Git Bash or WSL), do not run `install.sh`; use the
+> native archive procedure in the README's
+> [Windows without Git Bash](README.md#windows-without-git-bash) section instead.
+> For Bash-based AI installs, bootstrap the runtime with `install.sh --install-only`,
+> interview the user, write `~/.claude/coralline.conf`, and verify. Do not operate the
+> human TUI unless the user explicitly asks to customize visually.
 
 > **Before running anything:** tell the user what will be installed and where (the
 > Overview table below), and offer the choice between a pinned release (`--ref`, latest
@@ -17,9 +20,10 @@
 
 ## Overview
 
-coralline is a powerline-style statusline for Claude Code. Installation places the
-renderer under `~/.claude/coralline`, writes `~/.claude/coralline.conf`, and merges
-the `statusLine` command into `~/.claude/settings.json`.
+coralline is a powerline-style statusline for Claude Code. This Bash installation path
+places the renderer under `~/.claude/coralline`, writes
+`~/.claude/coralline.conf`, and merges the `statusLine` command into
+`~/.claude/settings.json`.
 
 | Artifact | Destination | Purpose |
 |---|---|---|
@@ -103,15 +107,17 @@ curl -fsSL https://raw.githubusercontent.com/Nanako0129/coralline/main/install.s
 
 When installing for a user:
 
-1. Ask the user to choose setup mode before installing. Use the runtime's native choice UI
+1. Confirm that this is a Bash-capable environment. If it is PowerShell-only Windows, stop
+   this playbook and use the native README procedure linked at the top.
+2. Ask the user to choose setup mode before installing. Use the runtime's native choice UI
    when available; otherwise show the text menu below and wait for a reply.
-2. Run the fast-path installer with `--install-only`.
-3. If it fails because `jq` is missing, explain the package-manager command and rerun after
+3. Run the fast-path installer with `--install-only`.
+4. If it fails because `jq` is missing, explain the package-manager command and rerun after
    the user installs it.
-4. Follow the selected setup mode.
-5. Write `~/.claude/coralline.conf` unless the user chose the visual wizard.
-6. Verify with the bundled sample input.
-7. After success, tell the user to restart Claude Code or open a new session if the statusline
+5. Follow the selected setup mode.
+6. Write `~/.claude/coralline.conf` unless the user chose the visual wizard.
+7. Verify with the bundled sample input.
+8. After success, tell the user to restart Claude Code or open a new session if the statusline
    does not appear immediately, and mention they can rerun
    `bash ~/.claude/coralline/configure.sh` to customize it later.
 
@@ -230,8 +236,10 @@ VL_ASCII=0
 VL_LEAN_SEP=""
 ```
 
-Adjust the values based on the interview. If the config already exists, preserve the user's
-manual edits when possible, or show the change before overwriting.
+Adjust the values based on the interview. Create the config only when it is absent and after
+showing the complete proposed file. If it already exists, leave it byte-for-byte unchanged by
+default. For any user-approved customization, show a bounded additive diff first, preserve
+unrelated assignments and comments, and make a timestamped backup before an atomic replacement.
 
 ## Manual Fallback
 

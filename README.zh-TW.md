@@ -110,11 +110,15 @@ burn、git 與 runtime segments——都只作用於主列，在 subagent 模式
 
 ## 安裝
 
-三種安裝方式都由同一支 `install.sh` 驅動，每一種都會把 renderer **與設定 wizard** 複製到
-`~/.claude/coralline`、並把 statusline 註冊進 Claude Code，所以不管你用哪種方式裝，之後都能重跑 wizard。
+在 macOS、Linux，以及具有 Bash 的 Windows 環境中，三種安裝方式都由同一支
+`install.sh` 驅動。每一種都會把 Bash renderer **與設定 wizard** 複製到
+`~/.claude/coralline`、並把 statusline 註冊進 Claude Code，所以之後都能重跑
+wizard。僅有 PowerShell 的 Windows 電腦則使用下方
+[Windows 無 Git Bash](#windows-無-git-bash)的獨立原生 archive 流程。
 
-> **需求：** `jq` 以及 [Nerd Font](https://www.nerdfonts.com/) 終端機字型。
-> 沒有 Nerd Font 的話，在設定檔加上 `VL_ASCII=1` 改用無特殊字符的渲染。
+> **Bash 需求：** `jq` 以及 [Nerd Font](https://www.nerdfonts.com/) 終端機字型。
+> 沒有 Nerd Font 的話，在設定檔加上 `VL_ASCII=1` 改用無特殊字符的渲染。下方原生
+> PowerShell renderer 不需要 `jq`。
 
 ### 請 Claude 安裝（推薦）
 
@@ -126,15 +130,17 @@ fetch https://raw.githubusercontent.com/Nanako0129/coralline/main/INSTALL.md
 and follow the playbook in it.
 ```
 
-Claude 會先讀 playbook，再用同一支 installer bootstrap runtime、訪談你的外觀偏好、
-寫入設定並驗證，最後提醒你如果不滿意可以自己重新開啟視覺化 wizard。
+在 Bash 環境中，Claude 會先讀 playbook，再用 `install.sh` bootstrap runtime、訪談你的
+外觀偏好、寫入設定並驗證，最後提醒你如果不滿意可以自己重新開啟視覺化 wizard。僅有
+PowerShell 的 Windows 請改用下方原生 archive 流程；這份 Bash playbook 不會安裝
+`statusline.ps1`。
 
 如果你的 Claude 對這份 playbook 亮紅旗、想先檢查內容，那是正確的直覺而不是阻礙：
 見[信任與安全](#信任與安全)。
 
 ### 自己安裝
 
-在終端機執行：
+在 Bash 終端機執行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Nanako0129/coralline/main/install.sh | bash
@@ -287,8 +293,10 @@ rm -rf ~/.claude/coralline ~/.claude/coralline.conf
 
 ## 設定
 
-兩種方式都使用同一支 installer。人類不帶模式參數執行時會進入視覺化設定；
-Claude 則使用 `--install-only` bootstrap，接著依照 `INSTALL.md` 訪談並寫入設定。
+兩種 Bash 設定方式都使用同一支 installer。人類不帶模式參數執行時會進入視覺化設定；
+Claude 則使用 `--install-only` bootstrap，接著依照 `INSTALL.md` 訪談並寫入設定。原生
+PowerShell archive 流程目前不會安裝 PowerShell wizard；它讀取同一份
+`coralline.conf`，可沿用既有 Bash 設定或手動建立。
 
 ### 設定模式
 
