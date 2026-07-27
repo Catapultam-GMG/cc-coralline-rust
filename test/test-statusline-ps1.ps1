@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  WIN-01 regression and differential tests for statusline.ps1.
+  WIN-01 plus WIN-02 state regression and differential tests for statusline.ps1.
 
   Run on native Windows PowerShell 5.1. Git Bash is test-only and supplies the
   statusline.sh oracle plus real configure.sh printf %q fixtures.
@@ -12,6 +12,8 @@ $Here = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
 $Repo = Split-Path -Path $Here -Parent
 $Script = Join-Path $Repo 'statusline.ps1'
 $BashScript = Join-Path $Repo 'statusline.sh'
+$script:StateScript = $Script
+$script:StateBashScript = $BashScript
 $Configure = Join-Path $Repo 'configure.sh'
 $PowerShellExe = (Get-Process -Id $PID).Path
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -115,10 +117,55 @@ function Invoke-CapturedProcess(
     }
 }
 
+function Start-CapturedProcessAsync(
+    [string]$FileName,
+    [string]$Arguments,
+    [string]$InputText,
+    [hashtable]$Environment,
+    [string]$WorkingDirectory
+) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FileName
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    if (-not [string]::IsNullOrEmpty($WorkingDirectory)) { $psi.WorkingDirectory = $WorkingDirectory }
+    foreach ($key in $Environment.Keys) {
+        if ($null -eq $Environment[$key]) { [void]$psi.EnvironmentVariables.Remove($key) }
+        else { $psi.EnvironmentVariables[$key] = [string]$Environment[$key] }
+    }
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    if (-not $process.Start()) { throw 'async process did not start' }
+    $stdout = New-Object System.IO.MemoryStream
+    $stderr = New-Object System.IO.MemoryStream
+    $outTask = $process.StandardOutput.BaseStream.CopyToAsync($stdout)
+    $errTask = $process.StandardError.BaseStream.CopyToAsync($stderr)
+    $inputBytes = $Utf8NoBom.GetBytes($InputText)
+    if ($inputBytes.Length -gt 0) { $process.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length) }
+    $process.StandardInput.Close()
+    return [pscustomobject]@{ Process=$process; Stdout=$stdout; Stderr=$stderr; OutTask=$outTask; ErrTask=$errTask }
+}
+
+function Wait-CapturedProcessAsync($Handle, [int]$TimeoutMs) {
+    $timedOut = -not $Handle.Process.WaitForExit($TimeoutMs)
+    if ($timedOut) { try { $Handle.Process.Kill() } catch { }; [void]$Handle.Process.WaitForExit(2000) }
+    [void]$Handle.OutTask.Wait(2000); [void]$Handle.ErrTask.Wait(2000)
+    $exitCode = -1
+    if (-not $timedOut -and $Handle.Process.HasExited) { $exitCode = $Handle.Process.ExitCode }
+    $result = [pscustomobject]@{ ExitCode=$exitCode; TimedOut=$timedOut; StdoutBytes=$Handle.Stdout.ToArray(); StderrBytes=$Handle.Stderr.ToArray() }
+    $Handle.Process.Dispose(); $Handle.Stdout.Dispose(); $Handle.Stderr.Dispose()
+    return $result
+}
+
 function Runtime-Environment([string]$ConfigPath, [hashtable]$Extra) {
     $environment = @{
         CORALLINE_CONFIG = $null
         CORALLINE_NO_SAMPLE = '1'
+        CORALLINE_TEST_NOW = $null
         REMORA_ACTIVE = $null
         VIRTUAL_ENV = $null
         CONDA_DEFAULT_ENV = $null
@@ -135,14 +182,18 @@ function Invoke-Statusline(
     [string]$Arguments,
     [int]$TimeoutMs
 ) {
-    $psArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $Script + '"'
+    $runtimeScript = $Script
+    if ($ExtraEnvironment.ContainsKey('CORALLINE_TEST_NOW') -and $null -ne $ExtraEnvironment.CORALLINE_TEST_NOW) { $runtimeScript = $script:StateScript }
+    $psArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $runtimeScript + '"'
     if (-not [string]::IsNullOrEmpty($Arguments)) { $psArgs += ' ' + $Arguments }
     return Invoke-CapturedProcess $PowerShellExe $psArgs $Json (Runtime-Environment $ConfigPath $ExtraEnvironment) $Repo $TimeoutMs
 }
 
 function Invoke-BashStatusline([string]$Json, [string]$ConfigPath, [hashtable]$ExtraEnvironment) {
     $environment = Runtime-Environment $ConfigPath $ExtraEnvironment
-    $args = '--noprofile --norc "' + (Forward-Path $BashScript) + '"'
+    $runtimeScript = $BashScript
+    if ($ExtraEnvironment.ContainsKey('CORALLINE_TEST_NOW') -and $null -ne $ExtraEnvironment.CORALLINE_TEST_NOW) { $runtimeScript = $script:StateBashScript }
+    $args = '--noprofile --norc "' + (Forward-Path $runtimeScript) + '"'
     return Invoke-CapturedProcess $script:BashExe $args $Json $environment $Repo 10000
 }
 
@@ -151,6 +202,9 @@ function Check-Run([string]$Name, $Run) {
     Check "$Name exit 0" ($Run.ExitCode -eq 0)
     Check "$Name stderr empty" ($Run.StderrBytes.Length -eq 0)
     Check "$Name strict UTF-8 stdout" ($null -ne $Run.Stdout)
+    if ($Run.TimedOut -or $Run.ExitCode -ne 0 -or $Run.StderrBytes.Length -ne 0) {
+        [Console]::Out.WriteLine('DIAG  ' + $Name + ' stderr=' + [Convert]::ToBase64String($Run.StderrBytes))
+    }
 }
 
 function Plain([string]$Text) {
@@ -248,6 +302,36 @@ function Snapshot-Ads([string]$Carrier, [string]$StreamName) {
     return "$($item.Length)|$hash"
 }
 
+function Snapshot-StateTree([string]$Root) {
+    if (-not (Test-Path -LiteralPath $Root)) { return '<missing>' }
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in @(Get-ChildItem -LiteralPath $Root -Recurse -Force | Sort-Object FullName)) {
+        $relative = $item.FullName.Substring($Root.Length).Replace('\','/')
+        $length = 0L
+        if (-not $item.PSIsContainer) { $length = $item.Length }
+        [void]$lines.Add(('{0}|{1}|{2}|{3}|{4}|{5}' -f $relative,$item.Attributes,$length,$item.CreationTimeUtc.Ticks,$item.LastWriteTimeUtc.Ticks,$item.LastAccessTimeUtc.Ticks))
+    }
+    return $lines -join "`n"
+}
+
+function Get-ImmediateNames([string]$Root) {
+    if (-not [IO.Directory]::Exists($Root)) { return ,([string[]]@()) }
+    return ,([string[]]@([IO.Directory]::EnumerateFileSystemEntries($Root) | ForEach-Object { [IO.Path]::GetFileName($_) } | Sort-Object))
+}
+
+function Wait-StateBarrier([string]$Barrier, [int]$Count, [int]$TimeoutMs) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $dir = [IO.Path]::GetDirectoryName($Barrier)
+    $pattern = [IO.Path]::GetFileName($Barrier) + '.*.ready'
+    while ($watch.ElapsedMilliseconds -lt $TimeoutMs) {
+        $ready = 0
+        foreach ($unused in [IO.Directory]::EnumerateFiles($dir, $pattern)) { $ready++ }
+        if ($ready -ge $Count) { return $true }
+        [Threading.Thread]::Sleep(10)
+    }
+    return $false
+}
+
 function Run-Git([string]$WorkingDirectory, [string]$Arguments) {
     $run = Invoke-CapturedProcess $script:GitExe $Arguments '' @{} $WorkingDirectory 10000
     if ($run.TimedOut -or $run.ExitCode -ne 0) { throw "git failed: $Arguments`n$($run.Stderr)" }
@@ -277,6 +361,118 @@ try {
     $source = [System.IO.File]::ReadAllText($Script, $StrictUtf8)
     $bashSource = [System.IO.File]::ReadAllText($BashScript, $StrictUtf8)
 
+    # Deterministic clock, state capture, and snapshot barriers live only in test
+    # copies. Production has no hidden environment-controlled time or I/O hooks.
+    $script:StateScript = Join-Path $TempRoot 'statusline-state-test.ps1'
+    $psClock = '$Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()'
+    $psClockHook = @'
+$Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$testNowValue = 0L
+if ([string]$env:CORALLINE_TEST_STRICT -eq '1') { $ErrorActionPreference = 'Stop' }
+if ([string]$env:CORALLINE_TEST_NOW -match '\A(?:0|[1-9][0-9]{0,11})\z' -and [long]::TryParse([string]$env:CORALLINE_TEST_NOW, $IntegerStyle, $Invariant, [ref]$testNowValue) -and $testNowValue -le 253402300799L) { $Now = $testNowValue }
+'@
+    $psBarrierMarker = '    $burnRetention = [pscustomobject]@{ Candidates=@(); Representatives=@() }'
+    $psBarrierHook = @'
+    if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_BARRIER)) {
+        [IO.File]::WriteAllBytes(([string]$env:CORALLINE_TEST_BARRIER + '.' + [string]$PID + '.ready'), [byte[]]@())
+        while (-not [IO.File]::Exists([string]$env:CORALLINE_TEST_BARRIER)) { Start-Sleep -Milliseconds 10 }
+    }
+    $burnRetention = [pscustomobject]@{ Candidates=@(); Representatives=@() }
+'@
+    $psDumpMarker = '    $State = Get-CorallineState $BurnStateGate $Limit5StateGate $Limit7StateGate'
+    $psDumpHook = @'
+    $State = Get-CorallineState $BurnStateGate $Limit5StateGate $Limit7StateGate
+    if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_STATE_DUMP)) {
+        $capture = [ordered]@{
+            BurnState=$State.Burn.State; BurnLabel=$State.Burn.Label; BurnEta=$State.Burn.Eta; BurnRate=$State.Burn.Rate; BurnTtr=$State.Burn.Ttr
+            FiveState=$State.Five.State; FiveEta=$State.Five.Eta; FiveRate=$State.Five.Rate; FiveTtr=$State.Five.Ttr
+            SevenEta=$State.Seven.Eta; SevenRate=$State.Seven.Rate; SevenTtr=$State.Seven.Ttr
+            Limit5Valid=$State.Limit5.Valid; Limit5Reset=$State.Limit5.Reset; Limit5Pct=$State.Limit5.Pct
+            Limit7Valid=$State.Limit7.Valid; Limit7Reset=$State.Limit7.Reset; Limit7Pct=$State.Limit7.Pct
+            BurnSnapshotComplete=$State.BurnSnapshotComplete; Limit5SnapshotComplete=$State.Limit5SnapshotComplete; Limit7SnapshotComplete=$State.Limit7SnapshotComplete
+        }
+        [IO.File]::WriteAllText([string]$env:CORALLINE_TEST_STATE_DUMP, ($capture | ConvertTo-Json -Compress), $Utf8NoBom)
+    }
+'@
+    $psAfterCreateMarker = "            `$stream.Dispose()`n            return `$true"
+    $psAfterCreateHook = @'
+            $stream.Dispose()
+            if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_AFTER_CREATE)) {
+                [IO.File]::WriteAllBytes(([string]$env:CORALLINE_TEST_AFTER_CREATE + '.' + [string]$PID + '.ready'), [byte[]]@())
+                while (-not [IO.File]::Exists([string]$env:CORALLINE_TEST_AFTER_CREATE)) { Start-Sleep -Milliseconds 10 }
+            }
+            return $true
+'@
+    $psMathMarker = 'function Format-StatePct([int]$Milli) {'
+    $psMathHook = @'
+if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_MATH_DUMP)) {
+    $values = @(
+        (Get-RoundEvenInt64 5L 2L),
+        (Get-RoundEvenInt64 7L 2L),
+        (Get-RoundEvenInt64 4L 3L),
+        (Get-RoundEvenInt64 5L 3L),
+        (Format-StateRate 10000000000L 3L),
+        (Format-StateRate 19999999999L 2L),
+        (Get-RoundEvenInt64 8639913600L 1000L)
+    )
+    [IO.File]::WriteAllText([string]$env:CORALLINE_TEST_MATH_DUMP, ($values -join '|'), $Utf8NoBom)
+    [Environment]::Exit(0)
+}
+function Format-StatePct([int]$Milli) {
+'@
+    if (-not $source.Contains($psClock) -or -not $source.Contains($psBarrierMarker) -or -not $source.Contains($psDumpMarker) -or -not $source.Contains($psAfterCreateMarker) -or -not $source.Contains($psMathMarker)) { throw 'PowerShell state test marker missing' }
+    $statePsSource = $source.Replace($psClock, $psClockHook.TrimEnd()).Replace($psBarrierMarker, $psBarrierHook.TrimEnd()).Replace($psDumpMarker, $psDumpHook.TrimEnd()).Replace($psAfterCreateMarker, $psAfterCreateHook.TrimEnd()).Replace($psMathMarker, $psMathHook.TrimEnd())
+    Write-Utf8 $script:StateScript $statePsSource
+
+    $script:StateBashScript = Join-Path $TempRoot 'statusline-state-test.sh'
+    $bashClock = 'printf -v NOW ''%(%s)T'' -1 2>/dev/null || NOW=$(date +%s)'
+    $bashClockHook = @'
+printf -v NOW '%(%s)T' -1 2>/dev/null || NOW=$(date +%s)
+case "${CORALLINE_TEST_NOW:-}" in
+  (0|[1-9][0-9]*)
+    if [ "${#CORALLINE_TEST_NOW}" -le 12 ]; then
+      _TEST_NOW=$(( 10#$CORALLINE_TEST_NOW ))
+      [ "$_TEST_NOW" -le 253402300799 ] && NOW=$_TEST_NOW
+    fi ;;
+esac
+'@
+    $bashBarrierMarker = '  state_snapshot' + "`n" + '  if [ "$_STATE_BURN_GATE" = 1 ]; then'
+    $bashBarrierHook = @'
+  state_snapshot
+  if [ -n "${CORALLINE_TEST_BARRIER:-}" ]; then
+    set -C
+    { : > "${CORALLINE_TEST_BARRIER}.$$.ready"; } 2>/dev/null || true
+    set +C
+    while [ ! -e "$CORALLINE_TEST_BARRIER" ]; do sleep 0.01; done
+  fi
+  if [ "$_STATE_BURN_GATE" = 1 ]; then
+'@
+    $bashDumpMarker = "  state_prepare`nfi`n`n# Defensive ANSI stripper"
+    $bashDumpHook = @'
+  state_prepare
+  if [ -n "${CORALLINE_TEST_STATE_DUMP:-}" ]; then
+    printf '%s\n' "BurnState=$_BURN_STATE BurnLabel=$_BURN_LABEL BurnEta=$_BURN_ETA BurnRate=$_BURN_RATE BurnTtr=$_BURN_TTR FiveState=$_B5_STATE FiveEta=$_B5_ETA FiveRate=$_B5_RATE FiveTtr=$_B5_TTR SevenEta=$_B7_ETA SevenRate=$_B7_RATE SevenTtr=$_B7_TTR Limit5Valid=$_STATE_RL5_VALID Limit5Reset=$_STATE_RL5_RST Limit5Pct=$_STATE_RL5_PCT Limit7Valid=$_STATE_RL7_VALID Limit7Reset=$_STATE_RL7_RST Limit7Pct=$_STATE_RL7_PCT" > "$CORALLINE_TEST_STATE_DUMP"
+  fi
+fi
+
+# Defensive ANSI stripper
+'@
+    $bashAfterCreateMarker = '      if { : > "$path"; } 2>/dev/null; then _PUB_BURN_PATH="$path"; break; fi'
+    $bashAfterCreateHook = @'
+      if { : > "$path"; } 2>/dev/null; then
+        _PUB_BURN_PATH="$path"
+        if [ -n "${CORALLINE_TEST_AFTER_CREATE:-}" ]; then
+          { : > "${CORALLINE_TEST_AFTER_CREATE}.$$.ready"; } 2>/dev/null || true
+          while [ ! -e "$CORALLINE_TEST_AFTER_CREATE" ]; do sleep 0.01; done
+        fi
+        break
+      fi
+'@
+    if (-not $bashSource.Contains($bashClock) -or -not $bashSource.Contains($bashBarrierMarker) -or -not $bashSource.Contains($bashDumpMarker) -or -not $bashSource.Contains($bashAfterCreateMarker)) { throw 'Bash state test marker missing' }
+    $stateBashSource = $bashSource.Replace($bashClock, $bashClockHook.TrimEnd()).Replace($bashBarrierMarker, $bashBarrierHook.TrimEnd()).Replace($bashDumpMarker, $bashDumpHook.TrimEnd()).Replace($bashAfterCreateMarker, $bashAfterCreateHook.TrimEnd())
+    Write-Utf8 $script:StateBashScript $stateBashSource
+
+    Check 'static source has no production deterministic-clock hook' (-not $source.Contains('CORALLINE_TEST_NOW') -and -not $bashSource.Contains('CORALLINE_TEST_NOW'))
     Check 'static source has no mojibake double question token' (-not $source.Contains(('?' + '?')))
     Check 'static source has no dangling handoff reference' (-not $source.Contains('handoff/'))
     Check 'static source forbids Invoke-Expression' (-not $source.Contains('Invoke-Expression'))
@@ -286,12 +482,12 @@ try {
     Check 'reparse validation precedes config read' ($source.IndexOf('Test-SafeRegularFile $Path') -lt $source.IndexOf('Read-StrictUtf8File $Path'))
     Check 'Bash oracle main extraction contains central scrub' ($bashSource.Contains('] | map(scrub) | join('))
 
-    $expectedRegistry = @('clock','cost','ctx','dir','duration','effort','git','limit5h','limit7d','lines','model','node','project','python','stash','style')
+    $expectedRegistry = @('burn','clock','cost','ctx','dir','duration','effort','git','limit5h','limit7d','lines','model','node','project','python','stash','style')
     $builderBlock = [regex]::Match($source, '(?s)\$SegmentBuilders = \[ordered\]@\{(.*?)\n\}').Groups[1].Value
     $actualRegistry = @([regex]::Matches($builderBlock, '(?m)^    ([A-Za-z0-9]+) =') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
-    Check 'closed PowerShell registry equals WIN-01 inventory' (($actualRegistry -join ' ') -eq (($expectedRegistry | Sort-Object) -join ' '))
-    $bashSegments = @([regex]::Matches($bashSource, '(?m)^seg_([A-Za-z0-9_]+)\(\)') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -ne 'len' -and $_ -ne 'limit' -and $_ -ne 'burn' } | Sort-Object -Unique)
-    Check 'Bash public registry minus burn equals WIN-01 inventory' (($bashSegments -join ' ') -eq (($expectedRegistry | Sort-Object) -join ' '))
+    Check 'closed PowerShell registry equals WIN-02 inventory' (($actualRegistry -join ' ') -eq (($expectedRegistry | Sort-Object) -join ' '))
+    $bashSegments = @([regex]::Matches($bashSource, '(?m)^seg_([A-Za-z0-9_]+)\(\)') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -ne 'len' -and $_ -ne 'limit' } | Sort-Object -Unique)
+    Check 'Bash public registry equals WIN-02 inventory' (($bashSegments -join ' ') -eq (($expectedRegistry | Sort-Object) -join ' '))
 
     $script:BashExe = $env:CORALLINE_TEST_BASH
     if ([string]::IsNullOrEmpty($script:BashExe)) { $script:BashExe = 'C:\Program Files\Git\bin\bash.exe' }
@@ -592,7 +788,13 @@ fi
     [void](Run-ModelColor 'inactive includes consume no shared budget' $inactiveBudget '91' @{ REMORA_ACTIVE='0' })
 
     $baseConfigLines = @('VL_CLOCK=off')
+    $burnPayload = Clone-Object $basePayload
+    $burnPayload.rate_limits.five_hour.used_percentage = $null
+    $burnPayload.rate_limits.five_hour.resets_at = $null
+    $burnPayload.rate_limits.seven_day.used_percentage = '30'
+    $burnPayload.rate_limits.seven_day.resets_at = '1345600'
     $segmentCases = [ordered]@{
+        burn = [pscustomobject]@{ Show=@('VL_SEGMENTS=burn','VL_CLOCK=off'); Needle=((Glyph 0x2197) + ' 7d ' + (Glyph 0x21E2)); Payload=$burnPayload; Environment=@{CORALLINE_TEST_NOW='1000000'}; Suppress={ param($p) $p.rate_limits.five_hour.used_percentage=$null; $p.rate_limits.seven_day.used_percentage=$null; $p }; SuppressConfig=$baseConfigLines + 'VL_SEGMENTS=burn' }
         clock = [pscustomobject]@{ Show=@('VL_SEGMENTS=clock','VL_CLOCK=24h','VL_CLOCK_SECONDS=0'); Needle=(Glyph 0x2299); Suppress={ param($p) $p }; SuppressConfig=@('VL_SEGMENTS=clock','VL_CLOCK=off') }
         cost = [pscustomobject]@{ Show=@('VL_SEGMENTS=cost','VL_CLOCK=off'); Needle='$1.23'; Suppress={ param($p) $p.cost.total_cost_usd=0; $p }; SuppressConfig=$baseConfigLines + 'VL_SEGMENTS=cost' }
         ctx = [pscustomobject]@{ Show=@('VL_SEGMENTS=ctx','VL_CLOCK=off'); Needle='62%'; Suppress={ param($p) $p.context_window.used_percentage=$null; $p }; SuppressConfig=$baseConfigLines + 'VL_SEGMENTS=ctx' }
@@ -613,14 +815,18 @@ fi
 
     foreach ($name in $expectedRegistry) {
         $case = $segmentCases[$name]
+        $showPayload = $basePayload
+        if ($null -ne $case.PSObject.Properties['Payload']) { $showPayload = $case.Payload }
+        $caseEnvironment = @{}
+        if ($null -ne $case.PSObject.Properties['Environment']) { $caseEnvironment = $case.Environment }
         $showConfig = New-Config ("segment-$name-show") $case.Show
-        $show = Invoke-Statusline (Json $basePayload) $showConfig @{} '' 5000
+        $show = Invoke-Statusline (Json $showPayload) $showConfig $caseEnvironment '' 5000
         Check-Run "$name show" $show
         Check "$name show/value" ((Plain $show.Stdout).Contains([string]$case.Needle))
-        $suppressedPayload = Clone-Object $basePayload
+        $suppressedPayload = Clone-Object $showPayload
         $suppressedPayload = & $case.Suppress $suppressedPayload
         $suppressConfig = New-Config ("segment-$name-suppress") $case.SuppressConfig
-        $suppress = Invoke-Statusline (Json $suppressedPayload) $suppressConfig @{} '' 5000
+        $suppress = Invoke-Statusline (Json $suppressedPayload) $suppressConfig $caseEnvironment '' 5000
         Check-Run "$name suppress" $suppress
         Check "$name suppresses without an empty pill" ([string]::IsNullOrEmpty($suppress.Stdout))
     }
@@ -789,6 +995,720 @@ fi
     Check-Run 'codepage 437 raw I/O' $codepageRun
     Check 'stdout is UTF-8 without BOM' ($codepageRun.StdoutBytes.Length -ge 3 -and -not ($codepageRun.StdoutBytes[0] -eq 0xEF -and $codepageRun.StdoutBytes[1] -eq 0xBB -and $codepageRun.StdoutBytes[2] -eq 0xBF) -and $codepageRun.Stdout.Contains((Glyph 0x96EA)))
     Check 'stdout uses LF without CR' (-not ($codepageRun.StdoutBytes -contains [byte]13) -and $codepageRun.StdoutBytes[$codepageRun.StdoutBytes.Length - 1] -eq 10)
+
+    # WIN-02 immutable state, estimator parity, mixed writers, and path boundaries.
+    $stateRoot = Join-Path $TempRoot 'win02-state'
+    [void][IO.Directory]::CreateDirectory($stateRoot)
+    $fixedNow = 1000000L
+    $reset5 = 1015900L
+    $reset7 = 1345600L
+    $statePayload = Clone-Object $basePayload
+    $statePayload.rate_limits.five_hour.used_percentage = '41.2'
+    $statePayload.rate_limits.five_hour.resets_at = [string]$reset5
+    $statePayload.rate_limits.seven_day.used_percentage = '30'
+    $statePayload.rate_limits.seven_day.resets_at = [string]$reset7
+    $stateEnvWrite = @{ CORALLINE_NO_SAMPLE=$null; CORALLINE_TEST_NOW=[string]$fixedNow }
+    $stateEnvRead = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow }
+
+    $mathDump = Join-Path $stateRoot 'math.txt'
+    $mathArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $script:StateScript + '"'
+    $mathRun = Invoke-CapturedProcess $PowerShellExe $mathArgs '' (Runtime-Environment '' @{ CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_MATH_DUMP=$mathDump }) $Repo 10000
+    Check-Run 'WIN-02 PowerShell exact rational helper vectors' $mathRun
+    Check 'WIN-02 exact midpoint/rate/carry/max arithmetic' ([IO.File]::ReadAllText($mathDump, $StrictUtf8) -ceq '2|4|1|2|0.3333333333|1.0000000000|8639914')
+
+    function New-StateConfig([string]$Name, [string]$Root, [string]$Segments, [bool]$Sync) {
+        [void][IO.Directory]::CreateDirectory($Root)
+        $burn = Forward-Path (Join-Path $Root 'burn.tsv')
+        $limit5 = Forward-Path (Join-Path $Root 'limit5.tsv')
+        $limit7 = Forward-Path (Join-Path $Root 'limit7.tsv')
+        $lines = @(
+            ('VL_SEGMENTS=' + (Quote-FromConfigure $Segments)),
+            'VL_CLOCK=off',
+            ("BURN_FILE='$burn'"),
+            ("RL5H_FILE='$limit5'"),
+            ("RL7D_FILE='$limit7'")
+        )
+        if ($Sync) { $lines += 'VL_LIMIT_SYNC=1' }
+        return New-Config $Name $lines
+    }
+
+    $sequentialRoot = Join-Path $stateRoot 'sequential'
+    $sequentialConfig = New-StateConfig 'win02-sequential' $sequentialRoot 'burn limit5h limit7d' $true
+    $psWrite = Invoke-Statusline (Json $statePayload) $sequentialConfig $stateEnvWrite '' 10000
+    Check-Run 'WIN-02 PowerShell first writer' $psWrite
+    $burnStore = Join-Path $sequentialRoot 'burn.d'
+    $limit5Store = Join-Path $sequentialRoot 'limit5.d'
+    $limit7Store = Join-Path $sequentialRoot 'limit7.d'
+    $burnNames = Get-ImmediateNames $burnStore
+    Check 'WIN-02 PowerShell canonical burn name' ($burnNames.Count -eq 1 -and $burnNames[0] -ceq 'b_000001015900_000001000000_041.200_0000')
+    Check 'WIN-02 PowerShell canonical 5h directory' ([IO.Directory]::Exists((Join-Path $limit5Store '0001015900_041.200')))
+    Check 'WIN-02 PowerShell canonical 7d directory' ([IO.Directory]::Exists((Join-Path $limit7Store '0001345600_030.000')))
+    Check 'WIN-02 PowerShell writer leaves legacy TSV absent' (-not [IO.File]::Exists((Join-Path $sequentialRoot 'burn.tsv')))
+
+    $bashRead = Invoke-BashStatusline (Json $statePayload) $sequentialConfig $stateEnvRead
+    Check-Run 'WIN-02 Bash reads PowerShell state' $bashRead
+    Check-Exact 'WIN-02 Bash reader matches PowerShell fixed-pill output' $bashRead $psWrite
+    Remove-Item -LiteralPath $burnStore,$limit5Store,$limit7Store -Recurse -Force
+    $bashWrite = Invoke-BashStatusline (Json $statePayload) $sequentialConfig $stateEnvWrite
+    Check-Run 'WIN-02 Bash first writer' $bashWrite
+    $burnNames = Get-ImmediateNames $burnStore
+    Check 'WIN-02 Bash canonical burn name' ($burnNames.Count -eq 1 -and $burnNames[0] -ceq 'b_000001015900_000001000000_041.200_0000')
+    $psRead = Invoke-Statusline (Json $statePayload) $sequentialConfig $stateEnvRead '' 10000
+    Check-Run 'WIN-02 PowerShell reads Bash state' $psRead
+    Check-Exact 'WIN-02 PowerShell reader matches Bash fixed-pill output' $psRead $bashWrite
+
+    # C:\, C:/, and /c/ spellings must resolve to the same physical store.
+    $identityRoot = Join-Path $stateRoot 'identity'
+    [void][IO.Directory]::CreateDirectory($identityRoot)
+    $identityNative = Join-Path $identityRoot 'burn.tsv'
+    $identityForward = Forward-Path $identityNative
+    $identityMsys = '/' + $identityForward.Substring(0,1).ToLowerInvariant() + $identityForward.Substring(2)
+    $identityForms = @($identityNative, $identityForward, $identityMsys)
+    for ($i=0; $i -lt $identityForms.Count; $i++) {
+        $config = New-Config ("win02-identity-$i") @('VL_SEGMENTS=burn','VL_CLOCK=off',("BURN_FILE='" + $identityForms[$i] + "'"))
+        $payload = Clone-Object $statePayload
+        $payload.rate_limits.five_hour.used_percentage = [string](10 + $i)
+        $identityDump = Join-Path $identityRoot ("state-$i.txt")
+        $identityEnv = @{ CORALLINE_NO_SAMPLE=$null; CORALLINE_TEST_NOW=[string]($fixedNow + $i); CORALLINE_TEST_STATE_DUMP=(Forward-Path $identityDump) }
+        if ($i -eq 2) { $identityEnv.CORALLINE_TEST_STRICT='1' }
+        if (($i % 2) -eq 0) { $run = Invoke-Statusline (Json $payload) $config $identityEnv '' 10000 }
+        else { $run = Invoke-BashStatusline (Json $payload) $config $identityEnv }
+        Check-Run "WIN-02 path identity writer $i" $run
+    }
+    $identityNames = Get-ImmediateNames (Join-Path $identityRoot 'burn.d')
+    if ($identityNames.Count -ne 3) {
+        [Console]::Out.WriteLine('DIAG  WIN-02 identity names=' + ($identityNames -join ','))
+        foreach ($dump in @(Get-ChildItem -LiteralPath $identityRoot -Filter 'state-*.txt' -File | Sort-Object Name)) { [Console]::Out.WriteLine('DIAG  ' + $dump.Name + '=' + [IO.File]::ReadAllText($dump.FullName, $StrictUtf8)) }
+    }
+    Check 'WIN-02 C native/forward/MSYS forms share one store' ($identityNames.Count -eq 3)
+
+    # Exact decimal vectors are checked through committed filenames in both runtimes.
+    $pctVectors = @(
+        [pscustomobject]@{Raw='1.2345'; Canon='001.234'; Valid=$true},
+        [pscustomobject]@{Raw='1.2355'; Canon='001.236'; Valid=$true},
+        [pscustomobject]@{Raw='99.9995'; Canon='100.000'; Valid=$true},
+        [pscustomobject]@{Raw='100.000001'; Canon=''; Valid=$false},
+        [pscustomobject]@{Raw='-0'; Canon=''; Valid=$false},
+        [pscustomobject]@{Raw='1e2'; Canon=''; Valid=$false},
+        [pscustomobject]@{Raw='1,2'; Canon=''; Valid=$false}
+    )
+    for ($i=0; $i -lt $pctVectors.Count; $i++) {
+        $vectorRoot = Join-Path $stateRoot ("pct-$i")
+        $config = New-StateConfig ("win02-pct-$i") $vectorRoot 'burn' $false
+        $payload = Clone-Object $statePayload
+        $payload.rate_limits.five_hour.used_percentage = $pctVectors[$i].Raw
+        if (($i % 2) -eq 0) { $run = Invoke-Statusline (Json $payload) $config $stateEnvWrite '' 10000 }
+        else { $run = Invoke-BashStatusline (Json $payload) $config $stateEnvWrite }
+        Check-Run "WIN-02 canonical pct writer $i" $run
+        $names = Get-ImmediateNames (Join-Path $vectorRoot 'burn.d')
+        if ($pctVectors[$i].Valid) { Check "WIN-02 canonical pct $($pctVectors[$i].Raw)" ($names.Count -eq 1 -and $names[0].Contains('_' + $pctVectors[$i].Canon + '_')) }
+        else { Check "WIN-02 rejects pct $($pctVectors[$i].Raw)" ($names.Count -eq 0) }
+    }
+
+    # Store-only estimator vector: exact same-second reduction, rate-derived ETA,
+    # reset isolation, and raw fixed-pill output must agree.
+    $estimateRoot = Join-Path $stateRoot 'estimate'
+    $estimateConfig = New-StateConfig 'win02-estimate' $estimateRoot 'burn' $false
+    $estimateStore = Join-Path $estimateRoot 'burn.d'
+    [void][IO.Directory]::CreateDirectory($estimateStore)
+    foreach ($name in @(
+        'b_000001015900_000000999640_006.000_0000',
+        'b_000001015900_000000999700_007.000_0000',
+        'b_000001015900_000000999700_006.500_0001',
+        'b_000001015900_000000999940_008.000_0000',
+        'b_000001015900_000001000000_008.000_0000',
+        'b_000001010000_000000999900_051.000_0000'
+    )) { [IO.File]::WriteAllBytes((Join-Path $estimateStore $name), [byte[]]@()) }
+    $estimatePayload = Clone-Object $statePayload
+    $estimatePayload.rate_limits.five_hour.used_percentage = '8'
+    $estimatePsDump = Join-Path $estimateRoot 'ps-state.json'
+    $estimateBashDump = Join-Path $estimateRoot 'bash-state.txt'
+    $estimatePsEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=$estimatePsDump }
+    $estimateBashEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=(Forward-Path $estimateBashDump) }
+    $estimatePs = Invoke-Statusline (Json $estimatePayload) $estimateConfig $estimatePsEnv '' 10000
+    $estimateBash = Invoke-BashStatusline (Json $estimatePayload) $estimateConfig $estimateBashEnv
+    Check-Run 'WIN-02 PowerShell estimator vector' $estimatePs
+    Check-Run 'WIN-02 Bash estimator vector' $estimateBash
+    $estimatePsState = [IO.File]::ReadAllText($estimatePsDump, $StrictUtf8) | ConvertFrom-Json
+    $estimateBashState = [IO.File]::ReadAllText($estimateBashDump, $StrictUtf8).Trim()
+    Check 'WIN-02 PowerShell exact estimator semantics' ($estimatePsState.FiveState -eq 'active' -and [string]$estimatePsState.FiveEta -eq '22080' -and $estimatePsState.FiveRate -eq '0.0041666667' -and [string]$estimatePsState.FiveTtr -eq '15900' -and $estimatePsState.BurnLabel -eq '5h')
+    Check 'WIN-02 same-second maximum preserves synthetic slope' ($estimatePsState.FiveEta -eq 22080 -and $estimatePsState.FiveRate -eq '0.0041666667')
+    Check 'WIN-02 Bash exact estimator semantics' ($estimateBashState.Contains('FiveState=active FiveEta=22080 FiveRate=0.0041666667 FiveTtr=15900') -and $estimateBashState.Contains('BurnState=active BurnLabel=5h BurnEta=22080'))
+    if (-not ($estimatePsState.FiveState -eq 'active')) { [Console]::Out.WriteLine('DIAG  WIN-02 PowerShell state=' + ([IO.File]::ReadAllText($estimatePsDump, $StrictUtf8))) }
+    Check-Exact 'WIN-02 estimator fixed-pill differential' $estimatePs $estimateBash
+    Check 'WIN-02 estimator exact ETA visible' ((Plain $estimatePs.Stdout).Contains((Glyph 0x2197) + ' ' + (Glyph 0x2713)))
+
+    # 7d rational vectors straddle an exact .5 ETA without binary floating point.
+    # The exact midpoint has an even quotient and stays down; one milli-percent
+    # below/above it lands on opposite sides. Both runtimes expose the same state.
+    foreach ($vector in @(
+        [pscustomobject]@{Pct='39.999'; Eta='5'; Rate=''},
+        [pscustomobject]@{Pct='40'; Eta='4'; Rate='13.3333333333'},
+        [pscustomobject]@{Pct='40.001'; Eta='4'; Rate=''}
+    )) {
+        $rationalRoot = Join-Path $stateRoot ('rational-' + $vector.Pct.Replace('.','-'))
+        $rationalConfig = New-StateConfig ('win02-rational-' + $vector.Pct.Replace('.','-')) $rationalRoot 'burn' $false
+        $rationalPayload = Clone-Object $statePayload
+        $rationalPayload.rate_limits.five_hour.used_percentage = $null
+        $rationalPayload.rate_limits.five_hour.resets_at = $null
+        $rationalPayload.rate_limits.seven_day.used_percentage = $vector.Pct
+        $rationalPayload.rate_limits.seven_day.resets_at = [string]($fixedNow + 604797L)
+        $psDump = Join-Path $rationalRoot 'ps.json'
+        $bashDump = Join-Path $rationalRoot 'bash.txt'
+        $psEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=$psDump }
+        $bashEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=(Forward-Path $bashDump) }
+        $psRun = Invoke-Statusline (Json $rationalPayload) $rationalConfig $psEnv '' 10000
+        $bashRun = Invoke-BashStatusline (Json $rationalPayload) $rationalConfig $bashEnv
+        Check-Run ('WIN-02 PowerShell rational pct ' + $vector.Pct) $psRun
+        Check-Run ('WIN-02 Bash rational pct ' + $vector.Pct) $bashRun
+        Check-Exact ('WIN-02 rational fixed-pill differential ' + $vector.Pct) $psRun $bashRun
+        $psState = [IO.File]::ReadAllText($psDump, $StrictUtf8) | ConvertFrom-Json
+        $bashState = [IO.File]::ReadAllText($bashDump, $StrictUtf8).Trim()
+        Check ('WIN-02 rational ETA ' + $vector.Pct) ([string]$psState.SevenEta -eq $vector.Eta -and $bashState.Contains('SevenEta=' + $vector.Eta + ' '))
+        if (-not [string]::IsNullOrEmpty($vector.Rate)) { Check 'WIN-02 rational non-divisible 7d rate' ($psState.SevenRate -eq $vector.Rate -and $bashState.Contains('SevenRate=' + $vector.Rate + ' ')) }
+        Check ('WIN-02 rational no-sample root absent ' + $vector.Pct) (-not [IO.Directory]::Exists((Join-Path $rationalRoot 'burn.d')))
+    }
+
+    # Deterministic controls distinguish unchanged usage, truly idle history, and
+    # reset rollover. No live Claude quota movement is used as correctness evidence.
+    foreach ($control in @(
+        [pscustomobject]@{
+            Name='unchanged'; Expected='warming'; Pct='10';
+            Entries=@(
+                'b_000001015900_000000999500_010.000_0000',
+                'b_000001015900_000000999700_010.000_0000',
+                'b_000001015900_000000999900_010.000_0000'
+            )
+        },
+        [pscustomobject]@{
+            Name='idle'; Expected='idle'; Pct='6';
+            Entries=@(
+                'b_000001015900_000000999000_005.000_0000',
+                'b_000001015900_000000999100_006.000_0000',
+                'b_000001015900_000000999900_006.000_0000'
+            )
+        },
+        [pscustomobject]@{
+            Name='reset-rollover'; Expected='warming'; Pct='2';
+            Entries=@(
+                'b_000001010000_000000999500_005.000_0000',
+                'b_000001010000_000000999700_006.000_0000',
+                'b_000001010000_000000999900_007.000_0000',
+                'b_000001015900_000000999950_002.000_0000'
+            )
+        }
+    )) {
+        $controlRoot = Join-Path $stateRoot ('estimator-' + $control.Name)
+        $controlConfig = New-StateConfig ('win02-estimator-' + $control.Name) $controlRoot 'burn' $false
+        $controlStore = Join-Path $controlRoot 'burn.d'
+        [void][IO.Directory]::CreateDirectory($controlStore)
+        foreach ($name in $control.Entries) { [IO.File]::WriteAllBytes((Join-Path $controlStore $name), [byte[]]@()) }
+        $controlPayload = Clone-Object $statePayload
+        $controlPayload.rate_limits.five_hour.used_percentage = $control.Pct
+        $controlPayload.rate_limits.seven_day.used_percentage = $null
+        $controlPayload.rate_limits.seven_day.resets_at = $null
+        $psDump = Join-Path $controlRoot 'ps.json'
+        $bashDump = Join-Path $controlRoot 'bash.txt'
+        $psEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=$psDump }
+        $bashEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=(Forward-Path $bashDump) }
+        $psRun = Invoke-Statusline (Json $controlPayload) $controlConfig $psEnv '' 10000
+        $bashRun = Invoke-BashStatusline (Json $controlPayload) $controlConfig $bashEnv
+        Check-Run ('WIN-02 PowerShell estimator control ' + $control.Name) $psRun
+        Check-Run ('WIN-02 Bash estimator control ' + $control.Name) $bashRun
+        Check-Exact ('WIN-02 estimator control differential ' + $control.Name) $psRun $bashRun
+        $psState = [IO.File]::ReadAllText($psDump, $StrictUtf8) | ConvertFrom-Json
+        $bashState = [IO.File]::ReadAllText($bashDump, $StrictUtf8).Trim()
+        Check ('WIN-02 deterministic estimator state ' + $control.Name) ($psState.FiveState -eq $control.Expected -and $bashState.Contains('FiveState=' + $control.Expected + ' '))
+    }
+
+    # Legacy is bounded, permanently read-only, deduplicated in memory, and never
+    # imported as l_* state.
+    $legacyRoot = Join-Path $stateRoot 'legacy'
+    $legacyConfig = New-StateConfig 'win02-legacy' $legacyRoot 'burn' $false
+    $legacyPath = Join-Path $legacyRoot 'burn.tsv'
+    Write-Utf8 $legacyPath "999640`t6`t1015900`n999700`t7`t1015900`n999940`t8`t1015900`n1000000`t8`t1015900`n9999999`t99`t99999999`n"
+    $legacyBefore = Snapshot-File $legacyPath
+    $legacyPayload = Clone-Object $statePayload
+    $legacyPayload.rate_limits.five_hour.used_percentage = '8'
+    $legacyPs = Invoke-Statusline (Json $legacyPayload) $legacyConfig $stateEnvWrite '' 10000
+    $legacyBash = Invoke-BashStatusline (Json $legacyPayload) $legacyConfig $stateEnvWrite
+    Check-Run 'WIN-02 PowerShell legacy read' $legacyPs
+    Check-Run 'WIN-02 Bash legacy read' $legacyBash
+    Check 'WIN-02 legacy bytes/timestamp/hash unchanged' ((Snapshot-File $legacyPath) -eq $legacyBefore)
+    $legacyNames = Get-ImmediateNames (Join-Path $legacyRoot 'burn.d')
+    Check 'WIN-02 no runtime creates l_*' (@($legacyNames | Where-Object { $_ -like 'l_*' }).Count -eq 0)
+
+    # Simulate a downgrade runtime appending the permanent legacy TSV after the
+    # immutable store already exists. New readers must reread those rows without
+    # importing, rewriting, or changing either source.
+    [IO.File]::AppendAllText($legacyPath, "999500`t10`t1016000`n999700`t11`t1016000`n999940`t12`t1016000`n", $Utf8NoBom)
+    $downgradeLegacyBefore = Snapshot-File $legacyPath
+    [void](Snapshot-StateTree (Join-Path $legacyRoot 'burn.d'))
+    $downgradeStoreBefore = Snapshot-StateTree (Join-Path $legacyRoot 'burn.d')
+    $downgradePsDump = Join-Path $legacyRoot 'downgrade-ps.json'
+    $downgradeBashDump = Join-Path $legacyRoot 'downgrade-bash.txt'
+    $downgradePsEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=$downgradePsDump }
+    $downgradeBashEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=(Forward-Path $downgradeBashDump) }
+    $downgradePs = Invoke-Statusline (Json $legacyPayload) $legacyConfig $downgradePsEnv '' 10000
+    $downgradeBash = Invoke-BashStatusline (Json $legacyPayload) $legacyConfig $downgradeBashEnv
+    Check-Run 'WIN-02 PowerShell post-downgrade legacy reread' $downgradePs
+    Check-Run 'WIN-02 Bash post-downgrade legacy reread' $downgradeBash
+    Check-Exact 'WIN-02 post-downgrade reader differential' $downgradePs $downgradeBash
+    $downgradeState = [IO.File]::ReadAllText($downgradePsDump, $StrictUtf8) | ConvertFrom-Json
+    Check 'WIN-02 post-downgrade rows drive latest synthetic reset' ($downgradeState.FiveState -eq 'active' -and [string]$downgradeState.FiveEta -eq '21120' -and [string]$downgradeState.FiveTtr -eq '16000')
+    Check 'WIN-02 post-downgrade legacy remains byte exact during reread' ((Snapshot-File $legacyPath) -eq $downgradeLegacyBefore)
+    Check 'WIN-02 post-downgrade store remains unchanged during reread' ((Snapshot-StateTree (Join-Path $legacyRoot 'burn.d')) -ceq $downgradeStoreBefore)
+    Check 'WIN-02 post-downgrade reread creates no l_*' (@((Get-ImmediateNames (Join-Path $legacyRoot 'burn.d')) | Where-Object { $_ -like 'l_*' }).Count -eq 0)
+
+    # CORALLINE_NO_SAMPLE preserves all roots, strict sentinels, malformed entries,
+    # legacy bytes, and missing roots under both readers.
+    $readonlyRoot = Join-Path $stateRoot 'readonly'
+    $readonlyConfig = New-StateConfig 'win02-readonly' $readonlyRoot 'burn limit5h limit7d' $true
+    [void][IO.Directory]::CreateDirectory((Join-Path $readonlyRoot 'burn.d'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $readonlyRoot 'limit5.d\9999999999_099.000'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $readonlyRoot 'limit7.d\9999999999_099.000'))
+    [IO.File]::WriteAllBytes((Join-Path $readonlyRoot 'burn.d\b_253402300799_000001000000_099.000_0000'), [byte[]]@())
+    [IO.File]::WriteAllText((Join-Path $readonlyRoot 'burn.d\malformed'), 'x', $Utf8NoBom)
+    Write-Utf8 (Join-Path $readonlyRoot 'burn.tsv') "1000000`t41.2`t1015900`n"
+    [void](Snapshot-StateTree $readonlyRoot)
+    $readonlyBefore = Snapshot-StateTree $readonlyRoot
+    $readonlyPs = Invoke-Statusline (Json $statePayload) $readonlyConfig $stateEnvRead '' 10000
+    $readonlyBash = Invoke-BashStatusline (Json $statePayload) $readonlyConfig $stateEnvRead
+    Check-Run 'WIN-02 PowerShell no-sample' $readonlyPs
+    Check-Run 'WIN-02 Bash no-sample' $readonlyBash
+    Check 'WIN-02 no-sample tree metadata unchanged' ((Snapshot-StateTree $readonlyRoot) -ceq $readonlyBefore)
+    $missingReadonlyRoot = Join-Path $stateRoot 'readonly-missing'
+    $missingReadonlyConfig = New-StateConfig 'win02-readonly-missing' $missingReadonlyRoot 'burn limit5h limit7d' $true
+    [void](Invoke-Statusline (Json $statePayload) $missingReadonlyConfig $stateEnvRead '' 10000)
+    [void](Invoke-BashStatusline (Json $statePayload) $missingReadonlyConfig $stateEnvRead)
+    Check 'WIN-02 no-sample leaves missing roots absent' (-not [IO.Directory]::Exists((Join-Path $missingReadonlyRoot 'burn.d')) -and -not [IO.Directory]::Exists((Join-Path $missingReadonlyRoot 'limit5.d')))
+
+    # Over-cap stores are incomplete, bounded by watchdog, and frozen.
+    $overRoot = Join-Path $stateRoot 'overcap'
+    $overConfig = New-StateConfig 'win02-overcap' $overRoot 'burn limit5h' $true
+    $overBurn = Join-Path $overRoot 'burn.d'
+    [void][IO.Directory]::CreateDirectory($overBurn)
+    for ($i=0; $i -lt 4097; $i++) { [IO.File]::WriteAllBytes((Join-Path $overBurn ('x' + $i.ToString('D4'))), [byte[]]@()) }
+    $overPs = Invoke-Statusline (Json $statePayload) $overConfig $stateEnvWrite '' 20000
+    Check-Run 'WIN-02 PowerShell burn cap+1 watchdog' $overPs
+    Check 'WIN-02 PowerShell burn cap+1 frozen' ((Get-ImmediateNames $overBurn).Count -eq 4097)
+    $overLimit = Join-Path $overRoot 'limit5.d'
+    if ([IO.Directory]::Exists($overLimit)) { [IO.Directory]::Delete($overLimit, $true) }
+    [void][IO.Directory]::CreateDirectory($overLimit)
+    for ($i=0; $i -lt 513; $i++) { [void][IO.Directory]::CreateDirectory((Join-Path $overLimit ('x' + $i.ToString('D3')))) }
+    $overPs2 = Invoke-Statusline (Json $statePayload) $overConfig $stateEnvWrite '' 20000
+    Check-Run 'WIN-02 PowerShell limit cap+1 watchdog' $overPs2
+    Check 'WIN-02 PowerShell limit cap+1 frozen' ((Get-ImmediateNames $overLimit).Count -eq 513)
+
+    # Publication watermarks and complete scan caps are distinct boundaries.
+    foreach ($rawCount in @(3967,3968,4096)) {
+        $boundaryRoot = Join-Path $stateRoot ("burn-boundary-$rawCount")
+        $boundaryConfig = New-StateConfig ("win02-burn-boundary-$rawCount") $boundaryRoot 'burn' $false
+        $boundaryStore = Join-Path $boundaryRoot 'burn.d'
+        [void][IO.Directory]::CreateDirectory($boundaryStore)
+        for ($i=0; $i -lt $rawCount; $i++) { [IO.File]::WriteAllBytes((Join-Path $boundaryStore ('x' + $i.ToString('D4'))), [byte[]]@()) }
+        $boundaryRun = Invoke-Statusline (Json $statePayload) $boundaryConfig $stateEnvWrite '' 30000
+        Check-Run "WIN-02 PowerShell burn raw boundary $rawCount" $boundaryRun
+        $expectedCount = $rawCount
+        if ($rawCount -eq 3967) { $expectedCount++ }
+        Check "WIN-02 burn raw boundary $rawCount publication" ((Get-ImmediateNames $boundaryStore).Count -eq $expectedCount)
+    }
+    foreach ($rawCount in @(383,384,512)) {
+        $boundaryRoot = Join-Path $stateRoot ("limit-boundary-$rawCount")
+        $boundaryConfig = New-StateConfig ("win02-limit-boundary-$rawCount") $boundaryRoot 'limit5h' $true
+        $boundaryStore = Join-Path $boundaryRoot 'limit5.d'
+        [void][IO.Directory]::CreateDirectory($boundaryStore)
+        for ($i=0; $i -lt $rawCount; $i++) { [void][IO.Directory]::CreateDirectory((Join-Path $boundaryStore ('x' + $i.ToString('D3')))) }
+        $boundaryRun = Invoke-Statusline (Json $statePayload) $boundaryConfig $stateEnvWrite '' 30000
+        Check-Run "WIN-02 PowerShell limit raw boundary $rawCount" $boundaryRun
+        $expectedCount = $rawCount
+        if ($rawCount -eq 383) { $expectedCount++ }
+        Check "WIN-02 limit raw boundary $rawCount publication" ((Get-ImmediateNames $boundaryStore).Count -eq $expectedCount)
+    }
+
+    # The default 1500-entry retained set must remain usable on the prompt path.
+    # Every filename is canonical so this exercises the real native sort path.
+    $steadyRoot = Join-Path $stateRoot 'steady-1500'
+    $steadyConfig = New-StateConfig 'win02-steady-1500' $steadyRoot 'burn' $false
+    $steadyStore = Join-Path $steadyRoot 'burn.d'
+    [void][IO.Directory]::CreateDirectory($steadyStore)
+    for ($i=0; $i -lt 1500; $i++) {
+        $sample = $fixedNow - $i - 1L
+        $name = 'b_' + $reset5.ToString('D12', $Invariant) + '_' + $sample.ToString('D12', $Invariant) + '_010.000_0000'
+        [IO.File]::WriteAllBytes((Join-Path $steadyStore $name), [byte[]]@())
+    }
+    $steadyPs = Invoke-Statusline (Json $statePayload) $steadyConfig $stateEnvWrite '' 5000
+    Check-Run 'WIN-02 PowerShell 1500-entry steady render' $steadyPs
+    Check 'WIN-02 PowerShell 1500-entry steady render under 3s' ($steadyPs.ElapsedMs -lt 3000)
+    Check 'WIN-02 PowerShell 1500-entry steady publication' ((Get-ImmediateNames $steadyStore).Count -eq 1501)
+    $steadyBash = Invoke-BashStatusline (Json $statePayload) $steadyConfig $stateEnvRead
+    Check-Run 'WIN-02 Bash 1500-entry steady render' $steadyBash
+    Check 'WIN-02 Bash 1500-entry steady render under 3s' ($steadyBash.ElapsedMs -lt 3000)
+
+    # PowerShell legacy reads enforce the same byte/row/record bounds and keep the
+    # physical TSV untouched. Exact-cap input is complete; cap+1 and late bounds
+    # freeze publication instead of using partial rows.
+    $legacyExactRoot = Join-Path $stateRoot 'legacy-exact-cap'
+    $legacyExactConfig = New-StateConfig 'win02-legacy-exact-cap' $legacyExactRoot 'burn' $false
+    $legacyExactPath = Join-Path $legacyExactRoot 'burn.tsv'
+    $legacyRecord = New-Object byte[] 4096
+    for ($i=0; $i -lt 4095; $i++) { $legacyRecord[$i] = 120 }
+    $legacyRecord[4095] = 10
+    $legacyExactBytes = New-Object byte[] 1048576
+    for ($offset=0; $offset -lt $legacyExactBytes.Length; $offset += $legacyRecord.Length) { [Array]::Copy($legacyRecord, 0, $legacyExactBytes, $offset, $legacyRecord.Length) }
+    [IO.File]::WriteAllBytes($legacyExactPath, $legacyExactBytes)
+    $legacyExactBefore = Snapshot-File $legacyExactPath
+    $legacyExactRun = Invoke-Statusline (Json $statePayload) $legacyExactConfig $stateEnvWrite '' 30000
+    Check-Run 'WIN-02 PowerShell exact 1MiB legacy' $legacyExactRun
+    Check 'WIN-02 exact 1MiB legacy completes and publishes' ((Get-ImmediateNames (Join-Path $legacyExactRoot 'burn.d')).Count -eq 1)
+    Check 'WIN-02 exact 1MiB legacy remains byte exact' ((Snapshot-File $legacyExactPath) -eq $legacyExactBefore)
+
+    $legacyOverRoot = Join-Path $stateRoot 'legacy-cap-plus-one'
+    $legacyOverConfig = New-StateConfig 'win02-legacy-cap-plus-one' $legacyOverRoot 'burn' $false
+    $legacyOverPath = Join-Path $legacyOverRoot 'burn.tsv'
+    $legacyOverBytes = New-Object byte[] 1048577
+    [Array]::Copy($legacyExactBytes, $legacyOverBytes, $legacyExactBytes.Length)
+    $legacyOverBytes[1048576] = 120
+    [IO.File]::WriteAllBytes($legacyOverPath, $legacyOverBytes)
+    $legacyOverBefore = Snapshot-File $legacyOverPath
+    $legacyOverRun = Invoke-Statusline (Json $statePayload) $legacyOverConfig $stateEnvWrite '' 30000
+    Check-Run 'WIN-02 PowerShell legacy cap+1 watchdog' $legacyOverRun
+    Check 'WIN-02 legacy cap+1 freezes publication' (-not [IO.Directory]::Exists((Join-Path $legacyOverRoot 'burn.d')))
+    Check 'WIN-02 legacy cap+1 remains byte exact' ((Snapshot-File $legacyOverPath) -eq $legacyOverBefore)
+
+    foreach ($legacyCase in @(
+        [pscustomobject]@{Name='row-cap-plus-one'; Bytes=([byte[]](,10 * 4097))},
+        [pscustomobject]@{Name='record-cap-plus-one'; Bytes=([Text.Encoding]::ASCII.GetBytes(('1' * 4097)))},
+        [pscustomobject]@{Name='nul-row'; Bytes=([byte[]](49,48,48,48,48,48,48,9,49,9,49,48,49,53,57,48,48,10,49,0,9,49,9,49,10))}
+    )) {
+        $caseRoot = Join-Path $stateRoot ('legacy-' + $legacyCase.Name)
+        $caseConfig = New-StateConfig ('win02-legacy-' + $legacyCase.Name) $caseRoot 'burn' $false
+        $casePath = Join-Path $caseRoot 'burn.tsv'
+        [IO.File]::WriteAllBytes($casePath, $legacyCase.Bytes)
+        $caseBefore = Snapshot-File $casePath
+        $caseRun = Invoke-Statusline (Json $statePayload) $caseConfig $stateEnvWrite '' 10000
+        Check-Run ('WIN-02 PowerShell legacy ' + $legacyCase.Name) $caseRun
+        $casePublished = [IO.Directory]::Exists((Join-Path $caseRoot 'burn.d'))
+        if ($legacyCase.Name -eq 'nul-row') { Check 'WIN-02 bounded NUL row is ignored without poisoning snapshot' $casePublished }
+        else { Check ('WIN-02 ' + $legacyCase.Name + ' freezes publication') (-not $casePublished) }
+        Check ('WIN-02 ' + $legacyCase.Name + ' remains byte exact') ((Snapshot-File $casePath) -eq $caseBefore)
+    }
+
+    # Fixed-clock limit edges are strict for both stores. Only NOW+1 and NOW+max
+    # are plausible and publishable; expired/far-future strict sentinels are
+    # preserved read-only, then removed only from a complete mutation snapshot.
+    foreach ($limitSpec in @(
+        [pscustomobject]@{Name='5h'; Segment='limit5h'; RootName='limit5.d'; Max=21600L; Field='five_hour'},
+        [pscustomobject]@{Name='7d'; Segment='limit7d'; RootName='limit7.d'; Max=691200L; Field='seven_day'}
+    )) {
+        foreach ($offset in @(0L,1L,$limitSpec.Max,($limitSpec.Max + 1L))) {
+            $edgeRoot = Join-Path $stateRoot ("edge-$($limitSpec.Name)-$offset")
+            $edgeConfig = New-StateConfig ("win02-edge-$($limitSpec.Name)-$offset") $edgeRoot $limitSpec.Segment $true
+            $edgePayload = Clone-Object $statePayload
+            $edgePayload.rate_limits.five_hour.used_percentage = $null
+            $edgePayload.rate_limits.five_hour.resets_at = $null
+            $edgePayload.rate_limits.seven_day.used_percentage = $null
+            $edgePayload.rate_limits.seven_day.resets_at = $null
+            $edgePayload.rate_limits.($limitSpec.Field).used_percentage = '33.333'
+            $edgePayload.rate_limits.($limitSpec.Field).resets_at = [string]($fixedNow + $offset)
+            $edgeRun = Invoke-Statusline (Json $edgePayload) $edgeConfig $stateEnvWrite '' 10000
+            Check-Run ("WIN-02 $($limitSpec.Name) reset edge $offset") $edgeRun
+            $validEdge = $offset -eq 1L -or $offset -eq $limitSpec.Max
+            $edgeStore = Join-Path $edgeRoot $limitSpec.RootName
+            $edgeNames = Get-ImmediateNames $edgeStore
+            Check ("WIN-02 $($limitSpec.Name) reset edge $offset publication") (($validEdge -and $edgeNames.Count -eq 1) -or (-not $validEdge -and $edgeNames.Count -eq 0))
+        }
+
+        $sentinelRoot = Join-Path $stateRoot ('sentinel-' + $limitSpec.Name)
+        $sentinelConfig = New-StateConfig ('win02-sentinel-' + $limitSpec.Name) $sentinelRoot $limitSpec.Segment $true
+        $sentinelStore = Join-Path $sentinelRoot $limitSpec.RootName
+        [void][IO.Directory]::CreateDirectory($sentinelStore)
+        $expiredName = $fixedNow.ToString('D10', $Invariant) + '_099.000'
+        $futureName = ($fixedNow + $limitSpec.Max + 1L).ToString('D10', $Invariant) + '_099.000'
+        [void][IO.Directory]::CreateDirectory((Join-Path $sentinelStore $expiredName))
+        [void][IO.Directory]::CreateDirectory((Join-Path $sentinelStore $futureName))
+        $sentinelPayload = Clone-Object $statePayload
+        $sentinelPayload.rate_limits.five_hour.used_percentage = $null
+        $sentinelPayload.rate_limits.five_hour.resets_at = $null
+        $sentinelPayload.rate_limits.seven_day.used_percentage = $null
+        $sentinelPayload.rate_limits.seven_day.resets_at = $null
+        $sentinelPayload.rate_limits.($limitSpec.Field).used_percentage = '20'
+        $sentinelPayload.rate_limits.($limitSpec.Field).resets_at = [string]($fixedNow + 1L)
+        $sentinelRead = Invoke-Statusline (Json $sentinelPayload) $sentinelConfig $stateEnvRead '' 10000
+        Check-Run ("WIN-02 $($limitSpec.Name) sentinel no-sample") $sentinelRead
+        Check ("WIN-02 $($limitSpec.Name) no-sample preserves reset sentinels") ((Get-ImmediateNames $sentinelStore).Count -eq 2)
+        $sentinelWrite = Invoke-Statusline (Json $sentinelPayload) $sentinelConfig $stateEnvWrite '' 10000
+        Check-Run ("WIN-02 $($limitSpec.Name) sentinel mutation") $sentinelWrite
+        $sentinelNames = Get-ImmediateNames $sentinelStore
+        $expectedName = ($fixedNow + 1L).ToString('D10', $Invariant) + '_020.000'
+        Check ("WIN-02 $($limitSpec.Name) complete GC removes only sentinels") ($sentinelNames.Count -eq 1 -and $sentinelNames[0] -ceq $expectedName)
+    }
+
+    # Limit high-water is reset-first, then pct within that reset. A rollover to a
+    # greater reset cannot be shadowed by an older 90% value, and a lower current
+    # payload cannot regress a stored 20% high-water.
+    foreach ($limitSpec in @(
+        [pscustomobject]@{Name='5h'; Segment='limit5h'; RootName='limit5.d'; Field='five_hour'},
+        [pscustomobject]@{Name='7d'; Segment='limit7d'; RootName='limit7.d'; Field='seven_day'}
+    )) {
+        $highRoot = Join-Path $stateRoot ('highwater-' + $limitSpec.Name)
+        $highConfig = New-StateConfig ('win02-highwater-' + $limitSpec.Name) $highRoot $limitSpec.Segment $true
+        $highStore = Join-Path $highRoot $limitSpec.RootName
+        [void][IO.Directory]::CreateDirectory($highStore)
+        foreach ($name in @(
+            (($fixedNow + 100L).ToString('D10', $Invariant) + '_090.000'),
+            (($fixedNow + 200L).ToString('D10', $Invariant) + '_010.000'),
+            (($fixedNow + 200L).ToString('D10', $Invariant) + '_020.000')
+        )) { [void][IO.Directory]::CreateDirectory((Join-Path $highStore $name)) }
+        $highPayload = Clone-Object $statePayload
+        $highPayload.rate_limits.five_hour.used_percentage = $null
+        $highPayload.rate_limits.five_hour.resets_at = $null
+        $highPayload.rate_limits.seven_day.used_percentage = $null
+        $highPayload.rate_limits.seven_day.resets_at = $null
+        $highPayload.rate_limits.($limitSpec.Field).used_percentage = '15'
+        $highPayload.rate_limits.($limitSpec.Field).resets_at = [string]($fixedNow + 200L)
+        $psDump = Join-Path $highRoot 'ps.json'
+        $bashDump = Join-Path $highRoot 'bash.txt'
+        $psEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=$psDump }
+        $bashEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=(Forward-Path $bashDump) }
+        $psRun = Invoke-Statusline (Json $highPayload) $highConfig $psEnv '' 10000
+        $bashRun = Invoke-BashStatusline (Json $highPayload) $highConfig $bashEnv
+        Check-Run ('WIN-02 PowerShell high-water ' + $limitSpec.Name) $psRun
+        Check-Run ('WIN-02 Bash high-water ' + $limitSpec.Name) $bashRun
+        Check-Exact ('WIN-02 high-water differential ' + $limitSpec.Name) $psRun $bashRun
+        $psState = [IO.File]::ReadAllText($psDump, $StrictUtf8) | ConvertFrom-Json
+        $bashState = [IO.File]::ReadAllText($bashDump, $StrictUtf8).Trim()
+        $prefix = 'Limit5'
+        if ($limitSpec.Name -eq '7d') { $prefix = 'Limit7' }
+        $psPct = $psState.($prefix + 'Pct')
+        $psReset = $psState.($prefix + 'Reset')
+        Check ('WIN-02 reset-first stored high-water ' + $limitSpec.Name) ([string]$psPct -eq '20000' -and [string]$psReset -eq [string]($fixedNow + 200L) -and $bashState.Contains($prefix + 'Pct=20000'))
+
+        $highPayload.rate_limits.($limitSpec.Field).used_percentage = '25'
+        $writeRun = Invoke-Statusline (Json $highPayload) $highConfig $stateEnvWrite '' 10000
+        Check-Run ('WIN-02 PowerShell high-water advance ' + $limitSpec.Name) $writeRun
+        $highNames = Get-ImmediateNames $highStore
+        $expectedHigh = ($fixedNow + 200L).ToString('D10', $Invariant) + '_025.000'
+        Check ('WIN-02 high-water advances without regression ' + $limitSpec.Name) ($highNames -contains $expectedHigh)
+        $maintenanceRun = Invoke-Statusline (Json $highPayload) $highConfig $stateEnvWrite '' 10000
+        Check-Run ('WIN-02 PowerShell high-water maintenance ' + $limitSpec.Name) $maintenanceRun
+        $highNames = Get-ImmediateNames $highStore
+        Check ('WIN-02 high-water maintenance converges ' + $limitSpec.Name) ($highNames.Count -eq 1 -and $highNames[0] -ceq $expectedHigh)
+    }
+
+    # Concurrent mixed-runtime cohorts use unique canonical pct values so every
+    # successful writer has one observable immutable commit.
+    foreach ($count in @(1,2,4,8,128)) {
+        $cohortRoot = Join-Path $stateRoot ("cohort-$count")
+        $cohortConfig = New-StateConfig ("win02-cohort-$count") $cohortRoot 'burn' $false
+        $handles = New-Object 'System.Collections.Generic.List[object]'
+        for ($i=0; $i -lt $count; $i++) {
+            $payload = Clone-Object $statePayload
+            $payload.rate_limits.five_hour.used_percentage = [string]::Format($Invariant, '10.{0:000}', $i)
+            $writerEnv = @{ CORALLINE_NO_SAMPLE=$null; CORALLINE_TEST_NOW=[string]($fixedNow + $i) }
+            $environment = Runtime-Environment $cohortConfig $writerEnv
+            if (($i % 2) -eq 0) {
+                $args = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $script:StateScript + '"'
+                [void]$handles.Add((Start-CapturedProcessAsync $PowerShellExe $args (Json $payload) $environment $Repo))
+            } else {
+                $args = '--noprofile --norc "' + (Forward-Path $script:StateBashScript) + '"'
+                [void]$handles.Add((Start-CapturedProcessAsync $script:BashExe $args (Json $payload) $environment $Repo))
+            }
+        }
+        $cohortOk = $true
+        $cohortErrors = New-Object 'System.Collections.Generic.List[string]'
+        $writerIndex = 0
+        foreach ($handle in $handles) {
+            $result = Wait-CapturedProcessAsync $handle 120000
+            if ($result.TimedOut -or $result.ExitCode -ne 0 -or $result.StderrBytes.Length -ne 0) {
+                $cohortOk = $false
+                [void]$cohortErrors.Add(("writer=$writerIndex timeout=$($result.TimedOut) exit=$($result.ExitCode) stderr=" + $Utf8NoBom.GetString($result.StderrBytes)))
+            }
+            $writerIndex++
+        }
+        $cohortNames = Get-ImmediateNames (Join-Path $cohortRoot 'burn.d')
+        if (-not $cohortOk -or $cohortNames.Count -ne $count) { [Console]::Out.WriteLine("DIAG  WIN-02 cohort N=$count names=$($cohortNames.Count) errors=" + ($cohortErrors -join ';')) }
+        Check "WIN-02 mixed cohort N=$count writers succeed" ($cohortOk -and $cohortNames.Count -eq $count)
+    }
+
+    # Every mixed writer snapshots before the parent injects occupied live slots.
+    # The occupied names are therefore post-snapshot commits and cannot enter this
+    # GC round; writers must collide through them and exclusively claim later slots.
+    $raceRoot = Join-Path $stateRoot 'same-name-race'
+    $raceConfig = New-StateConfig 'win02-same-name-race' $raceRoot 'burn' $false
+    $raceBarrier = Join-Path $raceRoot 'release'
+    $racePayload = Clone-Object $statePayload
+    $racePayload.rate_limits.five_hour.used_percentage = '42.345'
+    $raceHandles = New-Object 'System.Collections.Generic.List[object]'
+    for ($i=0; $i -lt 8; $i++) {
+        $raceEnv = Runtime-Environment $raceConfig @{ CORALLINE_NO_SAMPLE=$null; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_BARRIER=(Forward-Path $raceBarrier) }
+        if (($i % 2) -eq 0) {
+            $raceArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $script:StateScript + '"'
+            [void]$raceHandles.Add((Start-CapturedProcessAsync $PowerShellExe $raceArgs (Json $racePayload) $raceEnv $Repo))
+        } else {
+            $raceArgs = '--noprofile --norc "' + (Forward-Path $script:StateBashScript) + '"'
+            [void]$raceHandles.Add((Start-CapturedProcessAsync $script:BashExe $raceArgs (Json $racePayload) $raceEnv $Repo))
+        }
+    }
+    $raceReady = Wait-StateBarrier $raceBarrier 8 120000
+    Check 'WIN-02 mixed same-name writers reach complete-snapshot barrier' $raceReady
+    $raceStore = Join-Path $raceRoot 'burn.d'
+    if ($raceReady) {
+        [void][IO.Directory]::CreateDirectory($raceStore)
+        for ($slot=0; $slot -lt 4; $slot++) {
+            $name = 'b_000001015900_000001000000_042.345_' + $slot.ToString('D4', $Invariant)
+            [IO.File]::WriteAllBytes((Join-Path $raceStore $name), [byte[]]@())
+        }
+        [IO.File]::WriteAllBytes($raceBarrier, [byte[]]@())
+    }
+    $raceOk = $raceReady
+    foreach ($handle in $raceHandles) {
+        $result = Wait-CapturedProcessAsync $handle 120000
+        if ($result.TimedOut -or $result.ExitCode -ne 0 -or $result.StderrBytes.Length -ne 0) { $raceOk=$false }
+    }
+    $raceNames = Get-ImmediateNames $raceStore
+    $expectedRaceNames = @()
+    for ($slot=0; $slot -lt 12; $slot++) { $expectedRaceNames += 'b_000001015900_000001000000_042.345_' + $slot.ToString('D4', $Invariant) }
+    Check 'WIN-02 preoccupied slots and eight mixed commits are exact' ($raceOk -and ($raceNames -join "`n") -ceq ($expectedRaceNames -join "`n"))
+    Check 'WIN-02 post-snapshot occupied entries survive current GC' (@($raceNames | Where-Object { $_ -like '*_0000' -or $_ -like '*_0001' -or $_ -like '*_0002' -or $_ -like '*_0003' }).Count -eq 4)
+
+    # Crash before the commit point leaves no entry. Crash after exclusive create
+    # leaves one complete zero-byte entry and no partial grammar-valid artifact.
+    $beforeCrashRoot = Join-Path $stateRoot 'crash-before-create'
+    $beforeCrashConfig = New-StateConfig 'win02-crash-before-create' $beforeCrashRoot 'burn' $false
+    $beforeBarrier = Join-Path $beforeCrashRoot 'release'
+    $beforeEnv = Runtime-Environment $beforeCrashConfig @{ CORALLINE_NO_SAMPLE=$null; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_BARRIER=(Forward-Path $beforeBarrier) }
+    $beforeArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $script:StateScript + '"'
+    $beforeHandle = Start-CapturedProcessAsync $PowerShellExe $beforeArgs (Json $statePayload) $beforeEnv $Repo
+    $beforeReady = Wait-StateBarrier $beforeBarrier 1 30000
+    Check 'WIN-02 crash-before-create reaches complete snapshot' $beforeReady
+    if ($beforeReady) { try { $beforeHandle.Process.Kill() } catch { } }
+    [void](Wait-CapturedProcessAsync $beforeHandle 30000)
+    Check 'WIN-02 crash-before-create leaves no committed entry' ((Get-ImmediateNames (Join-Path $beforeCrashRoot 'burn.d')).Count -eq 0)
+
+    $afterCrashRoot = Join-Path $stateRoot 'crash-after-create'
+    $afterCrashConfig = New-StateConfig 'win02-crash-after-create' $afterCrashRoot 'burn' $false
+    $afterBarrier = Join-Path $afterCrashRoot 'release'
+    $afterEnv = Runtime-Environment $afterCrashConfig @{ CORALLINE_NO_SAMPLE=$null; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_AFTER_CREATE=(Forward-Path $afterBarrier) }
+    $afterArgs = '--noprofile --norc "' + (Forward-Path $script:StateBashScript) + '"'
+    $afterHandle = Start-CapturedProcessAsync $script:BashExe $afterArgs (Json $statePayload) $afterEnv $Repo
+    $afterReady = Wait-StateBarrier $afterBarrier 1 30000
+    Check 'WIN-02 crash-after-create reaches committed barrier' $afterReady
+    $afterStore = Join-Path $afterCrashRoot 'burn.d'
+    $afterNames = Get-ImmediateNames $afterStore
+    $afterComplete = $afterNames.Count -eq 1 -and [IO.File]::Exists((Join-Path $afterStore $afterNames[0])) -and (New-Object IO.FileInfo((Join-Path $afterStore $afterNames[0]))).Length -eq 0
+    if ($afterReady) { try { $afterHandle.Process.Kill() } catch { } }
+    [void](Wait-CapturedProcessAsync $afterHandle 30000)
+    Check 'WIN-02 crash-after-create preserves complete commit' ($afterComplete -and (Get-ImmediateNames $afterStore).Count -eq 1)
+
+    # Culture cannot change canonical decimal filenames or output.
+    $cultureRoot = Join-Path $stateRoot 'culture'
+    $cultureConfig = New-StateConfig 'win02-culture' $cultureRoot 'burn' $false
+    $culturePayload = Clone-Object $statePayload
+    $culturePayload.rate_limits.five_hour.used_percentage = '1.2355'
+    $cultureCommand = '[Threading.Thread]::CurrentThread.CurrentCulture=[Globalization.CultureInfo]::GetCultureInfo(''de-DE''); & ''' + $script:StateScript + ''''
+    $cultureArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + $cultureCommand.Replace('"','\"') + '"'
+    $cultureRun = Invoke-CapturedProcess $PowerShellExe $cultureArgs (Json $culturePayload) (Runtime-Environment $cultureConfig $stateEnvWrite) $Repo 10000
+    Check-Run 'WIN-02 comma-decimal PowerShell culture' $cultureRun
+    $cultureNames = Get-ImmediateNames (Join-Path $cultureRoot 'burn.d')
+    Check 'WIN-02 culture keeps invariant decimal filename' ($cultureNames.Count -eq 1 -and $cultureNames[0].Contains('_001.236_'))
+
+    # State path positive controls plus ADS, junction, symlink, UNC, and device
+    # negatives. Required NTFS capabilities are failures, never BLOCKED.
+    $pathRoot = Join-Path $stateRoot 'paths'
+    $pathPositive = New-StateConfig 'win02-path-positive' (Join-Path $pathRoot 'positive') 'burn' $false
+    $pathPositiveRun = Invoke-Statusline (Json $statePayload) $pathPositive $stateEnvWrite '' 10000
+    Check-Run 'WIN-02 state path positive control' $pathPositiveRun
+    $positiveStore = Join-Path $pathRoot 'positive\burn.d'
+    Check 'WIN-02 state path positive control reaches write' ([IO.Directory]::Exists($positiveStore))
+    $positiveSentinel = Join-Path $positiveStore 'b_253402300799_000001000000_099.000_0000'
+    [IO.File]::WriteAllBytes($positiveSentinel, [byte[]]@())
+    $pathPositiveGc = Invoke-Statusline (Json $statePayload) $pathPositive $stateEnvWrite '' 10000
+    Check-Run 'WIN-02 state path positive GC control' $pathPositiveGc
+    Check 'WIN-02 state path positive control reaches exact GC' (-not [IO.File]::Exists($positiveSentinel))
+
+    $adsCarrier = Join-Path $pathRoot 'ads-carrier'
+    [void][IO.Directory]::CreateDirectory($pathRoot)
+    [IO.File]::WriteAllText($adsCarrier, 'primary', $Utf8NoBom)
+    $adsReady = $true
+    try { Set-Content -LiteralPath $adsCarrier -Stream canary -Value 'stream' -NoNewline -ErrorAction Stop } catch { $adsReady=$false }
+    Check 'WIN-02 NTFS ADS capability available' $adsReady
+    if ($adsReady) {
+        $adsBefore = Snapshot-Ads $adsCarrier canary
+        $adsConfig = New-Config 'win02-path-ads' @('VL_SEGMENTS=burn','VL_CLOCK=off',("BURN_FILE='" + (Forward-Path $adsCarrier) + ":burn.tsv'"))
+        $adsRun = Invoke-Statusline (Json $statePayload) $adsConfig $stateEnvWrite '' 10000
+        Check-Run 'WIN-02 ADS state rejection' $adsRun
+        Check 'WIN-02 ADS state canary unchanged' ((Snapshot-Ads $adsCarrier canary) -eq $adsBefore)
+    }
+
+    $junctionTarget = Join-Path $pathRoot 'junction-target'
+    $junctionLink = Join-Path $pathRoot 'junction-link'
+    [void][IO.Directory]::CreateDirectory($junctionTarget)
+    $mkJunction = Invoke-CapturedProcess $env:ComSpec ('/d /s /c "mklink /J ""' + $junctionLink + '"" ""' + $junctionTarget + '"""') '' @{} $Repo 5000
+    $junctionReady = $mkJunction.ExitCode -eq 0 -and [IO.Directory]::Exists($junctionLink)
+    Check 'WIN-02 NTFS junction capability available' $junctionReady
+    if ($junctionReady) {
+        $junctionTargetStore = Join-Path $junctionTarget 'burn.d'
+        [void][IO.Directory]::CreateDirectory($junctionTargetStore)
+        $junctionSentinel = Join-Path $junctionTargetStore 'b_253402300799_000001000000_099.000_0000'
+        [IO.File]::WriteAllBytes($junctionSentinel, [byte[]]@())
+        $junctionConfig = New-Config 'win02-path-junction' @('VL_SEGMENTS=burn','VL_CLOCK=off',("BURN_FILE='" + (Forward-Path (Join-Path $junctionLink 'burn.tsv')) + "'"))
+        $junctionRun = Invoke-Statusline (Json $statePayload) $junctionConfig $stateEnvWrite '' 10000
+        Check-Run 'WIN-02 junction state rejection' $junctionRun
+        Check 'WIN-02 junction target receives no publication or GC' ([IO.File]::Exists($junctionSentinel) -and (Get-ImmediateNames $junctionTargetStore).Count -eq 1)
+    }
+
+    $symlinkTarget = Join-Path $pathRoot 'symlink-target'
+    $symlinkLink = Join-Path $pathRoot 'symlink-link'
+    [void][IO.Directory]::CreateDirectory($symlinkTarget)
+    $mkSymlink = Invoke-CapturedProcess $env:ComSpec ('/d /s /c "mklink /D ""' + $symlinkLink + '"" ""' + $symlinkTarget + '"""') '' @{} $Repo 5000
+    $symlinkReady = $mkSymlink.ExitCode -eq 0 -and [IO.Directory]::Exists($symlinkLink)
+    Check 'WIN-02 NTFS directory symlink capability available' $symlinkReady
+    if ($symlinkReady) {
+        $symlinkTargetStore = Join-Path $symlinkTarget 'burn.d'
+        [void][IO.Directory]::CreateDirectory($symlinkTargetStore)
+        $symlinkSentinel = Join-Path $symlinkTargetStore 'b_253402300799_000001000000_099.000_0000'
+        [IO.File]::WriteAllBytes($symlinkSentinel, [byte[]]@())
+        $symlinkConfig = New-Config 'win02-path-symlink' @('VL_SEGMENTS=burn','VL_CLOCK=off',("BURN_FILE='" + (Forward-Path (Join-Path $symlinkLink 'burn.tsv')) + "'"))
+        $symlinkRun = Invoke-Statusline (Json $statePayload) $symlinkConfig $stateEnvWrite '' 10000
+        Check-Run 'WIN-02 directory symlink state rejection' $symlinkRun
+        Check 'WIN-02 directory symlink target receives no publication or GC' ([IO.File]::Exists($symlinkSentinel) -and (Get-ImmediateNames $symlinkTargetStore).Count -eq 1)
+    }
+
+    $fileTarget = Join-Path $pathRoot 'legacy-target.tsv'
+    $fileLink = Join-Path $pathRoot 'legacy-link.tsv'
+    Write-Utf8 $fileTarget "1000000`t1`t1015900`n"
+    $mkFileLink = Invoke-CapturedProcess $env:ComSpec ('/d /s /c "mklink ""' + $fileLink + '"" ""' + $fileTarget + '"""') '' @{} $Repo 5000
+    $fileLinkReady = $mkFileLink.ExitCode -eq 0 -and [IO.File]::Exists($fileLink)
+    Check 'WIN-02 NTFS file symlink capability available' $fileLinkReady
+    if ($fileLinkReady) {
+        $fileBefore = Snapshot-File $fileTarget
+        $fileLinkConfig = New-Config 'win02-path-file-link' @('VL_SEGMENTS=burn','VL_CLOCK=off',("BURN_FILE='" + (Forward-Path $fileLink) + "'"))
+        $fileLinkRun = Invoke-Statusline (Json $statePayload) $fileLinkConfig $stateEnvWrite '' 10000
+        Check-Run 'WIN-02 file symlink state rejection' $fileLinkRun
+        Check 'WIN-02 file symlink target unchanged' ((Snapshot-File $fileTarget) -eq $fileBefore)
+    }
+
+    $localStateBase = Join-Path $pathRoot 'unc-local\burn.tsv'
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($localStateBase))
+    $driveRoot = [IO.Path]::GetPathRoot($localStateBase)
+    $uncStateBase = '\\localhost\' + $driveRoot.Substring(0,1) + '$\' + $localStateBase.Substring($driveRoot.Length)
+    $uncProbe = Invoke-CapturedProcess $PowerShellExe ('-NoProfile -Command "[IO.File]::WriteAllText(''' + $uncStateBase + ''',''probe''); [IO.File]::Delete(''' + $uncStateBase + ''')"') '' @{} $Repo 5000
+    $uncReady = $uncProbe.ExitCode -eq 0 -and -not $uncProbe.TimedOut
+    Check 'WIN-02 loopback UNC capability available' $uncReady
+    if ($uncReady) {
+        $uncConfig = New-Config 'win02-path-unc' @('VL_SEGMENTS=burn','VL_CLOCK=off',("BURN_FILE='" + $uncStateBase + "'"))
+        $uncRun = Invoke-Statusline (Json $statePayload) $uncConfig $stateEnvWrite '' 5000
+        Check-Run 'WIN-02 UNC state rejection' $uncRun
+        Check 'WIN-02 UNC state rejection is pre-I/O' (-not [IO.Directory]::Exists((Join-Path ([IO.Path]::GetDirectoryName($localStateBase)) 'burn.d')))
+    }
+
+    foreach ($deviceBase in @('\\?\' + $localStateBase, '\\.\' + $localStateBase)) {
+        $deviceConfig = New-Config ('win02-path-device-' + [Math]::Abs($deviceBase.GetHashCode())) @('VL_SEGMENTS=burn','VL_CLOCK=off',("BURN_FILE='" + $deviceBase + "'"))
+        $deviceRun = Invoke-Statusline (Json $statePayload) $deviceConfig $stateEnvWrite '' 5000
+        Check-Run 'WIN-02 device namespace state rejection' $deviceRun
+        Check 'WIN-02 device namespace creates no store' (-not [IO.Directory]::Exists((Join-Path ([IO.Path]::GetDirectoryName($localStateBase)) 'burn.d')))
+    }
 
     $subagentRun = Invoke-Statusline '' '\\localhost\never\touch.conf' @{} '--subagent' 5000
     Check-Run 'literal subagent early route' $subagentRun

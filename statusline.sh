@@ -299,223 +299,807 @@ fmt_eta() {  # → _ETA ; $1=seconds (mirrors fmt_countdown's d/h/m formatting)
   else                      printf -v _ETA '%dm' "$m"; fi
 }
 
-burn_sample() {  # append one 5h sample; $1=now $2=pct(raw) $3=resets_at(raw)
-  [ -n "$2" ] || return 0
-  to_epoch "$3" || return 0
-  # Reject an implausibly-far-future reset (corrupt/sentinel snapshot): this is the
-  # 5h window, which resets within hours, so anything past now+RL_MAX_5H would
-  # otherwise poison the burn projection permanently (see #32).
-  [ "$_EP" -le "$(( $1 + RL_MAX_5H ))" ] || return 0
-  # [ -d ] is a builtin (steady state stays fork-free); mkdir forks only on the
-  # first render after a fresh install, when ~/.claude/coralline/ doesn't exist.
-  [ -d "${BURN_FILE%/*}" ] || mkdir -p "${BURN_FILE%/*}" 2>/dev/null
-  printf '%s\t%s\t%s\n' "$1" "$2" "$_EP" >> "$BURN_FILE" 2>/dev/null
+# ── Immutable burn / limit state ──────────────────────────────────────────────
+# State percentages are canonical integer milli-percent. Filenames, not file
+# contents or enumeration order, are the shared source of truth.
+state_pct() {  # → _SP_MILLI _SP_CANON; strict raw decimal, ties-to-even at .001
+  local raw="$1" whole frac six keep rest milli LC_ALL=C
+  _SP_MILLI=""; _SP_CANON=""
+  [[ "$raw" =~ ^(0|[1-9][0-9]?|100)(\.([0-9]{1,6}))?$ ]] || return 1
+  whole="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"
+  if [ "$whole" = 100 ]; then
+    case "$frac" in (*[!0]*) return 1 ;; esac
+  fi
+  six="${frac}000000"; six="${six:0:6}"
+  keep=${six:0:3}; rest=${six:3:3}
+  milli=$(( 10#$whole * 1000 + 10#$keep ))
+  if [ $(( 10#$rest )) -gt 500 ] || { [ $(( 10#$rest )) -eq 500 ] && [ $(( milli % 2 )) -eq 1 ]; }; then
+    milli=$(( milli + 1 ))
+  fi
+  [ "$milli" -le 100000 ] || return 1
+  _SP_MILLI=$milli
+  printf -v _SP_CANON '%03d.%03d' $(( milli / 1000 )) $(( milli % 1000 ))
 }
 
-# The store is a SET of atomically-created directory entries under <file>.d, each
-# named "<reset:%010d>_<pct:%07.3f>". Fixed widths make lexical order == numeric
-# order (reset dominates, pct tie-breaks), so the last entry is the current
-# window's high-water. Three race-free primitives, with no shared append and no
-# whole-file rewrite (so the rename-unlinks-the-inode hazard of a single mutable
-# file cannot occur):
-#   add  = one mkdir (atomic; concurrent adds make distinct names; idempotent)
-#   read = ls | sort | tail -1
-#   gc   = rmdir every snapshot entry below the snapshot max. Removing a non-max
-#          element cannot change the max, and entries added after the snapshot are
-#          untouched, so a concurrent higher add is never lost (no lock needed).
-rl_dir() { _RLD="${1%.tsv}.d"; }
+state_epoch() {  # → _SE_VALUE _SE_PAD; $1=strict epoch $2=width (10 or 12)
+  local raw="$1" width="$2" value
+  _SE_VALUE=""; _SE_PAD=""
+  case "$raw" in (0|[1-9][0-9]*) ;; (*) return 1 ;; esac
+  case "$raw" in (*[!0-9]*) return 1 ;; esac
+  [ "${#raw}" -le 12 ] || return 1
+  value=$(( 10#$raw ))
+  [ "$value" -ge 0 ] && [ "$value" -le 253402300799 ] || return 1
+  [ "$width" != 10 ] || [ "$value" -le 9999999999 ] || return 1
+  _SE_VALUE=$value
+  printf -v _SE_PAD "%0${width}d" "$value"
+}
 
-rl_sample() {  # $1=file $2=pct(raw int/float) $3=resets_at(raw) $4=max secs ahead
-  [ -n "$2" ] || return 0
-  to_epoch "$3" || return 0
-  # Reject an implausibly-far-future reset (corrupt/sentinel snapshot): a value past
-  # now plus this window's ceiling ($4) would win rl_latest's high-water forever and
-  # rmdir every real entry (see #32). The caller passes RL_MAX_5H or RL_MAX_7D so a
-  # stale 5h value days out is rejected, not just an absurd one. Guarded on NOW and
-  # on $4 being supplied so direct unit calls without a clock keep recording.
-  [ -z "${NOW:-}" ] || [ -z "${4:-}" ] || [ "$_EP" -le "$(( NOW + $4 ))" ] || return 0
-  rl_dir "$1"
-  if [ ! -d "$_RLD" ]; then
-    mkdir -p "$_RLD" 2>/dev/null
-    # One-shot migration: a pre-dir-set build kept a flat <file>.tsv (+ tmp); the
-    # dir-set never touches it, so drop it once when the dir is first created.
-    rm -f "$1" "$1".*.tmp 2>/dev/null
+state_payload_epoch() {  # → _SE_*; canonical ISO UTC or strict epoch only
+  local raw="$1" width="$2"
+  case "$raw" in
+    (*T*) to_epoch "$raw" || return 1; state_epoch "$_EP" "$width" ;;
+    (*) state_epoch "$raw" "$width" ;;
+  esac
+}
+
+state_round_even() {  # → _RE; exact nonnegative rational midpoint-to-even
+  local n="$1" d="$2" q r twice
+  _RE=0
+  [ "$d" -gt 0 ] || return 1
+  q=$(( n / d )); r=$(( n % d )); twice=$(( r * 2 ))
+  if [ "$twice" -gt "$d" ] || { [ "$twice" -eq "$d" ] && [ $(( q % 2 )) -eq 1 ]; }; then
+    q=$(( q + 1 ))
   fi
-  local r p
-  printf -v r '%010d' "$_EP" 2>/dev/null || return 0
-  printf -v p '%07.3f' "$2"  2>/dev/null || return 0
-  mkdir "$_RLD/${r}_${p}" 2>/dev/null
+  _RE=$q
+}
+
+state_rate10() {  # → _RATE10; $1=scaled numerator $2=denominator
+  local scaled
+  state_round_even "$1" "$2" || { _RATE10="0.0000000000"; return 1; }
+  scaled=$_RE
+  printf -v _RATE10 '%d.%010d' $(( scaled / 10000000000 )) $(( scaled % 10000000000 ))
+}
+
+state_drive_lower() {  # → _SDL
+  case "$1" in
+    (A|a) _SDL=a ;; (B|b) _SDL=b ;; (C|c) _SDL=c ;; (D|d) _SDL=d ;;
+    (E|e) _SDL=e ;; (F|f) _SDL=f ;; (G|g) _SDL=g ;; (H|h) _SDL=h ;;
+    (I|i) _SDL=i ;; (J|j) _SDL=j ;; (K|k) _SDL=k ;; (L|l) _SDL=l ;;
+    (M|m) _SDL=m ;; (N|n) _SDL=n ;; (O|o) _SDL=o ;; (P|p) _SDL=p ;;
+    (Q|q) _SDL=q ;; (R|r) _SDL=r ;; (S|s) _SDL=s ;; (T|t) _SDL=t ;;
+    (U|u) _SDL=u ;; (V|v) _SDL=v ;; (W|w) _SDL=w ;; (X|x) _SDL=x ;;
+    (Y|y) _SDL=y ;; (Z|z) _SDL=z ;; (*) return 1 ;;
+  esac
+}
+
+state_abs_path() {  # → _SAP; lexical absolute path, including MSYS drive forms
+  local p="$1" drive rest part out=""
+  _SAP=""
+  [ -n "$p" ] || return 1
+  p="${p//\\//}"
+  case "$p" in
+    (//*) return 1 ;;
+    ([abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]:/*)
+      drive=${p:0:1}; state_drive_lower "$drive" || return 1
+      p="/${_SDL}/${p:3}" ;;
+    (/*) ;;
+    (*) p="$PWD/$p" ;;
+  esac
+  rest="${p#/}"
+  while :; do
+    part="${rest%%/*}"
+    case "$part" in
+      (''|.) ;;
+      (..) [ -n "$out" ] || return 1; out="${out%/*}" ;;
+      (*) out="${out:+$out/}$part" ;;
+    esac
+    [ "$rest" = "$part" ] && break
+    rest="${rest#*/}"
+  done
+  _SAP="/${out}"
+  [ "$_SAP" != "/" ] || _SAP="/"
+}
+
+state_no_symlink_path() {  # → _SNP; every existing ancestor and target is non-link
+  local path="$1" rest part cur="" tail
+  _SNP=""
+  state_abs_path "$path" || return 1
+  path="$_SAP"; rest="${path#/}"
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"; tail="${rest#*/}"
+    cur="$cur/$part"
+    [ -L "$cur" ] && return 1
+    if [ "$tail" != "$rest" ] && [ -e "$cur" ] && [ ! -d "$cur" ]; then return 1; fi
+    [ "$tail" = "$rest" ] && break
+    rest="$tail"
+  done
+  _SNP="$path"
+}
+
+state_store_path() {  # → _SS_BASE _SS_ROOT from configured base
+  state_abs_path "$1" || return 1
+  _SS_BASE="$_SAP"
+  _SS_ROOT="${_SS_BASE%.tsv}.d"
+  [ "$_SS_ROOT" != "$_SS_BASE" ] || _SS_ROOT="${_SS_BASE}.d"
+}
+
+state_same_path() {  # true for proven or platform-conservative store-root identity
+  local left="$1" right="$2" had_nocase=0 same=1
+  [ "$left" = "$right" ] && return 0
+  if [ -e "$left" ] && [ -e "$right" ] && [ "$left" -ef "$right" ]; then return 0; fi
+  case "${OSTYPE:-}" in
+    (darwin*|mingw*|msys*)
+      shopt -q nocasematch && had_nocase=1
+      shopt -s nocasematch
+      [[ "$left" == "$right" ]] && same=0
+      [ "$had_nocase" = 1 ] || shopt -u nocasematch
+      return "$same"
+      ;;
+  esac
+  return 1
+}
+
+state_dir_empty() {
+  local child
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  for child in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -e "$child" ] || [ -L "$child" ] || continue
+    return 1
+  done
   return 0
 }
 
-rl_latest() {  # $1=file $2=max secs ahead → _LL_PCT _LL_RST (epoch)
-  _LL_PCT=""; _LL_RST=""
-  rl_dir "$1"; [ -d "$_RLD" ] || return 0
-  # ONE snapshot for both the max and the GC. A second listing could include an
-  # entry added after `hi` was chosen, and the loop would rmdir that fresher (and
-  # possibly higher) entry. Iterating the same snapshot means post-snapshot adds
-  # are never deletion candidates, so a concurrent higher add is never lost.
-  local snap hi d cut="" kept=""
-  # A store poisoned before this fix (a 2030 sentinel written by an old preview)
-  # would still pin every read: rl_latest picks the max reset and rmdirs the rest.
-  # So drop entries beyond now plus this window's ceiling ($2) on read too. That
-  # keeps the sentinel out of the high-water AND prunes it, so the store self-heals
-  # (#32). Guarded on NOW (and on $2 being supplied) so direct unit calls without a
-  # clock keep every entry. A real reset is never that far out, so a concurrent
-  # legitimate add is never a pruning candidate.
-  [ -z "${NOW:-}" ] || [ -z "${2:-}" ] || cut=$(( NOW + $2 ))
-  snap=$(ls -1 "$_RLD" 2>/dev/null | grep '^[0-9]' | sort)
-  [ -n "$snap" ] || return 0
-  for d in $snap; do
-    if [ -n "$cut" ] && [ "$(( 10#${d%_*} ))" -gt "$cut" ]; then
-      rmdir "$_RLD/$d" 2>/dev/null            # purge the poisoned sentinel entry
-    else
-      kept="${kept}${kept:+ }$d"
-    fi
-  done
-  [ -n "$kept" ] || return 0
-  hi="${kept##* }"             # kept is built in sorted order, so the last is the max
-  _LL_RST=$(( 10#${hi%_*} ))   # 10# avoids the leading-zero octal trap on the reset
-  _LL_PCT="${hi#*_}"           # keep as string so a fractional pct is preserved
-  for d in $kept; do
-    [ "$d" = "$hi" ] || rmdir "$_RLD/$d" 2>/dev/null
-  done
+state_burn_name() {  # → _SBN_* for one strict live basename
+  local name="$1" pr ps pc LC_ALL=C
+  _SBN_RST=""; _SBN_SAMP=""; _SBN_PCT=""; _SBN_SLOT=""
+  [[ "$name" =~ ^b_([0-9]{12})_([0-9]{12})_((0[0-9]{2}|100)\.[0-9]{3})_([0-9]{4})$ ]] || return 1
+  pr="${BASH_REMATCH[1]}"; ps="${BASH_REMATCH[2]}"; pc="${BASH_REMATCH[3]}"
+  _SBN_RST=$(( 10#$pr )); _SBN_SAMP=$(( 10#$ps ))
+  [ "$_SBN_RST" -le 253402300799 ] && [ "$_SBN_SAMP" -le 253402300799 ] || return 1
+  _SBN_PCT=$(( 10#${pc:0:3} * 1000 + 10#${pc:4:3} ))
+  [ "$_SBN_PCT" -le 100000 ] || return 1
+  _SBN_SLOT="${BASH_REMATCH[5]}"
 }
 
-burn_eta_5h() {  # → _B5_STATE _B5_ETA _B5_RATE _B5_TTR ; trims $BURN_FILE
-  _B5_STATE="warming"; _B5_ETA="inf"; _B5_RATE="0"; _B5_TTR="0"
-  [ -f "$BURN_FILE" ] || return 0
-  local tmp="$BURN_FILE.$$.tmp" out
-  out=$(awk -F'\t' -v now="$NOW" -v win="$CORALLINE_BURN_WINDOW" \
-            -v trim="$BURN_TRIM" -v tmp="$tmp" -v maxahead="$RL_MAX_5H" '
-    $2 != "" {
-      e = $1 + 0; r = $3 + 0
-      # Drop a row whose reset is implausibly far out (a 2030 sentinel from an old
-      # sample preview). Left in, it becomes the "current window" below and starves
-      # the real samples; dropping it on read self-heals a pre-fix poisoned file (#32).
-      if (r > now + maxahead) { dropped = 1; next }
-      if (!(e in seen)) { ord[++n] = e; seen[e] = 1 }
-      pct[e] = $2 + 0; rst[e] = r
-    }
-    END {
-      if (n == 0) { print "warming inf 0 0"; next_done = 1 }
-      if (!next_done) {
-        # Fit the slope over the CURRENT window only. The sample file is shared
-        # by every concurrent session writing to this host; idle ones keep
-        # appending stale snapshots from earlier windows (a different reset).
-        # Mixing windows lets the fit pair two samples seconds apart but tens of
-        # percent apart, giving a near-vertical rate and a bogus ~1m ETA. The
-        # current window is the one with the latest reset; keep only its samples
-        # (cord[1..m]) in file order, then run the recent-slope fit over them.
-        cur = 0
-        for (i = 1; i <= n; i++) if (rst[ord[i]] > cur) cur = rst[ord[i]]
-        m = 0
-        for (i = 1; i <= n; i++) if (rst[ord[i]] == cur) cord[++m] = ord[i]
-        # Within the current window usage only ever rises until the window
-        # resets, so any decrease here is cache-lag jitter between concurrent
-        # sessions (their rate-limit caches refresh at different moments), NOT a
-        # reset — a real reset lands in a new window and was filtered out above.
-        # Anchoring the fit at the window start keeps a few jitter down-blips
-        # from collapsing it onto the last 1-2 samples and exploding the slope
-        # into a bogus ~1m ETA.
-        start = 1
-        le = cord[m]; lp = pct[le]
-        ttr = cur - now; if (ttr < 0) ttr = 0
-        cwin = now - win
-        # Crossings must span at least this long to trust a slope. Cache-lag
-        # jitter between sessions is second-scale, so a sub-minute span is noise;
-        # a genuine fast burn still rises over many seconds and clears this, so
-        # the guard rejects only second-scale noise, not real fast consumption.
-        minspan = int(win / 10)
-        fc_t = 0; fc_p = -1; lc_t = 0; lc_p = -1; ncross = 0; anycross = 0
-        for (i = start + 1; i <= m; i++) {
-          a = int(pct[cord[i-1]]); b = int(pct[cord[i]])
-          if (b > a) {
-            anycross = 1; ct = cord[i]
-            if (ct >= cwin && ct <= now) {
-              if (fc_p < 0) { fc_t = ct; fc_p = b }
-              lc_t = ct; lc_p = b; ncross++
+state_limit_name() {  # → _SLN_RST _SLN_PCT for one strict limit basename
+  local name="$1" pr pc LC_ALL=C
+  _SLN_RST=""; _SLN_PCT=""
+  [[ "$name" =~ ^([0-9]{10})_((0[0-9]{2}|100)\.[0-9]{3})$ ]] || return 1
+  pr="${BASH_REMATCH[1]}"; pc="${BASH_REMATCH[2]}"
+  _SLN_RST=$(( 10#$pr ))
+  _SLN_PCT=$(( 10#${pc:0:3} * 1000 + 10#${pc:4:3} ))
+  [ "$_SLN_PCT" -le 100000 ] || return 1
+}
+
+state_add_burn_path() {
+  local path="$1" name="$2" i plausible=0
+  _SB_RAW=$(( _SB_RAW + 1 ))
+  state_burn_name "$name" || return 0
+  [ -f "$path" ] && [ ! -L "$path" ] && [ ! -s "$path" ] || return 0
+  if [ "$_SBN_SAMP" -le $(( NOW + 300 )) ] && [ "$_SBN_RST" -ge "$_SBN_SAMP" ] \
+     && [ "$_SBN_RST" -le $(( NOW + RL_MAX_5H )) ]; then plausible=1; fi
+  i=${#_SB_NAMES[@]}
+  _SB_NAMES[$i]="$name"; _SB_PATHS[$i]="$path"; _SB_RSTS[$i]="$_SBN_RST"
+  _SB_SAMPS[$i]="$_SBN_SAMP"; _SB_PCTS[$i]="$_SBN_PCT"; _SB_PLAUS[$i]="$plausible"
+}
+
+state_add_limit_path() {  # $1=5|7 $2=path $3=name
+  local which="$1" path="$2" name="$3" i plausible=0 max
+  if [ "$which" = 5 ]; then _SL5_RAW=$(( _SL5_RAW + 1 )); max=$RL_MAX_5H
+  else _SL7_RAW=$(( _SL7_RAW + 1 )); max=$RL_MAX_7D; fi
+  state_limit_name "$name" || return 0
+  state_dir_empty "$path" || return 0
+  if [ "$_SLN_RST" -gt "$NOW" ] && [ "$_SLN_RST" -le $(( NOW + max )) ]; then plausible=1; fi
+  if [ "$which" = 5 ]; then
+    i=${#_SL5_NAMES[@]}; _SL5_NAMES[$i]="$name"; _SL5_PATHS[$i]="$path"
+    _SL5_RSTS[$i]="$_SLN_RST"; _SL5_PCTS[$i]="$_SLN_PCT"; _SL5_PLAUS[$i]="$plausible"
+  else
+    i=${#_SL7_NAMES[@]}; _SL7_NAMES[$i]="$name"; _SL7_PATHS[$i]="$path"
+    _SL7_RSTS[$i]="$_SLN_RST"; _SL7_PCTS[$i]="$_SLN_PCT"; _SL7_PLAUS[$i]="$plausible"
+  fi
+}
+
+state_add_legacy_record() {
+  local record="$1" a b c rest i
+  case "$record" in (*$'\t'*$'\t'*) ;; (*) return 1 ;; esac
+  a="${record%%$'\t'*}"; rest="${record#*$'\t'}"
+  b="${rest%%$'\t'*}"; c="${rest#*$'\t'}"
+  case "$c" in (*$'\t'*) return 1 ;; esac
+  [[ "$a" =~ ^[0-9]{12}$ ]] && [[ "$b" =~ ^[0-9]{12}$ ]] && [[ "$c" =~ ^[0-9]{1,6}$ ]] || return 1
+  [ "$(( 10#$c ))" -le 100000 ] || return 1
+  i=${#_LEG_RSTS[@]}
+  _LEG_RSTS[$i]=$(( 10#$a )); _LEG_SAMPS[$i]=$(( 10#$b )); _LEG_PCTS[$i]=$(( 10#$c ))
+}
+
+state_snapshot() {  # one framed controller for every gated state root + legacy TSV
+  local record name phase=paths ctrl=$'\001' f_seen=0 l_seen=0 e_seen=0 bad=0
+  local f_status=missing l_status=missing combined=0 matched stream_over=0
+  _LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=()
+  exec 9< <(
+    if [ "${#_STATE_FIND_ARGS[@]}" -gt 0 ]; then
+      LC_ALL=C find -P "${_STATE_FIND_ARGS[@]}" ! -name . -prune -print0 2>/dev/null
+      _sf=$?
+    else
+      _sf=0
+    fi
+    printf '\001F:%s\0' "$_sf" || exit 0
+    if [ "$_STATE_LEGACY_READ" = 1 ]; then
+      LC_ALL=C od -An -v -N 1048577 -tu1 -- "$_SB_BASE" 2>/dev/null | LC_ALL=C awk \
+        -v now="$NOW" -v maxahead="$RL_MAX_5H" '
+        function pct_milli(raw, parts, whole, frac, six, keep, rest, milli, last) {
+          if (raw !~ /^(0|[1-9][0-9]?|100)(\.[0-9]{1,6})?$/) return -1
+          parts = split(raw, p, "."); whole = p[1]
+          frac = (parts == 2 ? p[2] : "")
+          if (whole == "100" && frac ~ /[1-9]/) return -1
+          six = substr(frac "000000", 1, 6)
+          keep = substr(six, 1, 3) + 0; rest = substr(six, 4, 3) + 0
+          milli = (whole + 0) * 1000 + keep
+          if (rest > 500 || (rest == 500 && milli % 2 == 1)) milli++
+          if (milli < 0 || milli > 100000) return -1
+          return milli
+        }
+        function epoch_ok(raw, value) {
+          if (raw !~ /^(0|[1-9][0-9]*)$/ || length(raw) > 12) return 0
+          if (length(raw) == 12 && raw > "253402300799") return 0
+          return 1
+        }
+        function finish_record( fields, nf, sample, reset, pctm, canon, slot) {
+          rows++
+          if (rows > 4096) { bad = 1; return }
+          if (!row_ascii) { rec = ""; rec_len = 0; row_ascii = 1; return }
+          nf = split(rec, fields, "\t")
+          if (nf == 3 && epoch_ok(fields[1]) && epoch_ok(fields[3])) {
+            sample = fields[1] + 0; reset = fields[3] + 0; pctm = pct_milli(fields[2])
+            if (pctm >= 0 && sample <= now + 300 && reset >= sample && reset <= now + maxahead) {
+              canon = sprintf("%012d\t%012d\t%d", reset, sample, pctm)
+              valid++
+              slot = ((valid - 1) % 512) + 1
+              ring[slot] = canon
             }
           }
+          rec = ""; rec_len = 0; row_ascii = 1
         }
-        if (ncross >= 2 && lc_t > fc_t && lc_p > fc_p && (lc_t - fc_t) >= minspan) {
-          rate = (lc_p - fc_p) / (lc_t - fc_t)
-          eta = (100 - lp) / rate; if (eta < 0) eta = 0
-          printf "active %.0f %.10f %d\n", eta, rate, ttr
-        } else if (anycross && ncross == 0) {
-          print "idle inf 0 " ttr
-        } else {
-          print "warming inf 0 " ttr
+        BEGIN { row_ascii = 1 }
+        {
+          for (i = 1; i <= NF; i++) {
+            byte = $i + 0; bytes++
+            if (bytes > 1048576) { bad = 1; exit 42 }
+            if (byte == 10) { finish_record(); if (bad) exit 42; continue }
+            rec_len++
+            if (rec_len > 4096) { bad = 1; exit 42 }
+            if (byte == 9 || byte == 46 || (byte >= 48 && byte <= 57)) rec = rec sprintf("%c", byte)
+            else row_ascii = 0
+          }
         }
-        # Trim on PHYSICAL rows (NR), not distinct seconds (n): sub-second render
-        # bursts (resize storms) append same-second rows that n dedups away, so an
-        # n-based cap would never fire and the file would grow unbounded. The
-        # rewrite emits the deduped last-`trim` seconds, so it also collapses the
-        # burst rows. Fires when the file exceeds the cap, or when a sentinel row
-        # was dropped above, so the poisoned row is purged from the file too (#32).
-        if (NR > trim || dropped) {
-          lo = n - trim + 1; if (lo < 1) lo = 1
-          for (i = lo; i <= n; i++)
-            printf "%d\t%s\t%d\n", ord[i], pct[ord[i]], rst[ord[i]] > tmp
-        }
-      }
-    }
-  ' "$BURN_FILE")
-  [ -f "$tmp" ] && mv "$tmp" "$BURN_FILE" 2>/dev/null
-  for _f in "$BURN_FILE".*.tmp; do        # sweep tmps orphaned by dead sessions
-    [ -e "$_f" ] || break                  # literal glob → no orphans
-    [ "$_f" = "$tmp" ] || rm -f "$_f" 2>/dev/null
+        END {
+          if (!bad && rec_len > 0) finish_record()
+          if (bad) exit 42
+          first = valid - 511; if (first < 1) first = 1
+          for (i = first; i <= valid; i++) printf "%s%c", ring[((i - 1) % 512) + 1], 0
+        }'
+      _sp=("${PIPESTATUS[@]}")
+      printf '\001L:%s:%s\0' "${_sp[0]}" "${_sp[1]}" || exit 0
+    else
+      printf '\001L:0:0\0' || exit 0
+    fi
+    printf '\001E\0'
+  )
+  while IFS= read -r -d '' -u 9 record; do
+    case "$record" in
+      ("${ctrl}F:"*)
+        [ "$phase" = paths ] && [ "$f_seen" -eq 0 ] || { bad=1; continue; }
+        f_seen=1; f_status="${record#?F:}"; phase=legacy
+        case "$f_status" in (''|*[!0-9]*) bad=1 ;; esac
+        ;;
+      ("${ctrl}L:"*)
+        [ "$phase" = legacy ] && [ "$l_seen" -eq 0 ] || { bad=1; continue; }
+        l_seen=1; l_status="${record#?L:}"; phase=end
+        case "$l_status" in ([0-9]*:[0-9]*) ;; (*) bad=1 ;; esac
+        ;;
+      ("${ctrl}E")
+        [ "$phase" = end ] && [ "$e_seen" -eq 0 ] || { bad=1; continue; }
+        e_seen=1; phase=done
+        ;;
+      (/*)
+        [ "$phase" = paths ] || { bad=1; continue; }
+        combined=$(( combined + 1 )); matched=0
+        if [ "$_STATE_BURN_GATE" = 1 ]; then
+          case "$record" in ("$_SB_ROOT/./"*) name="${record#"$_SB_ROOT/./"}"; state_add_burn_path "$_SB_ROOT/$name" "$name"; matched=1 ;; esac
+          [ "$_SB_RAW" -le 4096 ] || stream_over=1
+        fi
+        if [ "$matched" -eq 0 ] && [ "$_STATE_RL5_GATE" = 1 ]; then
+          case "$record" in ("$_SL5_ROOT/./"*) name="${record#"$_SL5_ROOT/./"}"; state_add_limit_path 5 "$_SL5_ROOT/$name" "$name"; matched=1 ;; esac
+          [ "$_SL5_RAW" -le 512 ] || stream_over=1
+        fi
+        if [ "$matched" -eq 0 ] && [ "$_STATE_RL7_GATE" = 1 ]; then
+          case "$record" in ("$_SL7_ROOT/./"*) name="${record#"$_SL7_ROOT/./"}"; state_add_limit_path 7 "$_SL7_ROOT/$name" "$name"; matched=1 ;; esac
+          [ "$_SL7_RAW" -le 512 ] || stream_over=1
+        fi
+        [ "$matched" -eq 1 ] || bad=1
+        [ "$combined" -le 5120 ] || stream_over=1
+        if [ "$stream_over" -eq 1 ]; then exec 9<&-; break; fi
+        ;;
+      (*)
+        if [ "$phase" = legacy ] && [ "${record:0:1}" != "$ctrl" ]; then
+          state_add_legacy_record "$record" || bad=1
+        else bad=1; fi
+        ;;
+    esac
   done
-  read -r _B5_STATE _B5_ETA _B5_RATE _B5_TTR <<EOF
-$out
-EOF
+  exec 9<&- 2>/dev/null || true
+  if [ "$stream_over" -eq 1 ]; then
+    _SB_DIR_COMPLETE=0; _SL5_COMPLETE=0; _SL7_COMPLETE=0; _LEG_COMPLETE=0
+    _LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=()
+    return 0
+  fi
+  [ "$f_seen" -eq 1 ] && [ "$l_seen" -eq 1 ] && [ "$e_seen" -eq 1 ] && [ "$phase" = done ] || bad=1
+  [ "$bad" -eq 0 ] || { _SB_DIR_COMPLETE=0; _SL5_COMPLETE=0; _SL7_COMPLETE=0; _LEG_COMPLETE=0; _LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=(); return 0; }
+  if [ "$f_status" = 0 ]; then
+    [ "$_SB_DIR_PREOK" = 1 ] && _SB_DIR_COMPLETE=1
+    [ "$_SL5_DIR_PREOK" = 1 ] && _SL5_COMPLETE=1
+    [ "$_SL7_DIR_PREOK" = 1 ] && _SL7_COMPLETE=1
+  fi
+  if [ "$l_status" = 0:0 ] && [ "$_LEG_PREOK" = 1 ]; then _LEG_COMPLETE=1
+  else _LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=(); fi
 }
 
-burn_eta_7d() {  # → _B7_* (stateless); $1=pct(=wd_pct) $2=resets_at(=wd_rst)
-  local p7="${1:-$wd_pct}" r7="${2:-$wd_rst}"
-  _B7_ETA="inf"; _B7_RATE="0"; _B7_TTR="0"
-  [ -n "$p7" ] || return 0
-  to_epoch "$r7" || return 0
-  read -r _B7_ETA _B7_RATE _B7_TTR <<EOF
-$(awk -v p="$p7" -v r="$_EP" -v now="$NOW" 'BEGIN {
-    ttr = r - now; if (ttr < 0) ttr = 0
-    ws = r - 7 * 86400; el = now - ws
-    if (p + 0 <= 0 || el <= 0) { print "inf 0 " ttr; exit }
-    rate = (p + 0) / el
-    eta = (100 - (p + 0)) / rate; if (eta < 0) eta = 0
-    printf "%.0f %.10f %d\n", eta, rate, ttr
-  }')
-EOF
+state_sort_order() {  # → _SORT_ORDER; stable bottom-up merge sort of _SORT_KEYS
+  local n i width left mid right a b k pick LC_ALL=C
+  local work=()
+  _SORT_ORDER=(); n=${#_SORT_KEYS[@]}
+  for ((i=0; i<n; i++)); do _SORT_ORDER[$i]=$i; done
+  width=1
+  while [ "$width" -lt "$n" ]; do
+    work=(); left=0
+    while [ "$left" -lt "$n" ]; do
+      mid=$(( left + width )); [ "$mid" -gt "$n" ] && mid=$n
+      right=$(( left + width + width )); [ "$right" -gt "$n" ] && right=$n
+      a=$left; b=$mid; k=$left
+      while [ "$a" -lt "$mid" ] || [ "$b" -lt "$right" ]; do
+        if [ "$b" -ge "$right" ]; then pick=${_SORT_ORDER[$a]}; a=$(( a + 1 ))
+        elif [ "$a" -ge "$mid" ]; then pick=${_SORT_ORDER[$b]}; b=$(( b + 1 ))
+        elif [[ "${_SORT_KEYS[${_SORT_ORDER[$b]}]}" < "${_SORT_KEYS[${_SORT_ORDER[$a]}]}" ]]; then
+          pick=${_SORT_ORDER[$b]}; b=$(( b + 1 ))
+        else pick=${_SORT_ORDER[$a]}; a=$(( a + 1 ))
+        fi
+        work[$k]=$pick; k=$(( k + 1 ))
+      done
+      left=$right
+    done
+    _SORT_ORDER=("${work[@]}"); width=$(( width + width ))
+  done
+}
+
+state_sort_burn() {
+  local i j n
+  local names=() paths=() rsts=() samps=() pcts=() plaus=()
+  _SORT_KEYS=("${_SB_NAMES[@]}"); state_sort_order; n=${#_SORT_ORDER[@]}
+  for ((i=0; i<n; i++)); do
+    j=${_SORT_ORDER[$i]}; names[$i]="${_SB_NAMES[$j]}"; paths[$i]="${_SB_PATHS[$j]}"
+    rsts[$i]="${_SB_RSTS[$j]}"; samps[$i]="${_SB_SAMPS[$j]}"
+    pcts[$i]="${_SB_PCTS[$j]}"; plaus[$i]="${_SB_PLAUS[$j]}"
+  done
+  _SB_NAMES=("${names[@]}"); _SB_PATHS=("${paths[@]}"); _SB_RSTS=("${rsts[@]}")
+  _SB_SAMPS=("${samps[@]}"); _SB_PCTS=("${pcts[@]}"); _SB_PLAUS=("${plaus[@]}")
+  _SORT_KEYS=(); _SORT_ORDER=()
+}
+
+state_sort_limit() {  # $1=5|7
+  local which="$1" i j n
+  local names=() paths=() rsts=() pcts=() plaus=()
+  if [ "$which" = 5 ]; then _SORT_KEYS=("${_SL5_NAMES[@]}"); else _SORT_KEYS=("${_SL7_NAMES[@]}"); fi
+  state_sort_order; n=${#_SORT_ORDER[@]}
+  for ((i=0; i<n; i++)); do
+    j=${_SORT_ORDER[$i]}
+    if [ "$which" = 5 ]; then
+      names[$i]="${_SL5_NAMES[$j]}"; paths[$i]="${_SL5_PATHS[$j]}"; rsts[$i]="${_SL5_RSTS[$j]}"
+      pcts[$i]="${_SL5_PCTS[$j]}"; plaus[$i]="${_SL5_PLAUS[$j]}"
+    else
+      names[$i]="${_SL7_NAMES[$j]}"; paths[$i]="${_SL7_PATHS[$j]}"; rsts[$i]="${_SL7_RSTS[$j]}"
+      pcts[$i]="${_SL7_PCTS[$j]}"; plaus[$i]="${_SL7_PLAUS[$j]}"
+    fi
+  done
+  if [ "$which" = 5 ]; then
+    _SL5_NAMES=("${names[@]}"); _SL5_PATHS=("${paths[@]}"); _SL5_RSTS=("${rsts[@]}")
+    _SL5_PCTS=("${pcts[@]}"); _SL5_PLAUS=("${plaus[@]}")
+  else
+    _SL7_NAMES=("${names[@]}"); _SL7_PATHS=("${paths[@]}"); _SL7_RSTS=("${rsts[@]}")
+    _SL7_PCTS=("${pcts[@]}"); _SL7_PLAUS=("${plaus[@]}")
+  fi
+  _SORT_KEYS=(); _SORT_ORDER=()
+}
+
+state_burn_retention() {
+  local i n key group_key="" rep=-1 j keep_from reps=0 LC_ALL=C
+  local group=() rep_names=() rep_paths=() rep_rsts=() rep_samps=() rep_pcts=()
+  _SB_CAND_NAMES=(); _SB_CAND_PATHS=()
+  state_sort_burn
+  n=${#_SB_NAMES[@]}
+  for ((i=0; i<=n; i++)); do
+    if [ "$i" -lt "$n" ] && [ "${_SB_PLAUS[$i]}" = 1 ]; then key="${_SB_RSTS[$i]}_${_SB_SAMPS[$i]}"; else key=""; fi
+    if [ -n "$group_key" ] && { [ "$key" != "$group_key" ] || [ "$i" -eq "$n" ]; }; then
+      for j in "${group[@]}"; do
+        if [ "$j" -ne "$rep" ]; then
+          _SB_CAND_NAMES[${#_SB_CAND_NAMES[@]}]="${_SB_NAMES[$j]}"
+          _SB_CAND_PATHS[${#_SB_CAND_PATHS[@]}]="${_SB_PATHS[$j]}"
+        fi
+      done
+      rep_names[$reps]="${_SB_NAMES[$rep]}"; rep_paths[$reps]="${_SB_PATHS[$rep]}"
+      rep_rsts[$reps]="${_SB_RSTS[$rep]}"; rep_samps[$reps]="${_SB_SAMPS[$rep]}"; rep_pcts[$reps]="${_SB_PCTS[$rep]}"
+      reps=$(( reps + 1 )); group=(); group_key=""; rep=-1
+    fi
+    [ "$i" -lt "$n" ] || continue
+    if [ "${_SB_PLAUS[$i]}" != 1 ]; then
+      _SB_CAND_NAMES[${#_SB_CAND_NAMES[@]}]="${_SB_NAMES[$i]}"
+      _SB_CAND_PATHS[${#_SB_CAND_PATHS[@]}]="${_SB_PATHS[$i]}"
+      continue
+    fi
+    key="${_SB_RSTS[$i]}_${_SB_SAMPS[$i]}"
+    if [ -z "$group_key" ]; then group_key="$key"; rep=$i; group=($i)
+    else
+      group[${#group[@]}]=$i
+      if [ "${_SB_PCTS[$i]}" -gt "${_SB_PCTS[$rep]}" ] || { [ "${_SB_PCTS[$i]}" -eq "${_SB_PCTS[$rep]}" ] && [[ "${_SB_NAMES[$i]}" < "${_SB_NAMES[$rep]}" ]]; }; then rep=$i; fi
+    fi
+  done
+  keep_from=$(( reps - BURN_TRIM )); [ "$keep_from" -lt 0 ] && keep_from=0
+  for ((i=0; i<keep_from; i++)); do
+    _SB_CAND_NAMES[${#_SB_CAND_NAMES[@]}]="${rep_names[$i]}"
+    _SB_CAND_PATHS[${#_SB_CAND_PATHS[@]}]="${rep_paths[$i]}"
+  done
+  _SB_REP_RSTS=(); _SB_REP_SAMPS=(); _SB_REP_PCTS=()
+  for ((i=0; i<reps; i++)); do
+    _SB_REP_RSTS[${#_SB_REP_RSTS[@]}]="${rep_rsts[$i]}"
+    _SB_REP_SAMPS[${#_SB_REP_SAMPS[@]}]="${rep_samps[$i]}"
+    _SB_REP_PCTS[${#_SB_REP_PCTS[@]}]="${rep_pcts[$i]}"
+  done
+  _SB_CAND_TOTAL=${#_SB_CAND_PATHS[@]}
+}
+
+state_limit_retention() {  # $1=5|7
+  local which="$1" i n winner=-1
+  state_sort_limit "$which"
+  if [ "$which" = 5 ]; then
+    _SL5_CAND_NAMES=(); _SL5_CAND_PATHS=(); n=${#_SL5_NAMES[@]}
+    for ((i=0; i<n; i++)); do [ "${_SL5_PLAUS[$i]}" = 1 ] && winner=$i; done
+    for ((i=0; i<n; i++)); do
+      [ "$i" -eq "$winner" ] && continue
+      _SL5_CAND_NAMES[${#_SL5_CAND_NAMES[@]}]="${_SL5_NAMES[$i]}"; _SL5_CAND_PATHS[${#_SL5_CAND_PATHS[@]}]="${_SL5_PATHS[$i]}"
+    done
+    _SL5_CAND_TOTAL=${#_SL5_CAND_PATHS[@]}; _SL5_STORED_VALID=0
+    if [ "$winner" -ge 0 ]; then _SL5_STORED_VALID=1; _SL5_STORED_RST="${_SL5_RSTS[$winner]}"; _SL5_STORED_PCT="${_SL5_PCTS[$winner]}"; fi
+  else
+    _SL7_CAND_NAMES=(); _SL7_CAND_PATHS=(); n=${#_SL7_NAMES[@]}
+    for ((i=0; i<n; i++)); do [ "${_SL7_PLAUS[$i]}" = 1 ] && winner=$i; done
+    for ((i=0; i<n; i++)); do
+      [ "$i" -eq "$winner" ] && continue
+      _SL7_CAND_NAMES[${#_SL7_CAND_NAMES[@]}]="${_SL7_NAMES[$i]}"; _SL7_CAND_PATHS[${#_SL7_CAND_PATHS[@]}]="${_SL7_PATHS[$i]}"
+    done
+    _SL7_CAND_TOTAL=${#_SL7_CAND_PATHS[@]}; _SL7_STORED_VALID=0
+    if [ "$winner" -ge 0 ]; then _SL7_STORED_VALID=1; _SL7_STORED_RST="${_SL7_RSTS[$winner]}"; _SL7_STORED_PCT="${_SL7_PCTS[$winner]}"; fi
+  fi
+}
+
+state_revalidate_burn() {
+  local path="$1" name="$2"
+  [ "$path" = "$_SB_ROOT/$name" ] || return 1
+  state_no_symlink_path "$_SB_ROOT" || return 1
+  [ "$_SNP" = "$_SB_ROOT" ] && [ -d "$_SB_ROOT" ] || return 1
+  state_burn_name "$name" || return 1
+  [ -f "$path" ] && [ ! -L "$path" ] && [ ! -s "$path" ]
+}
+
+state_revalidate_limit() {
+  local root="$1" path="$2" name="$3"
+  [ "$path" = "$root/$name" ] || return 1
+  state_no_symlink_path "$root" || return 1
+  [ "$_SNP" = "$root" ] && [ -d "$root" ] || return 1
+  state_limit_name "$name" || return 1
+  state_dir_empty "$path"
+}
+
+state_gc() {
+  local i limit path name id idx resolved_b=0 resolved_5=0 resolved_7=0
+  local rm_paths=() rm_ids=() rm_indexes=()
+  _SB_REMOVED=0; _SL5_REMOVED=0; _SL7_REMOVED=0
+  if [ "$_STATE_MUTATE" = 1 ] && [ "$_SB_COMPLETE" = 1 ]; then
+    limit=${#_SB_CAND_PATHS[@]}; [ "$limit" -gt 128 ] && limit=128
+    for ((i=0; i<limit; i++)); do
+      path="${_SB_CAND_PATHS[$i]}"; name="${_SB_CAND_NAMES[$i]}"
+      if [ ! -e "$path" ] && [ ! -L "$path" ]; then resolved_b=$(( resolved_b + 1 ))
+      elif state_revalidate_burn "$path" "$name"; then
+        idx=${#rm_paths[@]}; rm_paths[$idx]="$path"; rm_ids[$idx]=b; rm_indexes[$idx]=$i
+      fi
+    done
+  fi
+  if [ "$_STATE_MUTATE" = 1 ] && [ "$_SL5_COMPLETE" = 1 ]; then
+    limit=${#_SL5_CAND_PATHS[@]}; [ "$limit" -gt 128 ] && limit=128
+    for ((i=0; i<limit; i++)); do
+      path="${_SL5_CAND_PATHS[$i]}"; name="${_SL5_CAND_NAMES[$i]}"
+      if [ ! -e "$path" ] && [ ! -L "$path" ]; then resolved_5=$(( resolved_5 + 1 ))
+      elif state_revalidate_limit "$_SL5_ROOT" "$path" "$name"; then
+        idx=${#rm_paths[@]}; rm_paths[$idx]="$path"; rm_ids[$idx]=5; rm_indexes[$idx]=$i
+      fi
+    done
+  fi
+  if [ "$_STATE_MUTATE" = 1 ] && [ "$_SL7_COMPLETE" = 1 ]; then
+    limit=${#_SL7_CAND_PATHS[@]}; [ "$limit" -gt 128 ] && limit=128
+    for ((i=0; i<limit; i++)); do
+      path="${_SL7_CAND_PATHS[$i]}"; name="${_SL7_CAND_NAMES[$i]}"
+      if [ ! -e "$path" ] && [ ! -L "$path" ]; then resolved_7=$(( resolved_7 + 1 ))
+      elif state_revalidate_limit "$_SL7_ROOT" "$path" "$name"; then
+        idx=${#rm_paths[@]}; rm_paths[$idx]="$path"; rm_ids[$idx]=7; rm_indexes[$idx]=$i
+      fi
+    done
+  fi
+  if [ "${#rm_paths[@]}" -gt 0 ]; then rm -df -- "${rm_paths[@]}" 2>/dev/null || true; fi
+  for ((i=0; i<${#rm_paths[@]}; i++)); do
+    path="${rm_paths[$i]}"; id="${rm_ids[$i]}"
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      case "$id" in (b) resolved_b=$(( resolved_b + 1 )) ;; (5) resolved_5=$(( resolved_5 + 1 )) ;; (7) resolved_7=$(( resolved_7 + 1 )) ;; esac
+    fi
+  done
+  _SB_REMOVED=$resolved_b; _SL5_REMOVED=$resolved_5; _SL7_REMOVED=$resolved_7
+  _SB_CLEAN=0; _SL5_CLEAN=0; _SL7_CLEAN=0
+  [ "$_SB_CAND_TOTAL" -eq "$resolved_b" ] && _SB_CLEAN=1
+  [ "$_SL5_CAND_TOTAL" -eq "$resolved_5" ] && _SL5_CLEAN=1
+  [ "$_SL7_CAND_TOTAL" -eq "$resolved_7" ] && _SL7_CLEAN=1
+}
+
+state_select_limit() {  # $1=5|7, includes the current canonical payload value
+  local which="$1" valid=0 rst=0 pct=0 crst cpct
+  if [ "$which" = 5 ]; then
+    if [ "$_SL5_COMPLETE" = 1 ] && [ "$_SL5_STORED_VALID" = 1 ]; then valid=1; rst=$_SL5_STORED_RST; pct=$_SL5_STORED_PCT; fi
+    if [ "$_CUR5_VALID" = 1 ]; then crst=$_CUR5_RST; cpct=$_CUR5_PCT
+    else crst=0; cpct=0; fi
+  else
+    if [ "$_SL7_COMPLETE" = 1 ] && [ "$_SL7_STORED_VALID" = 1 ]; then valid=1; rst=$_SL7_STORED_RST; pct=$_SL7_STORED_PCT; fi
+    if [ "$_CUR7_VALID" = 1 ]; then crst=$_CUR7_RST; cpct=$_CUR7_PCT
+    else crst=0; cpct=0; fi
+  fi
+  if [ "$crst" -gt 0 ] && { [ "$valid" -eq 0 ] || [ "$crst" -gt "$rst" ] || { [ "$crst" -eq "$rst" ] && [ "$cpct" -gt "$pct" ]; }; }; then
+    valid=1; rst=$crst; pct=$cpct
+  fi
+  if [ "$which" = 5 ]; then _STATE_RL5_VALID=$valid; _STATE_RL5_RST=$rst; _STATE_RL5_PCT=$pct
+  else _STATE_RL7_VALID=$valid; _STATE_RL7_RST=$rst; _STATE_RL7_PCT=$pct; fi
+}
+
+state_publish() {
+  local raw_post i slot name path
+  local mkdir_paths=()
+  _PUB_BURN=0; _PUB5=0; _PUB7=0
+  if [ "$_STATE_MUTATE" = 1 ] && [ "$_SB_COMPLETE" = 1 ] && [ "$_SB_CLEAN" = 1 ] && [ "$_CUR_BURN_VALID" = 1 ]; then
+    raw_post=$(( _SB_RAW - _SB_REMOVED ))
+    [ "$raw_post" -lt 3968 ] && _PUB_BURN=1
+  fi
+  if [ "$_STATE_MUTATE" = 1 ] && [ "$_SL5_COMPLETE" = 1 ] && [ "$_SL5_CLEAN" = 1 ] && [ "$_CUR5_VALID" = 1 ]; then
+    raw_post=$(( _SL5_RAW - _SL5_REMOVED )); [ "$raw_post" -lt 384 ] && _PUB5=1
+  fi
+  if [ "$_STATE_MUTATE" = 1 ] && [ "$_SL7_COMPLETE" = 1 ] && [ "$_SL7_CLEAN" = 1 ] && [ "$_CUR7_VALID" = 1 ]; then
+    raw_post=$(( _SL7_RAW - _SL7_REMOVED )); [ "$raw_post" -lt 384 ] && _PUB7=1
+  fi
+  if [ "$_PUB_BURN" = 1 ] && [ ! -d "$_SB_ROOT" ]; then
+    state_no_symlink_path "$_SB_ROOT" && mkdir_paths[${#mkdir_paths[@]}]="$_SB_ROOT" || _PUB_BURN=0
+  fi
+  if [ "$_PUB5" = 1 ]; then
+    printf -v name '%010d_%03d.%03d' "$_CUR5_RST" $(( _CUR5_PCT / 1000 )) $(( _CUR5_PCT % 1000 ))
+    _PUB5_PATH="$_SL5_ROOT/$name"
+    state_no_symlink_path "$_PUB5_PATH" && mkdir_paths[${#mkdir_paths[@]}]="$_PUB5_PATH" || _PUB5=0
+  fi
+  if [ "$_PUB7" = 1 ]; then
+    printf -v name '%010d_%03d.%03d' "$_CUR7_RST" $(( _CUR7_PCT / 1000 )) $(( _CUR7_PCT % 1000 ))
+    _PUB7_PATH="$_SL7_ROOT/$name"
+    state_no_symlink_path "$_PUB7_PATH" && mkdir_paths[${#mkdir_paths[@]}]="$_PUB7_PATH" || _PUB7=0
+  fi
+  if [ "${#mkdir_paths[@]}" -gt 0 ]; then mkdir -p -- "${mkdir_paths[@]}" 2>/dev/null || true; fi
+  if [ "$_PUB5" = 1 ]; then state_revalidate_limit "$_SL5_ROOT" "$_PUB5_PATH" "${_PUB5_PATH##*/}" || _PUB5=0; fi
+  if [ "$_PUB7" = 1 ]; then state_revalidate_limit "$_SL7_ROOT" "$_PUB7_PATH" "${_PUB7_PATH##*/}" || _PUB7=0; fi
+  if [ "$_PUB_BURN" = 1 ]; then
+    state_no_symlink_path "$_SB_ROOT" || _PUB_BURN=0
+    [ "$_SNP" = "$_SB_ROOT" ] && [ -d "$_SB_ROOT" ] && [ ! -L "$_SB_ROOT" ] || _PUB_BURN=0
+  fi
+  if [ "$_PUB_BURN" = 1 ]; then
+    set -C
+    for ((slot=0; slot<32; slot++)); do
+      printf -v name 'b_%012d_%012d_%03d.%03d_%04d' "$_CUR_BURN_RST" "$_CUR_BURN_SAMP" \
+        $(( _CUR_BURN_PCT / 1000 )) $(( _CUR_BURN_PCT % 1000 )) "$slot"
+      path="$_SB_ROOT/$name"
+      if { : > "$path"; } 2>/dev/null; then _PUB_BURN_PATH="$path"; break; fi
+      [ -e "$path" ] || [ -L "$path" ] || break
+    done
+    set +C
+  fi
+}
+
+state_est_insert() {  # insert one observation into _EST_* ordered by reset/sample/pct
+  local rst="$1" samp="$2" pct="$3" key i j n LC_ALL=C
+  printf -v key '%012d_%012d_%06d' "$rst" "$samp" "$pct"
+  n=${#_EST_KEYS[@]}; j=$n
+  while [ "$j" -gt 0 ] && [[ "$key" < "${_EST_KEYS[$((j-1))]}" ]]; do
+    _EST_KEYS[$j]="${_EST_KEYS[$((j-1))]}"; _EST_RSTS[$j]="${_EST_RSTS[$((j-1))]}"
+    _EST_SAMPS[$j]="${_EST_SAMPS[$((j-1))]}"; _EST_PCTS[$j]="${_EST_PCTS[$((j-1))]}"; j=$(( j - 1 ))
+  done
+  _EST_KEYS[$j]="$key"; _EST_RSTS[$j]="$rst"; _EST_SAMPS[$j]="$samp"; _EST_PCTS[$j]="$pct"
+}
+
+burn_eta_5h() {  # → _B5_STATE _B5_ETA _B5_RATE _B5_TTR from complete state snapshot
+  local i n maxrst=0 rst samp pct last_key="" last_samp=-1 last_pct=0
+  local a b ct cutoff fc_t=0 fc_p=-1 lc_t=0 lc_p=-1 ncross=0 anycross=0
+  local minspan span delta latest_pct=0
+  _B5_STATE=warming; _B5_ETA=inf; _B5_RATE="0.0000000000"; _B5_TTR=0
+  [ "$_SB_COMPLETE" = 1 ] || return 0
+  for ((i=0; i<${#_SB_REP_RSTS[@]}; i++)); do [ "${_SB_REP_RSTS[$i]}" -gt "$maxrst" ] && maxrst="${_SB_REP_RSTS[$i]}"; done
+  for ((i=0; i<${#_LEG_RSTS[@]}; i++)); do [ "${_LEG_RSTS[$i]}" -gt "$maxrst" ] && maxrst="${_LEG_RSTS[$i]}"; done
+  [ "$_CUR_BURN_VALID" != 1 ] || [ "$_CUR_BURN_RST" -le "$maxrst" ] || maxrst=$_CUR_BURN_RST
+  [ "$maxrst" -gt 0 ] || return 0
+  _EST_KEYS=(); _EST_RSTS=(); _EST_SAMPS=(); _EST_PCTS=()
+  for ((i=0; i<${#_SB_REP_RSTS[@]}; i++)); do
+    [ "${_SB_REP_RSTS[$i]}" -eq "$maxrst" ] && state_est_insert "${_SB_REP_RSTS[$i]}" "${_SB_REP_SAMPS[$i]}" "${_SB_REP_PCTS[$i]}"
+  done
+  for ((i=0; i<${#_LEG_RSTS[@]}; i++)); do
+    [ "${_LEG_RSTS[$i]}" -eq "$maxrst" ] && state_est_insert "${_LEG_RSTS[$i]}" "${_LEG_SAMPS[$i]}" "${_LEG_PCTS[$i]}"
+  done
+  [ "$_CUR_BURN_VALID" != 1 ] || [ "$_CUR_BURN_RST" -ne "$maxrst" ] || state_est_insert "$_CUR_BURN_RST" "$_CUR_BURN_SAMP" "$_CUR_BURN_PCT"
+  _SER_SAMPS=(); _SER_PCTS=(); n=${#_EST_KEYS[@]}
+  for ((i=0; i<n; i++)); do
+    rst="${_EST_RSTS[$i]}"; samp="${_EST_SAMPS[$i]}"; pct="${_EST_PCTS[$i]}"
+    key="${rst}_${samp}_${pct}"
+    [ "$key" = "$last_key" ] && continue
+    last_key="$key"
+    if [ "$samp" -ne "$last_samp" ]; then
+      _SER_SAMPS[${#_SER_SAMPS[@]}]="$samp"; _SER_PCTS[${#_SER_PCTS[@]}]="$pct"; last_samp=$samp
+    elif [ "$pct" -gt "${_SER_PCTS[$(( ${#_SER_PCTS[@]} - 1 ))]}" ]; then
+      _SER_PCTS[$(( ${#_SER_PCTS[@]} - 1 ))]="$pct"
+    fi
+  done
+  n=${#_SER_SAMPS[@]}; [ "$n" -gt 0 ] || return 0
+  latest_pct="${_SER_PCTS[$((n-1))]}"; _B5_TTR=$(( maxrst - NOW )); [ "$_B5_TTR" -lt 0 ] && _B5_TTR=0
+  cutoff=$(( NOW - CORALLINE_BURN_WINDOW )); minspan=$(( CORALLINE_BURN_WINDOW / 10 ))
+  for ((i=1; i<n; i++)); do
+    a=$(( ${_SER_PCTS[$((i-1))]} / 1000 )); b=$(( ${_SER_PCTS[$i]} / 1000 ))
+    if [ "$b" -gt "$a" ]; then
+      anycross=1; ct="${_SER_SAMPS[$i]}"
+      if [ "$ct" -ge "$cutoff" ] && [ "$ct" -le "$NOW" ]; then
+        if [ "$fc_p" -lt 0 ]; then fc_t=$ct; fc_p=$b; fi
+        lc_t=$ct; lc_p=$b; ncross=$(( ncross + 1 ))
+      fi
+    fi
+  done
+  if [ "$ncross" -ge 2 ] && [ "$lc_t" -gt "$fc_t" ] && [ "$lc_p" -gt "$fc_p" ] && [ $(( lc_t - fc_t )) -ge "$minspan" ]; then
+    span=$(( lc_t - fc_t )); delta=$(( lc_p - fc_p ))
+    state_rate10 $(( delta * 10000000000 )) "$span"; _B5_RATE="$_RATE10"
+    state_round_even $(( (100000 - latest_pct) * span )) $(( delta * 1000 ))
+    _B5_ETA=$_RE; _B5_STATE=active
+  elif [ "$anycross" -eq 1 ] && [ "$ncross" -eq 0 ]; then _B5_STATE=idle
+  fi
+}
+
+burn_eta_7d() {  # → _B7_*; $1=pct_milli $2=reset epoch
+  local pct="${1:-}" rst="${2:-}" elapsed
+  _B7_ETA=inf; _B7_RATE="0.0000000000"; _B7_TTR=0
+  [ -n "$pct" ] && [ -n "$rst" ] || return 0
+  _B7_TTR=$(( rst - NOW )); [ "$_B7_TTR" -lt 0 ] && _B7_TTR=0
+  elapsed=$(( NOW - (rst - 604800) ))
+  [ "$pct" -gt 0 ] && [ "$elapsed" -ge 1 ] && [ "$elapsed" -le "$RL_MAX_7D" ] || return 0
+  state_rate10 $(( pct * 10000000 )) "$elapsed"; _B7_RATE="$_RATE10"
+  state_round_even $(( (100000 - pct) * elapsed )) "$pct"; _B7_ETA=$_RE
 }
 
 burn_estimate() {  # → _BURN_STATE _BURN_LABEL _BURN_ETA _BURN_RATE _BURN_TTR
-  burn_eta_5h
-  # 5h already reads the shared sample file, so it is cross-session. For 7d, when
-  # limit-sync is on, project from the same synced value the limit7d segment shows
-  # so burn and limit7d cannot contradict each other on a stale local snapshot.
-  if [ "$VL_LIMIT_SYNC" = "1" ]; then
-    rl_latest "$RL7D_FILE" "$RL_MAX_7D"
-    if [ -n "$_LL_PCT" ]; then burn_eta_7d "$_LL_PCT" "$_LL_RST"; else burn_eta_7d; fi
-  else
-    burn_eta_7d
-  fi
   local f5=0 f7=0
-  [ "$_B5_ETA" != "inf" ] && f5=1
-  [ "$_B7_ETA" != "inf" ] && f7=1
+  [ "$_B5_ETA" != inf ] && f5=1
+  [ "$_B7_ETA" != inf ] && f7=1
   if [ "$f5" = 1 ] && { [ "$f7" = 0 ] || [ "$_B5_ETA" -le "$_B7_ETA" ]; }; then
-    _BURN_STATE="active"; _BURN_LABEL="5h"
-    _BURN_ETA="$_B5_ETA"; _BURN_RATE="$_B5_RATE"; _BURN_TTR="$_B5_TTR"
+    _BURN_STATE=active; _BURN_LABEL=5h; _BURN_ETA=$_B5_ETA; _BURN_RATE=$_B5_RATE; _BURN_TTR=$_B5_TTR
   elif [ "$f7" = 1 ]; then
-    _BURN_STATE="active"; _BURN_LABEL="7d"
-    _BURN_ETA="$_B7_ETA"; _BURN_RATE="$_B7_RATE"; _BURN_TTR="$_B7_TTR"
+    _BURN_STATE=active; _BURN_LABEL=7d; _BURN_ETA=$_B7_ETA; _BURN_RATE=$_B7_RATE; _BURN_TTR=$_B7_TTR
   else
-    _BURN_ETA="inf"; _BURN_RATE="0"; _BURN_TTR="0"; _BURN_LABEL=""
-    if [ "$_B5_STATE" = "idle" ]; then _BURN_STATE="idle"; else _BURN_STATE="warming"; fi
+    _BURN_ETA=inf; _BURN_RATE="0.0000000000"; _BURN_TTR=0; _BURN_LABEL=""
+    if [ "$_B5_STATE" = idle ]; then _BURN_STATE=idle; else _BURN_STATE=warming; fi
   fi
 }
 
+state_prepare() {  # one state snapshot/GC/publication/estimate pass per render
+  local root i
+  _STATE_MUTATE=1; [ "${CORALLINE_NO_SAMPLE:-0}" = 1 ] && _STATE_MUTATE=0
+  RL_MAX_5H=21600; RL_MAX_7D=691200
+  case "$CORALLINE_BURN_WINDOW" in (''|*[!0-9]*) CORALLINE_BURN_WINDOW=600 ;; esac
+  [ "${#CORALLINE_BURN_WINDOW}" -le 5 ] && [ "$CORALLINE_BURN_WINDOW" -ge 60 ] 2>/dev/null \
+    && [ "$CORALLINE_BURN_WINDOW" -le 86400 ] 2>/dev/null || CORALLINE_BURN_WINDOW=600
+  case "$BURN_TRIM" in (''|*[!0-9]*) BURN_TRIM=1500 ;; esac
+  [ "${#BURN_TRIM}" -le 4 ] && [ "$BURN_TRIM" -ge 1 ] 2>/dev/null \
+    && [ "$BURN_TRIM" -le 3000 ] 2>/dev/null || BURN_TRIM=1500
+
+  _CUR5_VALID=0; _CUR7_VALID=0; _CUR_BURN_VALID=0
+  if state_pct "$fh_pct"; then
+    _CUR5_PCT=$_SP_MILLI
+    if state_payload_epoch "$fh_rst" 10; then
+      _CUR5_RST=$_SE_VALUE; _CUR5_RST_PAD=$_SE_PAD
+      [ "$_CUR5_RST" -gt "$NOW" ] && [ "$_CUR5_RST" -le $(( NOW + RL_MAX_5H )) ] && _CUR5_VALID=1
+    fi
+  fi
+  if state_pct "$wd_pct"; then
+    _CUR7_PCT=$_SP_MILLI
+    if state_payload_epoch "$wd_rst" 10; then
+      _CUR7_RST=$_SE_VALUE; _CUR7_RST_PAD=$_SE_PAD
+      [ "$_CUR7_RST" -gt "$NOW" ] && [ "$_CUR7_RST" -le $(( NOW + RL_MAX_7D )) ] && _CUR7_VALID=1
+    fi
+  fi
+  if [ "$_CUR5_VALID" = 1 ]; then
+    state_epoch "$NOW" 12
+    _CUR_BURN_SAMP=$_SE_VALUE; _CUR_BURN_SAMP_PAD=$_SE_PAD
+    _CUR_BURN_RST=$_CUR5_RST; _CUR_BURN_PCT=$_CUR5_PCT
+    [ "$_CUR_BURN_SAMP" -le $(( NOW + 300 )) ] && [ "$_CUR_BURN_RST" -ge "$_CUR_BURN_SAMP" ] && _CUR_BURN_VALID=1
+  fi
+
+  _SB_NAMES=(); _SB_PATHS=(); _SB_RSTS=(); _SB_SAMPS=(); _SB_PCTS=(); _SB_PLAUS=(); _SB_RAW=0
+  _SL5_NAMES=(); _SL5_PATHS=(); _SL5_RSTS=(); _SL5_PCTS=(); _SL5_PLAUS=(); _SL5_RAW=0
+  _SL7_NAMES=(); _SL7_PATHS=(); _SL7_RSTS=(); _SL7_PCTS=(); _SL7_PLAUS=(); _SL7_RAW=0
+  _STATE_FIND_ARGS=(); _STATE_LEGACY_READ=0
+  _SB_DIR_PREOK=1; _SL5_DIR_PREOK=1; _SL7_DIR_PREOK=1; _LEG_PREOK=1
+  _SB_DIR_COMPLETE=0; _SL5_COMPLETE=0; _SL7_COMPLETE=0; _LEG_COMPLETE=0; _SB_COMPLETE=0
+
+  if [ "$_STATE_BURN_GATE" = 1 ]; then
+    if state_store_path "$BURN_FILE"; then _SB_BASE=$_SS_BASE; _SB_ROOT=$_SS_ROOT
+    else _SB_DIR_PREOK=0; _LEG_PREOK=0; fi
+    if [ "$_SB_DIR_PREOK" = 1 ]; then
+      state_no_symlink_path "$_SB_ROOT" || _SB_DIR_PREOK=0
+      if [ "$_SB_DIR_PREOK" = 1 ] && { [ -e "$_SB_ROOT" ] || [ -L "$_SB_ROOT" ]; }; then
+        [ -d "$_SB_ROOT" ] && [ ! -L "$_SB_ROOT" ] || _SB_DIR_PREOK=0
+        [ "$_SB_DIR_PREOK" = 0 ] || _STATE_FIND_ARGS[${#_STATE_FIND_ARGS[@]}]="$_SB_ROOT/."
+      fi
+      state_no_symlink_path "$_SB_BASE" || _LEG_PREOK=0
+      if [ "$_LEG_PREOK" = 1 ] && { [ -e "$_SB_BASE" ] || [ -L "$_SB_BASE" ]; }; then
+        [ -f "$_SB_BASE" ] && [ ! -L "$_SB_BASE" ] || _LEG_PREOK=0
+        [ "$_LEG_PREOK" = 0 ] || _STATE_LEGACY_READ=1
+      fi
+    fi
+  fi
+  if [ "$_STATE_RL5_GATE" = 1 ]; then
+    if state_store_path "$RL5H_FILE"; then _SL5_ROOT=$_SS_ROOT; else _SL5_DIR_PREOK=0; fi
+    if [ "$_SL5_DIR_PREOK" = 1 ]; then
+      state_no_symlink_path "$_SL5_ROOT" || _SL5_DIR_PREOK=0
+      if [ "$_SL5_DIR_PREOK" = 1 ] && { [ -e "$_SL5_ROOT" ] || [ -L "$_SL5_ROOT" ]; }; then
+        [ -d "$_SL5_ROOT" ] && [ ! -L "$_SL5_ROOT" ] || _SL5_DIR_PREOK=0
+        [ "$_SL5_DIR_PREOK" = 0 ] || _STATE_FIND_ARGS[${#_STATE_FIND_ARGS[@]}]="$_SL5_ROOT/."
+      fi
+    fi
+  fi
+  if [ "$_STATE_RL7_GATE" = 1 ]; then
+    if state_store_path "$RL7D_FILE"; then _SL7_ROOT=$_SS_ROOT; else _SL7_DIR_PREOK=0; fi
+    if [ "$_SL7_DIR_PREOK" = 1 ]; then
+      state_no_symlink_path "$_SL7_ROOT" || _SL7_DIR_PREOK=0
+      if [ "$_SL7_DIR_PREOK" = 1 ] && { [ -e "$_SL7_ROOT" ] || [ -L "$_SL7_ROOT" ]; }; then
+        [ -d "$_SL7_ROOT" ] && [ ! -L "$_SL7_ROOT" ] || _SL7_DIR_PREOK=0
+        [ "$_SL7_DIR_PREOK" = 0 ] || _STATE_FIND_ARGS[${#_STATE_FIND_ARGS[@]}]="$_SL7_ROOT/."
+      fi
+    fi
+  fi
+  if [ "$_STATE_BURN_GATE" = 1 ] && [ "$_STATE_RL5_GATE" = 1 ] && state_same_path "$_SB_ROOT" "$_SL5_ROOT"; then _SB_DIR_PREOK=0; _SL5_DIR_PREOK=0; fi
+  if [ "$_STATE_BURN_GATE" = 1 ] && [ "$_STATE_RL7_GATE" = 1 ] && state_same_path "$_SB_ROOT" "$_SL7_ROOT"; then _SB_DIR_PREOK=0; _SL7_DIR_PREOK=0; fi
+  if [ "$_STATE_RL5_GATE" = 1 ] && [ "$_STATE_RL7_GATE" = 1 ] && state_same_path "$_SL5_ROOT" "$_SL7_ROOT"; then _SL5_DIR_PREOK=0; _SL7_DIR_PREOK=0; fi
+
+  state_snapshot
+  if [ "$_STATE_BURN_GATE" = 1 ]; then [ "$_SB_DIR_COMPLETE" = 1 ] && [ "$_LEG_COMPLETE" = 1 ] && _SB_COMPLETE=1; fi
+  if [ "$_SB_COMPLETE" = 1 ]; then state_burn_retention; else _SB_CAND_NAMES=(); _SB_CAND_PATHS=(); _SB_CAND_TOTAL=0; _SB_REP_RSTS=(); _SB_REP_SAMPS=(); _SB_REP_PCTS=(); fi
+  if [ "$_SL5_COMPLETE" = 1 ]; then state_limit_retention 5; else _SL5_CAND_NAMES=(); _SL5_CAND_PATHS=(); _SL5_CAND_TOTAL=0; _SL5_STORED_VALID=0; fi
+  if [ "$_SL7_COMPLETE" = 1 ]; then state_limit_retention 7; else _SL7_CAND_NAMES=(); _SL7_CAND_PATHS=(); _SL7_CAND_TOTAL=0; _SL7_STORED_VALID=0; fi
+  state_gc
+  state_select_limit 5; state_select_limit 7
+  state_publish
+  burn_eta_5h
+  if [ "$VL_LIMIT_SYNC" = 1 ] && [ "$_STATE_RL7_VALID" = 1 ]; then burn_eta_7d "$_STATE_RL7_PCT" "$_STATE_RL7_RST"
+  elif [ "$_CUR7_VALID" = 1 ]; then burn_eta_7d "$_CUR7_PCT" "$_CUR7_RST"
+  else burn_eta_7d "" ""; fi
+  burn_estimate
+  _STATE_READY=1
+}
+
 seg_burn() {  # range-to-empty ETA until the binding 5h/7d limit hits 100% at the recent burn rate
-  [ -n "$fh_pct" ] || [ -n "$wd_pct" ] || return 0
+  if [ "${_STATE_READY:-0}" = 1 ]; then
+    [ "${_CUR5_VALID:-0}" = 1 ] || [ "${_CUR7_VALID:-0}" = 1 ] || return 0
+  else
+    [ -n "$fh_pct" ] || [ -n "$wd_pct" ] || return 0
+  fi
   # _BURN_* is precomputed once per render (see the burn_estimate call beside the
   # sampler below), so the visible and float passes share one computation.
   local bg="${VL_BG_BURN:-$VL_BG_5H}"
@@ -786,31 +1370,33 @@ seg_ctx() {  # context-window gauge with input/output/cache token counts
   push "$VL_BG_CTX" "${fgc} ${VL_CTX_GLYPH} ${_BAR} ${ci}% ${fgd}↑${ti} ↓${to} cr:${tcr} cw:${tcw} "
 }
 
-seg_limit() {  # $1=label $2=pct $3=resets_at $4=bg
+seg_limit() {  # $1=label $2=pct $3=resets_at $4=bg $5=canonical pct_milli(optional)
   [ -n "$2" ] || return 0
   local v fgc rst=""
-  printf -v v '%.0f' "$2" 2>/dev/null || v=0
+  if [ -n "${5:-}" ]; then state_round_even "$5" 1000; v=$_RE
+  else printf -v v '%.0f' "$2" 2>/dev/null || v=0; fi
   make_bar "$v"; pct_fg "$v"
   fg "$_PFG"; fgc="$_FG"
   fmt_countdown "$3"
   if [ -n "$_CD" ]; then fg "$VL_FG_DIM"; rst="${_FG}↺${_CD}"; fi
   push "$4" "${fgc} $1 ${_BAR} ${v}% ${rst} "
 }
-# With VL_LIMIT_SYNC, show the freshest cross-session value for the current
-# window (falling back to this session's own snapshot when none is recorded).
+# With VL_LIMIT_SYNC, render the once-per-render canonical state result.
 seg_limit5h() {  # 5h rate-limit gauge with reset countdown
-  local p="$fh_pct" r="$fh_rst"
-  if [ "$VL_LIMIT_SYNC" = "1" ]; then
-    rl_latest "$RL5H_FILE" "$RL_MAX_5H"; [ -n "$_LL_PCT" ] && { p="$_LL_PCT"; r="$_LL_RST"; }
+  local p="$fh_pct" r="$fh_rst" m=""
+  if [ "$VL_LIMIT_SYNC" = 1 ]; then
+    [ "${_STATE_RL5_VALID:-0}" = 1 ] || return 0
+    m=$_STATE_RL5_PCT; printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 )); r=$_STATE_RL5_RST
   fi
-  seg_limit "5h" "$p" "$r" "$VL_BG_5H"
+  seg_limit "5h" "$p" "$r" "$VL_BG_5H" "$m"
 }
 seg_limit7d() {  # 7d rate-limit gauge with reset countdown
-  local p="$wd_pct" r="$wd_rst"
-  if [ "$VL_LIMIT_SYNC" = "1" ]; then
-    rl_latest "$RL7D_FILE" "$RL_MAX_7D"; [ -n "$_LL_PCT" ] && { p="$_LL_PCT"; r="$_LL_RST"; }
+  local p="$wd_pct" r="$wd_rst" m=""
+  if [ "$VL_LIMIT_SYNC" = 1 ]; then
+    [ "${_STATE_RL7_VALID:-0}" = 1 ] || return 0
+    m=$_STATE_RL7_PCT; printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 )); r=$_STATE_RL7_RST
   fi
-  seg_limit "7d" "$p" "$r" "$VL_BG_7D"
+  seg_limit "7d" "$p" "$r" "$VL_BG_7D" "$m"
 }
 
 seg_cost() {  # session cost in USD
@@ -1202,27 +1788,18 @@ _SEG_SCAN=" $VL_SEGMENTS $VL_SEGMENTS2 $VL_SEGMENTS3 "
 [ "$VL_FLOAT" = "1" ] && _SEG_SCAN="$_SEG_SCAN$VL_FLOAT_SEGMENTS "
 case "$_SEG_SCAN" in *" git "*|*" stash "*|*" project "*) read_git ;; esac
 
-# Sample only when the burn segment is actually shown — the segment list is the
-# single source of truth, so enabling burn in configure.sh just works. _SEG_SCAN
-# also covers VL_FLOAT_SEGMENTS, so burn samples even when it's only in the float
-# readout (mirrors how read_git is gated above).
-#
-# CORALLINE_NO_SAMPLE=1 makes a render read-only: it skips every write to the
-# cross-session stores. A preview/verification render (sample-input.json carries
-# a year-2030 sentinel reset) would otherwise win the high-water forever and prune
-# the real entries, so the documented preview commands set this flag (see #32).
-if [ "${CORALLINE_NO_SAMPLE:-0}" != 1 ]; then
-  case "$_SEG_SCAN" in *" burn "*) burn_sample "$NOW" "$fh_pct" "$fh_rst" ;; esac
-  # limit-sync records to its own high-water store (separate from the burn file),
-  # only for the limit segment that is actually shown.
-  if [ "$VL_LIMIT_SYNC" = "1" ]; then
-    case "$_SEG_SCAN" in *" limit5h "*) rl_sample "$RL5H_FILE" "$fh_pct" "$fh_rst" "$RL_MAX_5H" ;; esac
-    # burn also consumes the synced 7d (below), so sample it whenever burn shows too,
-    # otherwise burn would read a stale/older synced 7d instead of this render's value.
-    case "$_SEG_SCAN" in *" limit7d "*|*" burn "*) rl_sample "$RL7D_FILE" "$wd_pct" "$wd_rst" "$RL_MAX_7D" ;; esac
-  fi
+# Burn and synced limits share one bounded snapshot. The disabled/default path
+# never opens the controller; CORALLINE_NO_SAMPLE keeps the same reads but makes
+# GC, publication, healing, and root creation impossible.
+_STATE_READY=0; _STATE_BURN_GATE=0; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0
+case "$_SEG_SCAN" in (*" burn "*) _STATE_BURN_GATE=1 ;; esac
+if [ "$VL_LIMIT_SYNC" = 1 ]; then
+  case "$_SEG_SCAN" in (*" limit5h "*) _STATE_RL5_GATE=1 ;; esac
+  case "$_SEG_SCAN" in (*" limit7d "*|*" burn "*) _STATE_RL7_GATE=1 ;; esac
 fi
-case "$_SEG_SCAN" in *" burn "*) burn_estimate ;; esac
+if [ "$_STATE_BURN_GATE" = 1 ] || [ "$_STATE_RL5_GATE" = 1 ] || [ "$_STATE_RL7_GATE" = 1 ]; then
+  state_prepare
+fi
 
 # Defensive ANSI stripper (the VL_NOCOLOR path should already emit none) → _PLAIN.
 strip_ansi() {

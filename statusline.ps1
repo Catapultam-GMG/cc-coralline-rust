@@ -4,8 +4,9 @@
 
   This slice implements the fixed pill main bar without Bash, jq, WSL, or
   PowerShell 7. Config is read from the same coralline.conf through a narrow,
-  non-executing Bash-word parser. Burn state, alternate styles/layouts, float
-  output, and subagent rows are implemented by later slices.
+  non-executing Bash-word parser. Burn and synced limit state share the same
+  immutable store as Bash; alternate styles/layouts, float output, and subagent
+  rows are implemented by later slices.
 #>
 
 # Claude Code registers this exact literal. It must leave before stdin, config,
@@ -398,15 +399,16 @@ function Test-PathInside([string]$Path, [string]$Root) {
 function Test-NoReparseComponents([string]$Path) {
     try { $root = [System.IO.Path]::GetPathRoot($Path) } catch { return $false }
     if ([string]::IsNullOrEmpty($root)) { return $false }
-    $relative = $Path.Substring($root.Length)
+    $parts = $Path.Substring($root.Length).Split(@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)
     $current = $root
-    foreach ($part in $relative.Split(@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
-        $current = [System.IO.Path]::Combine($current, $part)
+    for ($i=0; $i -lt $parts.Length; $i++) {
+        $current = [System.IO.Path]::Combine($current, $parts[$i])
         try { $attrs = [System.IO.File]::GetAttributes($current) }
         catch [System.IO.FileNotFoundException] { return $true }
         catch [System.IO.DirectoryNotFoundException] { return $true }
         catch { return $false }
         if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        if ($i -lt ($parts.Length - 1) -and ($attrs -band [System.IO.FileAttributes]::Directory) -eq 0) { return $false }
     }
     return $true
 }
@@ -629,6 +631,8 @@ $G = @{
     Up = Glyph 0x2191
     Down = Glyph 0x2193
     Reset = Glyph 0x21BA
+    Check = Glyph 0x2713
+    BurnTo = Glyph 0x21E2
 }
 
 function Get-Fg([string]$Spec) {
@@ -707,6 +711,547 @@ function ConvertTo-Epoch([string]$Raw) {
 }
 
 $Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+
+# Immutable burn and limit state. Percentages are integer milli-percent and all
+# midpoint decisions use exact Int64 quotient/remainder arithmetic.
+function ConvertTo-StatePct([string]$Raw) {
+    if ([string]::IsNullOrEmpty($Raw)) { return $null }
+    $match = [regex]::Match($Raw, '\A(0|[1-9][0-9]?|100)(?:\.([0-9]{1,6}))?\z', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    if (-not $match.Success) { return $null }
+    $whole = 0
+    if (-not [int]::TryParse($match.Groups[1].Value, $IntegerStyle, $Invariant, [ref]$whole)) { return $null }
+    $fraction = $match.Groups[2].Value
+    if ($whole -eq 100 -and $fraction -match '[1-9]') { return $null }
+    $six = ($fraction + '000000').Substring(0, 6)
+    $keep = 0
+    $rest = 0
+    if (-not [int]::TryParse($six.Substring(0, 3), $IntegerStyle, $Invariant, [ref]$keep)) { return $null }
+    if (-not [int]::TryParse($six.Substring(3, 3), $IntegerStyle, $Invariant, [ref]$rest)) { return $null }
+    $milli = $whole * 1000 + $keep
+    if ($rest -gt 500 -or ($rest -eq 500 -and ($milli % 2) -eq 1)) { $milli++ }
+    if ($milli -lt 0 -or $milli -gt 100000) { return $null }
+    $q = 0L
+    $r = 0L
+    $q = [Math]::DivRem([long]$milli, 1000L, [ref]$r)
+    return [pscustomobject]@{
+        Milli = [int]$milli
+        Canonical = [string]::Format($Invariant, '{0:000}.{1:000}', $q, $r)
+    }
+}
+
+function ConvertTo-StateEpoch([string]$Raw, [int]$Width) {
+    if ([string]::IsNullOrEmpty($Raw) -or $Raw -notmatch '\A(?:0|[1-9][0-9]{0,11})\z') { return $null }
+    $value = 0L
+    if (-not [long]::TryParse($Raw, $IntegerStyle, $Invariant, [ref]$value)) { return $null }
+    if ($value -lt 0 -or $value -gt 253402300799L) { return $null }
+    if ($Width -eq 10 -and $value -gt 9999999999L) { return $null }
+    $format = 'D' + [string]$Width
+    return [pscustomobject]@{ Value = $value; Padded = $value.ToString($format, $Invariant) }
+}
+
+function ConvertTo-StatePayloadEpoch([string]$Raw, [int]$Width) {
+    if ([string]::IsNullOrEmpty($Raw)) { return $null }
+    if ($Raw.IndexOf('T') -ge 0) {
+        $value = ConvertTo-Epoch $Raw
+        if ($null -eq $value) { return $null }
+        return ConvertTo-StateEpoch ([string]$value) $Width
+    }
+    return ConvertTo-StateEpoch $Raw $Width
+}
+
+function Get-RoundEvenInt64([long]$Numerator, [long]$Denominator) {
+    if ($Numerator -lt 0 -or $Denominator -le 0) { return 0L }
+    $remainder = 0L
+    $quotient = [Math]::DivRem($Numerator, $Denominator, [ref]$remainder)
+    $twice = $remainder * 2L
+    if ($twice -gt $Denominator -or ($twice -eq $Denominator -and ($quotient % 2L) -eq 1L)) { $quotient++ }
+    return $quotient
+}
+
+function Format-StateRate([long]$ScaledNumerator, [long]$Denominator) {
+    if ($ScaledNumerator -lt 0 -or $Denominator -le 0) { return '0.0000000000' }
+    $scaled = Get-RoundEvenInt64 $ScaledNumerator $Denominator
+    $fraction = 0L
+    $whole = [Math]::DivRem($scaled, 10000000000L, [ref]$fraction)
+    return [string]::Format($Invariant, '{0}.{1:0000000000}', $whole, $fraction)
+}
+
+function Format-StatePct([int]$Milli) {
+    $fraction = 0L
+    $whole = [Math]::DivRem([long]$Milli, 1000L, [ref]$fraction)
+    return [string]::Format($Invariant, '{0:000}.{1:000}', $whole, $fraction)
+}
+
+function Get-StatePaths([string]$Base) {
+    $full = ConvertTo-LocalFullPath $Base ([Environment]::CurrentDirectory)
+    if ([string]::IsNullOrEmpty($full)) { return $null }
+    $root = $full
+    if ($root.EndsWith('.tsv', [StringComparison]::Ordinal)) { $root = $root.Substring(0, $root.Length - 4) }
+    $root += '.d'
+    return [pscustomobject]@{ Base = $full; Root = $root }
+}
+
+function Test-StateRoot([string]$Root) {
+    if ([string]::IsNullOrEmpty($Root) -or -not (Test-NoReparseComponents $Root)) { return $false }
+    try {
+        $attrs = [IO.File]::GetAttributes($Root)
+        if (($attrs -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        return ($attrs -band [IO.FileAttributes]::Directory) -ne 0
+    } catch [IO.FileNotFoundException] { return $true }
+    catch [IO.DirectoryNotFoundException] { return $true }
+    catch { return $false }
+}
+
+function Test-StateRegularFile([string]$Path) {
+    if ([string]::IsNullOrEmpty($Path) -or -not (Test-NoReparseComponents $Path)) { return $false }
+    try {
+        $attrs = [IO.File]::GetAttributes($Path)
+        return (($attrs -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and ($attrs -band [IO.FileAttributes]::Directory) -eq 0)
+    } catch { return $false }
+}
+
+function Get-EmptyStateDirectoryStatus([string]$Path) {
+    if ([string]::IsNullOrEmpty($Path) -or -not (Test-NoReparseComponents $Path)) { return [pscustomobject]@{ Success=$false; Empty=$false } }
+    $enumerator = $null
+    try {
+        $attrs = [IO.File]::GetAttributes($Path)
+        if (($attrs -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ($attrs -band [IO.FileAttributes]::Directory) -eq 0) { return [pscustomobject]@{ Success=$true; Empty=$false } }
+        $enumerator = [IO.Directory]::EnumerateFileSystemEntries($Path).GetEnumerator()
+        return [pscustomobject]@{ Success=$true; Empty=(-not $enumerator.MoveNext()) }
+    } catch { return [pscustomobject]@{ Success=$false; Empty=$false } }
+    finally { if ($null -ne $enumerator) { $enumerator.Dispose() } }
+}
+
+function Test-EmptyStateDirectory([string]$Path) {
+    $status = Get-EmptyStateDirectoryStatus $Path
+    return $status.Success -and $status.Empty
+}
+
+function Test-StateObjectExists([string]$Path) {
+    try { [void][IO.File]::GetAttributes($Path); return $true }
+    catch [IO.FileNotFoundException] { return $false }
+    catch [IO.DirectoryNotFoundException] { return $false }
+    catch { return $true }
+}
+
+function ConvertFrom-CanonicalStatePct([string]$Raw) {
+    if ($Raw -notmatch '\A(?:0[0-9]{2}|100)\.[0-9]{3}\z') { return $null }
+    $whole = 0
+    $fraction = 0
+    if (-not [int]::TryParse($Raw.Substring(0, 3), $IntegerStyle, $Invariant, [ref]$whole)) { return $null }
+    if (-not [int]::TryParse($Raw.Substring(4, 3), $IntegerStyle, $Invariant, [ref]$fraction)) { return $null }
+    $milli = $whole * 1000 + $fraction
+    if ($milli -gt 100000) { return $null }
+    return $milli
+}
+
+function ConvertFrom-BurnName([string]$Name, [long]$NowValue) {
+    $match = [regex]::Match($Name, '\Ab_([0-9]{12})_([0-9]{12})_((?:0[0-9]{2}|100)\.[0-9]{3})_([0-9]{4})\z', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    if (-not $match.Success) { return $null }
+    $reset = 0L
+    $sample = 0L
+    if (-not [long]::TryParse($match.Groups[1].Value, $IntegerStyle, $Invariant, [ref]$reset)) { return $null }
+    if (-not [long]::TryParse($match.Groups[2].Value, $IntegerStyle, $Invariant, [ref]$sample)) { return $null }
+    if ($reset -gt 253402300799L -or $sample -gt 253402300799L) { return $null }
+    $pct = ConvertFrom-CanonicalStatePct $match.Groups[3].Value
+    if ($null -eq $pct) { return $null }
+    $plausible = $sample -le ($NowValue + 300L) -and $reset -ge $sample -and $reset -le ($NowValue + 21600L)
+    return [pscustomobject]@{ Name=$Name; Reset=$reset; Sample=$sample; Pct=[int]$pct; Plausible=$plausible }
+}
+
+function ConvertFrom-LimitName([string]$Name, [long]$NowValue, [long]$MaxAhead) {
+    $match = [regex]::Match($Name, '\A([0-9]{10})_((?:0[0-9]{2}|100)\.[0-9]{3})\z', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    if (-not $match.Success) { return $null }
+    $reset = 0L
+    if (-not [long]::TryParse($match.Groups[1].Value, $IntegerStyle, $Invariant, [ref]$reset)) { return $null }
+    $pct = ConvertFrom-CanonicalStatePct $match.Groups[2].Value
+    if ($null -eq $pct) { return $null }
+    $plausible = $reset -gt $NowValue -and $reset -le ($NowValue + $MaxAhead)
+    return [pscustomobject]@{ Name=$Name; Reset=$reset; Pct=[int]$pct; Plausible=$plausible }
+}
+
+function Get-StateDirectorySnapshot([string]$Root, [string]$Kind, [int]$Cap, [long]$NowValue, [long]$MaxAhead) {
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    if (-not (Test-StateRoot $Root)) { return [pscustomobject]@{ Complete=$false; Raw=0; Entries=@() } }
+    if (-not [IO.Directory]::Exists($Root)) { return [pscustomobject]@{ Complete=$true; Raw=0; Entries=@() } }
+    $raw = 0
+    $enumerator = $null
+    try {
+        $enumerator = [IO.Directory]::EnumerateFileSystemEntries($Root).GetEnumerator()
+        while ($enumerator.MoveNext()) {
+            $path = [string]$enumerator.Current
+            $raw++
+            if ($raw -gt $Cap) { return [pscustomobject]@{ Complete=$false; Raw=$raw; Entries=@() } }
+            $full = ConvertTo-LocalFullPath $path $Root
+            if ([string]::IsNullOrEmpty($full) -or -not (Test-PathInside $full $Root)) { continue }
+            if (-not [IO.Path]::GetDirectoryName($full).Equals($Root, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $name = [IO.Path]::GetFileName($full)
+            try { $attrs = [IO.File]::GetAttributes($full) } catch { return [pscustomobject]@{ Complete=$false; Raw=$raw; Entries=@() } }
+            if (($attrs -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if ($Kind -eq 'burn') {
+                $parsed = ConvertFrom-BurnName $name $NowValue
+                if ($null -eq $parsed -or ($attrs -band [IO.FileAttributes]::Directory) -ne 0) { continue }
+                try { if ((New-Object IO.FileInfo($full)).Length -ne 0) { continue } } catch { return [pscustomobject]@{ Complete=$false; Raw=$raw; Entries=@() } }
+            } else {
+                $parsed = ConvertFrom-LimitName $name $NowValue $MaxAhead
+                if ($null -eq $parsed -or ($attrs -band [IO.FileAttributes]::Directory) -eq 0) { continue }
+                $emptyStatus = Get-EmptyStateDirectoryStatus $full
+                if (-not $emptyStatus.Success) { return [pscustomobject]@{ Complete=$false; Raw=$raw; Entries=@() } }
+                if (-not $emptyStatus.Empty) { continue }
+            }
+            $parsed | Add-Member -NotePropertyName Path -NotePropertyValue $full
+            [void]$entries.Add($parsed)
+        }
+    } catch { return [pscustomobject]@{ Complete=$false; Raw=$raw; Entries=@() } }
+    finally { if ($null -ne $enumerator) { $enumerator.Dispose() } }
+    return [pscustomobject]@{ Complete=$true; Raw=$raw; Entries=$entries.ToArray() }
+}
+
+function ConvertFrom-LegacyRecord([string]$Record, [long]$NowValue) {
+    $fields = $Record.Split(@("`t"), [StringSplitOptions]::None)
+    if ($fields.Length -ne 3) { return $null }
+    $sampleValue = ConvertTo-StateEpoch $fields[0] 12
+    $pct = ConvertTo-StatePct $fields[1]
+    $resetValue = ConvertTo-StateEpoch $fields[2] 12
+    if ($null -eq $sampleValue -or $null -eq $pct -or $null -eq $resetValue) { return $null }
+    $sample = [long]$sampleValue.Value
+    $reset = [long]$resetValue.Value
+    if ($sample -gt ($NowValue + 300L) -or $reset -lt $sample -or $reset -gt ($NowValue + 21600L)) { return $null }
+    return [pscustomobject]@{ Reset=$reset; Sample=$sample; Pct=[int]$pct.Milli }
+}
+
+function Read-LegacyState([string]$Path, [long]$NowValue) {
+    $queue = New-Object 'System.Collections.Generic.Queue[object]'
+    if (-not [IO.File]::Exists($Path)) {
+        if (Test-StateObjectExists $Path) { return [pscustomobject]@{ Complete=$false; Rows=@() } }
+        if (Test-NoReparseComponents $Path) { return [pscustomobject]@{ Complete=$true; Rows=@() } }
+        return [pscustomobject]@{ Complete=$false; Rows=@() }
+    }
+    if (-not (Test-StateRegularFile $Path)) { return [pscustomobject]@{ Complete=$false; Rows=@() } }
+    $stream = $null
+    try {
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share, 4096, [IO.FileOptions]::SequentialScan)
+        $length = [long]$stream.Length
+        if ($length -gt 1048576L) { return [pscustomobject]@{ Complete=$false; Rows=@() } }
+        $buffer = New-Object byte[] 4096
+        $builder = New-Object Text.StringBuilder
+        $remaining = $length
+        $physical = 0
+        $recordLength = 0
+        $rowAscii = $true
+        while ($remaining -gt 0) {
+            $want = [int][Math]::Min([long]$buffer.Length, $remaining)
+            $read = $stream.Read($buffer, 0, $want)
+            if ($read -le 0) { return [pscustomobject]@{ Complete=$false; Rows=@() } }
+            $remaining -= $read
+            for ($i=0; $i -lt $read; $i++) {
+                $byte = [int]$buffer[$i]
+                if ($byte -eq 10) {
+                    $physical++
+                    if ($physical -gt 4096) { return [pscustomobject]@{ Complete=$false; Rows=@() } }
+                    if ($rowAscii) {
+                        $row = ConvertFrom-LegacyRecord $builder.ToString() $NowValue
+                        if ($null -ne $row) {
+                            if ($queue.Count -eq 512) { [void]$queue.Dequeue() }
+                            $queue.Enqueue($row)
+                        }
+                    }
+                    [void]$builder.Clear(); $recordLength=0; $rowAscii=$true
+                    continue
+                }
+                $recordLength++
+                if ($recordLength -gt 4096) { return [pscustomobject]@{ Complete=$false; Rows=@() } }
+                if ($byte -eq 9 -or $byte -eq 46 -or ($byte -ge 48 -and $byte -le 57)) { [void]$builder.Append([char]$byte) }
+                else { $rowAscii=$false }
+            }
+        }
+        if ($recordLength -gt 0) {
+            $physical++
+            if ($physical -gt 4096) { return [pscustomobject]@{ Complete=$false; Rows=@() } }
+            if ($rowAscii) {
+                $row = ConvertFrom-LegacyRecord $builder.ToString() $NowValue
+                if ($null -ne $row) {
+                    if ($queue.Count -eq 512) { [void]$queue.Dequeue() }
+                    $queue.Enqueue($row)
+                }
+            }
+        }
+        return [pscustomobject]@{ Complete=$true; Rows=$queue.ToArray() }
+    } catch { return [pscustomobject]@{ Complete=$false; Rows=@() } }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
+}
+
+function Sort-StateEntries([object[]]$Entries) {
+    $list = New-Object 'System.Collections.Generic.List[object]'
+    $list.AddRange($Entries)
+    $comparison = [System.Comparison[object]]{
+        param($left, $right)
+        return [string]::CompareOrdinal([string]$left.Name, [string]$right.Name)
+    }
+    $list.Sort($comparison)
+    return ,($list.ToArray())
+}
+
+function Get-BurnRetention([object[]]$Entries, [int]$Trim) {
+    $sorted = Sort-StateEntries $Entries
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    $representatives = @{}
+    foreach ($entry in $sorted) {
+        if (-not $entry.Plausible) { [void]$candidates.Add($entry); continue }
+        $key = ([string]$entry.Reset) + '_' + ([string]$entry.Sample)
+        if (-not $representatives.ContainsKey($key)) { $representatives[$key] = $entry; continue }
+        $old = $representatives[$key]
+        $replace = $entry.Pct -gt $old.Pct -or ($entry.Pct -eq $old.Pct -and [string]::CompareOrdinal($entry.Name, $old.Name) -lt 0)
+        if ($replace) { [void]$candidates.Add($old); $representatives[$key] = $entry }
+        else { [void]$candidates.Add($entry) }
+    }
+    $reps = Sort-StateEntries @($representatives.Values)
+    $oldCount = $reps.Count - $Trim
+    if ($oldCount -lt 0) { $oldCount = 0 }
+    for ($i=0; $i -lt $oldCount; $i++) { [void]$candidates.Add($reps[$i]) }
+    return [pscustomobject]@{ Candidates=$candidates.ToArray(); Representatives=$reps }
+}
+
+function Get-LimitRetention([object[]]$Entries) {
+    $sorted = Sort-StateEntries $Entries
+    $winner = $null
+    foreach ($entry in $sorted) { if ($entry.Plausible) { $winner = $entry } }
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($entry in $sorted) { if ($null -eq $winner -or -not [object]::ReferenceEquals($entry, $winner)) { [void]$candidates.Add($entry) } }
+    return [pscustomobject]@{ Candidates=$candidates.ToArray(); Winner=$winner }
+}
+
+function Test-BurnDeleteCandidate([string]$Root, $Entry) {
+    if ($null -eq $Entry -or -not $Entry.Path.Equals([IO.Path]::Combine($Root, $Entry.Name), [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not (Test-StateRoot $Root) -or -not [IO.Directory]::Exists($Root)) { return $false }
+    if ($null -eq (ConvertFrom-BurnName $Entry.Name $Now)) { return $false }
+    try {
+        $attrs = [IO.File]::GetAttributes($Entry.Path)
+        if (($attrs -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ($attrs -band [IO.FileAttributes]::Directory) -ne 0) { return $false }
+        return (New-Object IO.FileInfo($Entry.Path)).Length -eq 0
+    } catch { return $false }
+}
+
+function Test-LimitDeleteCandidate([string]$Root, $Entry, [long]$MaxAhead) {
+    if ($null -eq $Entry -or -not $Entry.Path.Equals([IO.Path]::Combine($Root, $Entry.Name), [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not (Test-StateRoot $Root) -or -not [IO.Directory]::Exists($Root)) { return $false }
+    if ($null -eq (ConvertFrom-LimitName $Entry.Name $Now $MaxAhead)) { return $false }
+    return Test-EmptyStateDirectory $Entry.Path
+}
+
+function Remove-StateCandidates([string]$Root, [object[]]$Candidates, [string]$Kind, [long]$MaxAhead, [bool]$Mutate) {
+    if (-not $Mutate) { return [pscustomobject]@{ Resolved=0; Clean=($Candidates.Count -eq 0) } }
+    $limit = [Math]::Min(128, $Candidates.Count)
+    $resolved = 0
+    for ($i=0; $i -lt $limit; $i++) {
+        $entry = $Candidates[$i]
+        if (-not (Test-StateObjectExists $entry.Path)) { $resolved++; continue }
+        $safe = $false
+        if ($Kind -eq 'burn') { $safe = Test-BurnDeleteCandidate $Root $entry }
+        else { $safe = Test-LimitDeleteCandidate $Root $entry $MaxAhead }
+        if (-not $safe) { continue }
+        try {
+            if ($Kind -eq 'burn') { [IO.File]::Delete($entry.Path) }
+            else { [IO.Directory]::Delete($entry.Path, $false) }
+        } catch { }
+        if (-not (Test-StateObjectExists $entry.Path)) { $resolved++ }
+    }
+    return [pscustomobject]@{ Resolved=$resolved; Clean=($resolved -eq $Candidates.Count) }
+}
+
+function Get-CurrentLimit([string]$RawPct, [string]$RawReset, [long]$NowValue, [long]$MaxAhead) {
+    $pct = ConvertTo-StatePct $RawPct
+    $reset = ConvertTo-StatePayloadEpoch $RawReset 10
+    if ($null -eq $pct -or $null -eq $reset) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L } }
+    $value = [long]$reset.Value
+    if ($value -le $NowValue -or $value -gt ($NowValue + $MaxAhead)) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L } }
+    return [pscustomobject]@{ Valid=$true; Pct=[int]$pct.Milli; Reset=$value }
+}
+
+function Select-LimitResult($Snapshot, $Retention, $Current) {
+    $valid = $false
+    $reset = 0L
+    $pct = 0
+    if ($Snapshot.Complete -and $null -ne $Retention.Winner) { $valid=$true; $reset=[long]$Retention.Winner.Reset; $pct=[int]$Retention.Winner.Pct }
+    if ($Current.Valid -and (-not $valid -or $Current.Reset -gt $reset -or ($Current.Reset -eq $reset -and $Current.Pct -gt $pct))) {
+        $valid=$true; $reset=[long]$Current.Reset; $pct=[int]$Current.Pct
+    }
+    return [pscustomobject]@{ Valid=$valid; Reset=$reset; Pct=$pct }
+}
+
+function Publish-LimitState([string]$Root, $Current, $Snapshot, $Gc, [long]$MaxAhead, [bool]$Mutate) {
+    if (-not $Mutate -or -not $Snapshot.Complete -or -not $Gc.Clean -or -not $Current.Valid) { return $false }
+    if (($Snapshot.Raw - $Gc.Resolved) -ge 384) { return $false }
+    if (-not (Test-StateRoot $Root)) { return $false }
+    $name = $Current.Reset.ToString('D10', $Invariant) + '_' + (Format-StatePct $Current.Pct)
+    $path = [IO.Path]::Combine($Root, $name)
+    if (-not (Test-NoReparseComponents $path)) { return $false }
+    try { [void][IO.Directory]::CreateDirectory($path) } catch { return $false }
+    return Test-LimitDeleteCandidate $Root ([pscustomobject]@{ Name=$name; Path=$path }) $MaxAhead
+}
+
+function Publish-BurnState([string]$Root, $Current, $Snapshot, $Gc, [bool]$Mutate) {
+    if (-not $Mutate -or -not $Snapshot.Complete -or -not $Gc.Clean -or -not $Current.Valid) { return $false }
+    if (($Snapshot.Raw - $Gc.Resolved) -ge 3968) { return $false }
+    if (-not (Test-StateRoot $Root)) { return $false }
+    try { [void][IO.Directory]::CreateDirectory($Root) } catch { return $false }
+    if (-not (Test-StateRoot $Root) -or -not [IO.Directory]::Exists($Root)) { return $false }
+    for ($slot=0; $slot -lt 32; $slot++) {
+        $name = 'b_' + $Current.Reset.ToString('D12', $Invariant) + '_' + $Current.Sample.ToString('D12', $Invariant) + '_' + (Format-StatePct $Current.Pct) + '_' + $slot.ToString('D4', $Invariant)
+        $path = [IO.Path]::Combine($Root, $name)
+        try {
+            $stream = New-Object IO.FileStream($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $stream.Dispose()
+            return $true
+        } catch [IO.IOException] {
+            if (Test-StateObjectExists $path) { continue }
+            return $false
+        } catch { return $false }
+    }
+    return $false
+}
+
+function Get-Burn5Estimate($Snapshot, $Retention, $Legacy, $Current, [long]$NowValue, [int]$Window) {
+    $warming = [pscustomobject]@{ State='warming'; Eta='inf'; Rate='0.0000000000'; Ttr=0L }
+    if (-not $Snapshot.Complete -or -not $Legacy.Complete) { return $warming }
+    $observations = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($entry in $Retention.Representatives) { if ($entry.Plausible) { [void]$observations.Add($entry) } }
+    foreach ($row in $Legacy.Rows) { [void]$observations.Add($row) }
+    if ($Current.Valid) { [void]$observations.Add($Current) }
+    if ($observations.Count -eq 0) { return $warming }
+    $maxReset = 0L
+    foreach ($observation in $observations) { if ([long]$observation.Reset -gt $maxReset) { $maxReset = [long]$observation.Reset } }
+    if ($maxReset -le 0) { return $warming }
+    $dedup = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $perSecond = New-Object 'System.Collections.Generic.Dictionary[long,int]'
+    foreach ($observation in $observations) {
+        if ([long]$observation.Reset -ne $maxReset) { continue }
+        $key = ([string]$observation.Reset) + '_' + ([string]$observation.Sample) + '_' + ([string]$observation.Pct)
+        if (-not $dedup.Add($key)) { continue }
+        $sample = [long]$observation.Sample
+        $pct = [int]$observation.Pct
+        if (-not $perSecond.ContainsKey($sample) -or $pct -gt $perSecond[$sample]) { $perSecond[$sample] = $pct }
+    }
+    if ($perSecond.Count -eq 0) { return $warming }
+    $samples = [long[]]@($perSecond.Keys)
+    [Array]::Sort($samples)
+    $ttr = $maxReset - $NowValue
+    if ($ttr -lt 0) { $ttr = 0 }
+    $cutoff = $NowValue - $Window
+    $unusedRemainder = 0L
+    $minSpan = [Math]::DivRem([long]$Window, 10L, [ref]$unusedRemainder)
+    $firstTime = 0L; $firstPct = -1; $lastTime = 0L; $lastPct = -1; $crossings = 0; $anyCrossing = $false
+    for ($i=1; $i -lt $samples.Length; $i++) {
+        $aRem = 0L; $bRem = 0L
+        $a = [Math]::DivRem([long]$perSecond[$samples[$i-1]], 1000L, [ref]$aRem)
+        $b = [Math]::DivRem([long]$perSecond[$samples[$i]], 1000L, [ref]$bRem)
+        if ($b -le $a) { continue }
+        $anyCrossing = $true
+        $crossTime = $samples[$i]
+        if ($crossTime -ge $cutoff -and $crossTime -le $NowValue) {
+            if ($firstPct -lt 0) { $firstTime=$crossTime; $firstPct=[int]$b }
+            $lastTime=$crossTime; $lastPct=[int]$b; $crossings++
+        }
+    }
+    if ($crossings -ge 2 -and $lastTime -gt $firstTime -and $lastPct -gt $firstPct -and ($lastTime - $firstTime) -ge $minSpan) {
+        $span = $lastTime - $firstTime
+        $delta = [long]($lastPct - $firstPct)
+        $latest = [long]$perSecond[$samples[$samples.Length - 1]]
+        $eta = Get-RoundEvenInt64 ((100000L - $latest) * $span) ($delta * 1000L)
+        $rate = Format-StateRate ($delta * 10000000000L) $span
+        return [pscustomobject]@{ State='active'; Eta=$eta; Rate=$rate; Ttr=$ttr }
+    }
+    if ($anyCrossing -and $crossings -eq 0) { return [pscustomobject]@{ State='idle'; Eta='inf'; Rate='0.0000000000'; Ttr=$ttr } }
+    return [pscustomobject]@{ State='warming'; Eta='inf'; Rate='0.0000000000'; Ttr=$ttr }
+}
+
+function Get-Burn7Estimate($Limit, [long]$NowValue) {
+    if (-not $Limit.Valid) { return [pscustomobject]@{ Eta='inf'; Rate='0.0000000000'; Ttr=0L } }
+    $ttr = [long]$Limit.Reset - $NowValue
+    if ($ttr -lt 0) { $ttr = 0 }
+    $elapsed = $NowValue - ([long]$Limit.Reset - 604800L)
+    if ($Limit.Pct -le 0 -or $elapsed -lt 1 -or $elapsed -gt 691200L) { return [pscustomobject]@{ Eta='inf'; Rate='0.0000000000'; Ttr=$ttr } }
+    $rate = Format-StateRate ([long]$Limit.Pct * 10000000L) $elapsed
+    $eta = Get-RoundEvenInt64 ((100000L - [long]$Limit.Pct) * $elapsed) ([long]$Limit.Pct)
+    return [pscustomobject]@{ Eta=$eta; Rate=$rate; Ttr=$ttr }
+}
+
+function Get-BurnBinding($Five, $Seven) {
+    $fiveFinite = [string]$Five.Eta -ne 'inf'
+    $sevenFinite = [string]$Seven.Eta -ne 'inf'
+    if ($fiveFinite -and (-not $sevenFinite -or [long]$Five.Eta -le [long]$Seven.Eta)) {
+        return [pscustomobject]@{ State='active'; Label='5h'; Eta=[long]$Five.Eta; Rate=$Five.Rate; Ttr=[long]$Five.Ttr }
+    }
+    if ($sevenFinite) { return [pscustomobject]@{ State='active'; Label='7d'; Eta=[long]$Seven.Eta; Rate=$Seven.Rate; Ttr=[long]$Seven.Ttr } }
+    $state = 'warming'
+    if ($Five.State -eq 'idle') { $state = 'idle' }
+    return [pscustomobject]@{ State=$state; Label=''; Eta='inf'; Rate='0.0000000000'; Ttr=0L }
+}
+
+function Get-CorallineState([bool]$BurnGate, [bool]$Limit5Gate, [bool]$Limit7Gate) {
+    $mutate = [string]$env:CORALLINE_NO_SAMPLE -ne '1'
+    $window = Get-BoundedInt $Cfg.CORALLINE_BURN_WINDOW 600 60 86400
+    $trim = Get-BoundedInt $Cfg.BURN_TRIM 1500 1 3000
+    $current5 = Get-CurrentLimit $fhPct $fhRst $Now 21600L
+    $current7 = Get-CurrentLimit $wdPct $wdRst $Now 691200L
+    $currentBurn = [pscustomobject]@{ Valid=$false; Reset=0L; Sample=$Now; Pct=0 }
+    if ($current5.Valid -and $current5.Reset -ge $Now) { $currentBurn = [pscustomobject]@{ Valid=$true; Reset=[long]$current5.Reset; Sample=$Now; Pct=[int]$current5.Pct } }
+
+    $emptySnapshot = [pscustomobject]@{ Complete=$false; Raw=0; Entries=@() }
+    $emptyLegacy = [pscustomobject]@{ Complete=$false; Rows=@() }
+    $burnSnapshot=$emptySnapshot; $limit5Snapshot=$emptySnapshot; $limit7Snapshot=$emptySnapshot; $legacy=$emptyLegacy
+    $burnPaths=$null; $limit5Paths=$null; $limit7Paths=$null
+    if ($BurnGate) { $burnPaths = Get-StatePaths $Cfg.BURN_FILE }
+    if ($Limit5Gate) { $limit5Paths = Get-StatePaths $Cfg.RL5H_FILE }
+    if ($Limit7Gate) { $limit7Paths = Get-StatePaths $Cfg.RL7D_FILE }
+    $collision = $false
+    $roots = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($candidateRoot in @($burnPaths, $limit5Paths, $limit7Paths)) { if ($null -ne $candidateRoot) { [void]$roots.Add($candidateRoot) } }
+    for ($i=0; $i -lt $roots.Count; $i++) {
+        for ($j=$i+1; $j -lt $roots.Count; $j++) { if ($roots[$i].Root.Equals($roots[$j].Root, [StringComparison]::OrdinalIgnoreCase)) { $collision=$true } }
+    }
+    if (-not $collision) {
+        if ($BurnGate -and $null -ne $burnPaths) {
+            $burnSnapshot = Get-StateDirectorySnapshot $burnPaths.Root 'burn' 4096 $Now 21600L
+            $legacy = Read-LegacyState $burnPaths.Base $Now
+            if (-not $legacy.Complete) { $burnSnapshot = [pscustomobject]@{ Complete=$false; Raw=$burnSnapshot.Raw; Entries=@() } }
+        }
+        if ($Limit5Gate -and $null -ne $limit5Paths) { $limit5Snapshot = Get-StateDirectorySnapshot $limit5Paths.Root 'limit' 512 $Now 21600L }
+        if ($Limit7Gate -and $null -ne $limit7Paths) { $limit7Snapshot = Get-StateDirectorySnapshot $limit7Paths.Root 'limit' 512 $Now 691200L }
+    }
+
+    $burnRetention = [pscustomobject]@{ Candidates=@(); Representatives=@() }
+    $limit5Retention = [pscustomobject]@{ Candidates=@(); Winner=$null }
+    $limit7Retention = [pscustomobject]@{ Candidates=@(); Winner=$null }
+    if ($burnSnapshot.Complete) { $burnRetention = Get-BurnRetention $burnSnapshot.Entries $trim }
+    if ($limit5Snapshot.Complete) { $limit5Retention = Get-LimitRetention $limit5Snapshot.Entries }
+    if ($limit7Snapshot.Complete) { $limit7Retention = Get-LimitRetention $limit7Snapshot.Entries }
+
+    $burnGc = [pscustomobject]@{ Resolved=0; Clean=$false }
+    $limit5Gc = [pscustomobject]@{ Resolved=0; Clean=$false }
+    $limit7Gc = [pscustomobject]@{ Resolved=0; Clean=$false }
+    if ($burnSnapshot.Complete) { $burnGc = Remove-StateCandidates $burnPaths.Root $burnRetention.Candidates 'burn' 21600L $mutate }
+    if ($limit5Snapshot.Complete) { $limit5Gc = Remove-StateCandidates $limit5Paths.Root $limit5Retention.Candidates 'limit' 21600L $mutate }
+    if ($limit7Snapshot.Complete) { $limit7Gc = Remove-StateCandidates $limit7Paths.Root $limit7Retention.Candidates 'limit' 691200L $mutate }
+
+    $limit5 = Select-LimitResult $limit5Snapshot $limit5Retention $current5
+    $limit7 = Select-LimitResult $limit7Snapshot $limit7Retention $current7
+    if ($BurnGate -and $burnSnapshot.Complete) { [void](Publish-BurnState $burnPaths.Root $currentBurn $burnSnapshot $burnGc $mutate) }
+    if ($Limit5Gate -and $limit5Snapshot.Complete) { [void](Publish-LimitState $limit5Paths.Root $current5 $limit5Snapshot $limit5Gc 21600L $mutate) }
+    if ($Limit7Gate -and $limit7Snapshot.Complete) { [void](Publish-LimitState $limit7Paths.Root $current7 $limit7Snapshot $limit7Gc 691200L $mutate) }
+
+    $five = Get-Burn5Estimate $burnSnapshot $burnRetention $legacy $currentBurn $Now $window
+    if ($Cfg.VL_LIMIT_SYNC -eq '1') { $seven = Get-Burn7Estimate $limit7 $Now }
+    else { $seven = Get-Burn7Estimate $current7 $Now }
+    $burn = Get-BurnBinding $five $seven
+    $burn | Add-Member -NotePropertyName Reported -NotePropertyValue ($current5.Valid -or $current7.Valid)
+    return [pscustomobject]@{
+        Burn=$burn; Five=$five; Seven=$seven; Limit5=$limit5; Limit7=$limit7
+        Current5=$current5; Current7=$current7; BurnSnapshotComplete=$burnSnapshot.Complete
+        Limit5SnapshotComplete=$limit5Snapshot.Complete; Limit7SnapshotComplete=$limit7Snapshot.Complete
+    }
+}
 
 function Format-Countdown([string]$ResetsAt) {
     $ep = ConvertTo-Epoch $ResetsAt
@@ -1038,6 +1583,14 @@ foreach ($list in @($Cfg.VL_SEGMENTS, $Cfg.VL_SEGMENTS2, $Cfg.VL_SEGMENTS3)) {
     foreach ($name in (Get-SegmentTokens $list)) { [void]$AllSegmentNames.Add($name) }
 }
 
+$BurnStateGate = $AllSegmentNames.Contains('burn')
+$Limit5StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and $AllSegmentNames.Contains('limit5h')
+$Limit7StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and ($AllSegmentNames.Contains('limit7d') -or $BurnStateGate)
+$State = $null
+if ($BurnStateGate -or $Limit5StateGate -or $Limit7StateGate) {
+    $State = Get-CorallineState $BurnStateGate $Limit5StateGate $Limit7StateGate
+}
+
 $GitState = @{ Branch = ''; Marks = ''; Ab = ''; Dirty = $false }
 $GitRoot = ''
 if ($AllSegmentNames.Contains('git') -or $AllSegmentNames.Contains('stash') -or $AllSegmentNames.Contains('project')) {
@@ -1119,9 +1672,10 @@ function Add-CtxSegment {
     Push-Segment $Cfg.VL_BG_CTX "${pfg} $($Cfg.VL_CTX_GLYPH) ${bar} ${pct}% ${dfg}$($G.Up)${ti} $($G.Down)${to} cr:${tcr} cw:${tcw} "
 }
 
-function Add-LimitSegment([string]$Label, [string]$RawPct, [string]$ResetsAt, [string]$Bg) {
+function Add-LimitSegment([string]$Label, [string]$RawPct, [string]$ResetsAt, [string]$Bg, [int]$PctMilli = -1) {
     $pct = 0
-    if (-not (Get-PctValue $RawPct ([ref]$pct))) { return }
+    if ($PctMilli -ge 0) { $pct = [int](Get-RoundEvenInt64 ([long]$PctMilli) 1000L) }
+    elseif (-not (Get-PctValue $RawPct ([ref]$pct))) { return }
     $bar = New-Bar $pct ([int]$Cfg.VL_BAR_WIDTH)
     $pfg = Get-Fg (Get-PctFg $pct)
     $countdown = Format-Countdown $ResetsAt
@@ -1131,6 +1685,62 @@ function Add-LimitSegment([string]$Label, [string]$RawPct, [string]$ResetsAt, [s
         $reset = "${dfg}$($G.Reset)${countdown}"
     }
     Push-Segment $Bg "${pfg} $Label ${bar} ${pct}% ${reset} "
+}
+
+function Add-Limit5Segment {
+    if ($Cfg.VL_LIMIT_SYNC -eq '1') {
+        if ($null -eq $State -or -not $State.Limit5.Valid) { return }
+        Add-LimitSegment '5h' (Format-StatePct $State.Limit5.Pct) ([string]$State.Limit5.Reset) $Cfg.VL_BG_5H $State.Limit5.Pct
+        return
+    }
+    Add-LimitSegment '5h' $fhPct $fhRst $Cfg.VL_BG_5H
+}
+
+function Add-Limit7Segment {
+    if ($Cfg.VL_LIMIT_SYNC -eq '1') {
+        if ($null -eq $State -or -not $State.Limit7.Valid) { return }
+        Add-LimitSegment '7d' (Format-StatePct $State.Limit7.Pct) ([string]$State.Limit7.Reset) $Cfg.VL_BG_7D $State.Limit7.Pct
+        return
+    }
+    Add-LimitSegment '7d' $wdPct $wdRst $Cfg.VL_BG_7D
+}
+
+function Format-Eta([long]$Seconds) {
+    $remainder = 0L
+    $days = [Math]::DivRem($Seconds, 86400L, [ref]$remainder)
+    $minutesRemainder = 0L
+    $hours = [Math]::DivRem($remainder, 3600L, [ref]$minutesRemainder)
+    $unused = 0L
+    $minutes = [Math]::DivRem($minutesRemainder, 60L, [ref]$unused)
+    if ($days -gt 0) { return [string]::Format($Invariant, '{0}d{1:00}h', $days, $hours) }
+    if ($hours -gt 0) { return [string]::Format($Invariant, '{0}h{1:00}m', $hours, $minutes) }
+    return [string]::Format($Invariant, '{0}m', $minutes)
+}
+
+function Add-BurnSegment {
+    if ($null -eq $State -or -not $State.Burn.Reported) { return }
+    $bg = $Cfg.VL_BG_BURN
+    if ([string]::IsNullOrEmpty($bg)) { $bg = $Cfg.VL_BG_5H }
+    if ($State.Burn.State -ne 'active') {
+        $fg = Get-Fg $Cfg.VL_FG_DIM
+        if ($State.Burn.State -eq 'warming') { Push-Segment $bg "${fg} $($Cfg.VL_BURN_GLYPH) $($G.Ellipsis) " }
+        else { Push-Segment $bg "${fg} $($Cfg.VL_BURN_GLYPH) $($G.Check) " }
+        return
+    }
+    $window = 604800L
+    if ($State.Burn.Label -eq '5h') { $window = 18000L }
+    $eta = [long]$State.Burn.Eta
+    $ttr = [long]$State.Burn.Ttr
+    if ($eta -gt $window) {
+        $fg = Get-Fg $Cfg.VL_FG_OK
+        Push-Segment $bg "${fg} $($Cfg.VL_BURN_GLYPH) $($G.Check) "
+        return
+    }
+    if ($eta -le $ttr) { $color = $Cfg.VL_FG_HOT }
+    elseif ((10L * $ttr) -ge (8L * $eta)) { $color = $Cfg.VL_FG_WARN }
+    else { $color = $Cfg.VL_FG_OK }
+    $fg = Get-Fg $color
+    Push-Segment $bg "${fg} $($Cfg.VL_BURN_GLYPH) $($State.Burn.Label) $($G.BurnTo) $(Format-Eta $eta) "
 }
 
 function Add-CostSegment {
@@ -1195,6 +1805,7 @@ function Add-PythonSegment {
 }
 
 $SegmentBuilders = [ordered]@{
+    burn = { Add-BurnSegment }
     clock = { Add-ClockSegment }
     cost = { Add-CostSegment }
     ctx = { Add-CtxSegment }
@@ -1202,8 +1813,8 @@ $SegmentBuilders = [ordered]@{
     duration = { Add-DurationSegment }
     effort = { Add-EffortSegment }
     git = { Add-GitSegment }
-    limit5h = { Add-LimitSegment '5h' $fhPct $fhRst $Cfg.VL_BG_5H }
-    limit7d = { Add-LimitSegment '7d' $wdPct $wdRst $Cfg.VL_BG_7D }
+    limit5h = { Add-Limit5Segment }
+    limit7d = { Add-Limit7Segment }
     lines = { Add-LinesSegment }
     model = { Add-ModelSegment }
     node = { Add-NodeSegment }
