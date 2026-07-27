@@ -116,11 +116,15 @@ burn、git 與 runtime segments——都只作用於主列，在 subagent 模式
 
 ## 安裝
 
-三種安裝方式都由同一支 `install.sh` 驅動，每一種都會把 renderer **與設定 wizard** 複製到
-`~/.claude/coralline`、並把 statusline 註冊進 Claude Code，所以不管你用哪種方式裝，之後都能重跑 wizard。
+在 macOS、Linux，以及具有 Bash 的 Windows 環境中，三種安裝方式都由同一支
+`install.sh` 驅動。每一種都會把 Bash renderer **與設定 wizard** 複製到
+`~/.claude/coralline`、並把 statusline 註冊進 Claude Code，所以之後都能重跑
+wizard。僅有 PowerShell 的 Windows 電腦則使用下方
+[Windows 無 Git Bash](#windows-無-git-bash)的獨立原生 archive 流程。
 
-> **需求：** `jq` 以及 [Nerd Font](https://www.nerdfonts.com/) 終端機字型。
-> 沒有 Nerd Font 的話，在設定檔加上 `VL_ASCII=1` 改用無特殊字符的渲染。
+> **Bash 需求：** `jq` 以及 [Nerd Font](https://www.nerdfonts.com/) 終端機字型。
+> 沒有 Nerd Font 的話，在設定檔加上 `VL_ASCII=1` 改用無特殊字符的渲染。下方原生
+> PowerShell renderer 不需要 `jq`。
 
 ### 請 Claude 安裝（推薦）
 
@@ -132,15 +136,17 @@ fetch https://raw.githubusercontent.com/Nanako0129/coralline/main/INSTALL.md
 and follow the playbook in it.
 ```
 
-Claude 會先讀 playbook，再用同一支 installer bootstrap runtime、訪談你的外觀偏好、
-寫入設定並驗證，最後提醒你如果不滿意可以自己重新開啟視覺化 wizard。
+在 Bash 環境中，Claude 會先讀 playbook，再用 `install.sh` bootstrap runtime、訪談你的
+外觀偏好、寫入設定並驗證，最後提醒你如果不滿意可以自己重新開啟視覺化 wizard。僅有
+PowerShell 的 Windows 請改用下方原生 archive 流程；這份 Bash playbook 不會安裝
+`statusline.ps1`。
 
 如果你的 Claude 對這份 playbook 亮紅旗、想先檢查內容，那是正確的直覺而不是阻礙：
 見[信任與安全](#信任與安全)。
 
 ### 自己安裝
 
-在終端機執行：
+在 Bash 終端機執行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Nanako0129/coralline/main/install.sh | bash
@@ -175,10 +181,64 @@ cp ~/.claude/coralline-src/themes/claude-coral.conf ~/.claude/coralline/themes/
 > **注意：** 上面的指令只複製 `claude-coral` 一個主題。「請 Claude 安裝」與一行安裝會帶上全部主題；
 > 手動安裝後若要換主題，把 `~/.claude/coralline-src/themes/*.conf` 其餘的也複製進 `~/.claude/coralline/themes/`。
 
+### Windows 無 Git Bash
+
+`statusline.sh` 本身需要 bash，因此只有 Windows PowerShell 5.1、沒有 Git for Windows
+或 WSL 的電腦無法執行它。`statusline.ps1` 是原生 Windows PowerShell 5.1 renderer，
+不需要 bash 或 `jq`；只有啟用 `git`／`stash`／`project` segments 時才需要 `PATH`
+中有 `git.exe`。
+
+它會讀取 bash 版本相同的 `~/.claude/coralline.conf` 與 theme 檔。原生主列與 bash
+renderer 支援相同的 segments、`pill`／`lean`／`classic` styles、
+`fixed`／`auto` layouts、burn history、limit sync 與 float publication。
+只有 `--subagent` 面板列協定仍限定使用 bash；`statusline.ps1 --subagent` 不會輸出內容。
+
+```powershell
+$download = Join-Path $env:TEMP ("coralline-" + [guid]::NewGuid())
+$archive = Join-Path $download "coralline-main.zip"
+New-Item -ItemType Directory -Force $download | Out-Null
+Invoke-WebRequest https://github.com/Nanako0129/coralline/archive/refs/heads/main.zip -UseBasicParsing -OutFile $archive
+Expand-Archive $archive -DestinationPath $download
+
+$source = Join-Path $download "coralline-main"
+$target = Join-Path $HOME ".claude\coralline"
+New-Item -ItemType Directory -Force (Join-Path $target "themes") | Out-Null
+$runtime = Join-Path $target "statusline.ps1"
+if (Test-Path -LiteralPath $runtime) {
+  Copy-Item -LiteralPath $runtime -Destination ($runtime + ".bak." + (Get-Date -Format "yyyyMMdd-HHmmss"))
+}
+Copy-Item (Join-Path $source "statusline.ps1") $runtime
+Copy-Item (Join-Path $source "themes\*.conf") (Join-Path $target "themes")
+Remove-Item $download -Recurse -Force
+```
+
+接著在 `~/.claude/settings.json` 加入：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/you/.claude/coralline/statusline.ps1\""
+  }
+}
+```
+
+可以沿用 bash wizard 已寫好的設定，或參考 `themes/` 內任一檔案手動建立
+`~/.claude/coralline.conf`。per-process `ExecutionPolicy Bypass` 讓未簽章的本機
+renderer 在一般 session 預設為 `Restricted` 時仍能啟動；它不會修改任何持久化 policy，
+且強制套用的 Group Policy 仍具有最高優先權。
+
 ### 更新
 
-兩種更新方式，都由同一支 installer 驅動。無論哪種，你的 `~/.claude/coralline.conf`
+下方兩種 installer 流程用於更新 Bash 安裝。無論哪種，你的 `~/.claude/coralline.conf`
 都會被保留，舊的 `statusline.sh` 會備份在 `~/.claude/coralline/` 下（保留最近 3 份）。
+
+#### 僅 PowerShell 的更新方式
+
+沒有 Bash 的電腦請重新執行 [Windows 無 Git Bash](#windows-無-git-bash)
+小節中的 PowerShell archive 指令。該區塊同時就是原生更新流程：下載目前的 `main`
+archive、把既有 `statusline.ps1` 備份為 `statusline.ps1.bak.<timestamp>`、更新
+renderer 與全部 themes，並保留 `~/.claude/coralline.conf` 與 `settings.json`。
 
 #### 請 Claude 更新（推薦）
 
@@ -227,7 +287,7 @@ curl -fsSL https://raw.githubusercontent.com/Nanako0129/coralline/main/install.s
 
 ### 移除
 
-若曾啟用 subagent 列主題，請先移除對應設定，再刪除工具：
+若環境可使用 Bash，請先移除 subagent 列主題，再刪除工具：
 
 ```bash
 bash ~/.claude/coralline/configure.sh --subagent-rows=off
@@ -237,10 +297,29 @@ rm -rf ~/.claude/coralline ~/.claude/coralline.conf
 然後把 `~/.claude/settings.json` 裡的 `statusLine` 區塊刪掉（或還原最新的
 `settings.json.bak.*`）。若略過第一個指令，也要一併刪除 `subagentStatusLine`。
 
+若是僅有 PowerShell 的原生 archive 安裝，先關閉 Claude Code 並備份設定檔：
+
+```powershell
+$settings = Join-Path $HOME '.claude\settings.json'
+Copy-Item -LiteralPath $settings -Destination "$settings.bak.$(Get-Date -Format yyyyMMddHHmmss)"
+notepad.exe $settings
+```
+
+在記事本中刪除 command 指向 `~/.claude/coralline/statusline.ps1` 的 `statusLine`
+物件。若 `subagentStatusLine` 的 command 也指向 coralline，請一併刪除，並確認存檔後
+仍是有效 JSON。最後移除已安裝的 runtime 與選用設定檔：
+
+```powershell
+Remove-Item -LiteralPath (Join-Path $HOME '.claude\coralline') -Recurse -Force
+Remove-Item -LiteralPath (Join-Path $HOME '.claude\coralline.conf') -Force -ErrorAction SilentlyContinue
+```
+
 ## 設定
 
-兩種方式都使用同一支 installer。人類不帶模式參數執行時會進入視覺化設定；
-Claude 則使用 `--install-only` bootstrap，接著依照 `INSTALL.md` 訪談並寫入設定。
+兩種 Bash 設定方式都使用同一支 installer。人類不帶模式參數執行時會進入視覺化設定；
+Claude 則使用 `--install-only` bootstrap，接著依照 `INSTALL.md` 訪談並寫入設定。原生
+PowerShell archive 流程目前不會安裝 PowerShell wizard；它讀取同一份
+`coralline.conf`，可沿用既有 Bash 設定或手動建立。
 
 ### 設定模式
 
@@ -255,11 +334,15 @@ Claude 不需要操作這個人類 TUI。
 
 ### 重新設定
 
-每一種安裝方式都會把 wizard 複製到 `~/.claude/coralline`，所以你隨時可以重跑來重新調整外觀：
+兩種 Bash 安裝方式都會把 wizard 複製到 `~/.claude/coralline`，所以有 Bash 的環境可隨時
+重跑來重新調整外觀：
 
 ```bash
 bash ~/.claude/coralline/configure.sh
 ```
+
+PowerShell-only 安裝不含原生 wizard。請先備份再手動編輯
+`$HOME\.claude\coralline.conf`，或沿用在有 Bash 的環境產生的設定。
 
 ### 測試 fork
 
@@ -429,11 +512,11 @@ wizard 會自動掃描 `themes/*.conf` 與 `themes/best-themes/*.conf` 這類巢
 | macOS | ✅ 支援（內建 bash 3.2 即可） |
 | Linux | ✅ 支援 |
 | Windows + Git Bash | ✅ 支援——有裝 Git Bash 時，Claude Code 會用它執行 statusline |
-| Windows 無 Git Bash | ❌ 暫不支援——Claude Code 會退回 PowerShell，跑不了 bash 腳本（[roadmap](https://github.com/Nanako0129/coralline/issues)） |
+| Windows 無 Git Bash | ✅ 原生 Windows PowerShell 5.1 支援主列 |
 
-> **Windows 提醒：** 裝 [Git for Windows](https://git-scm.com/download/win)（內含 Git Bash）和 `jq`，
-> coralline 即可原生運作。給「無 Git Bash」情境的原生 PowerShell 版本列在 roadmap 上。渲染流程
-> 特意設計成在 Git Bash 模擬的 `fork()` 下仍便宜——一個 `jq`、一個 `git`，沒有逐欄位的子程序開銷。
+> **Windows 提醒：** 原生 PowerShell renderer 不需要 Git Bash 或 `jq`。`git.exe`
+> 是選用項目，只用來啟用 `git`、`stash`、`project` segments。互動式 wizard 與套用
+> theme 的 `--subagent` 列仍限定使用 bash。
 
 ## 為什麼很快
 

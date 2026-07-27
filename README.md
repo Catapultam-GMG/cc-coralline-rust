@@ -124,12 +124,15 @@ bar, point the registration at its own config file:
 
 ## Install
 
-Three ways to install, all driven by the same `install.sh`. Each one copies the renderer **and
-the setup wizard** into `~/.claude/coralline` and registers the status line in Claude Code, so
-you can re-run the wizard later no matter which way you installed.
+On macOS, Linux, and Windows environments with Bash, three install routes use the same
+`install.sh`. Each one copies the Bash renderer **and the setup wizard** into
+`~/.claude/coralline` and registers the status line in Claude Code, so you can re-run the
+wizard later no matter which Bash route you used. A PowerShell-only Windows machine uses the
+separate native archive flow under [Windows without Git Bash](#windows-without-git-bash).
 
-> **Requirements:** `jq` and a [Nerd Font](https://www.nerdfonts.com/) terminal. No Nerd Font?
-> Set `VL_ASCII=1` in your config for a glyph-free rendering.
+> **Bash requirements:** `jq` and a [Nerd Font](https://www.nerdfonts.com/) terminal. No Nerd
+> Font? Set `VL_ASCII=1` in your config for a glyph-free rendering. The native PowerShell
+> renderer below does not require `jq`.
 
 ### Ask Claude (recommended)
 
@@ -141,16 +144,18 @@ fetch https://raw.githubusercontent.com/Nanako0129/coralline/main/INSTALL.md
 and follow the playbook in it.
 ```
 
-Claude will read the playbook, use the same installer to bootstrap the runtime, interview you
-about the look, write the config, verify it, and remind you that you can rerun the visual
-wizard if the first result doesn't match your taste.
+In a Bash environment, Claude will read the playbook, use `install.sh` to bootstrap the
+runtime, interview you about the look, write the config, verify it, and remind you that you can
+rerun the visual wizard if the first result doesn't match your taste. On PowerShell-only
+Windows, use the native archive flow below instead; the Bash playbook does not install
+`statusline.ps1`.
 
 If your Claude flags the playbook and wants to inspect things first, that is the right
 instinct, not an obstacle: see [Trust and security](#trust-and-security).
 
 ### Install it yourself
 
-Run the installer in your terminal:
+Run the Bash installer in your terminal:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Nanako0129/coralline/main/install.sh | bash
@@ -187,11 +192,69 @@ Then add to `~/.claude/settings.json`:
 > installers bundle every theme; after a manual install, copy the rest of
 > `~/.claude/coralline-src/themes/*.conf` into `~/.claude/coralline/themes/` to switch themes.
 
+### Windows without Git Bash
+
+`statusline.sh` needs a bash to run it, so a PowerShell-only Windows machine (no Git for
+Windows, no WSL) cannot use it at all — `install.sh` is itself a bash script. `statusline.ps1` is
+a native Windows PowerShell 5.1 port that needs neither: no bash, no `jq`, only `git.exe` on
+`PATH` for the `git`/`stash`/`project` segments (already required for those segments in the bash
+version too).
+
+It reads the exact same `~/.claude/coralline.conf` (and theme file) a bash install already
+wrote, so nothing about the config format changes; only the renderer is new. The native main
+bar supports the same segments, `pill`/`lean`/`classic` styles, `fixed`/`auto` layouts, burn
+history, limit sync, and float publication as the bash renderer. The `--subagent` panel-row
+protocol remains bash-only and exits without output in `statusline.ps1`.
+
+```powershell
+$download = Join-Path $env:TEMP ("coralline-" + [guid]::NewGuid())
+$archive = Join-Path $download "coralline-main.zip"
+New-Item -ItemType Directory -Force $download | Out-Null
+Invoke-WebRequest https://github.com/Nanako0129/coralline/archive/refs/heads/main.zip -UseBasicParsing -OutFile $archive
+Expand-Archive $archive -DestinationPath $download
+
+$source = Join-Path $download "coralline-main"
+$target = Join-Path $HOME ".claude\coralline"
+New-Item -ItemType Directory -Force (Join-Path $target "themes") | Out-Null
+$runtime = Join-Path $target "statusline.ps1"
+if (Test-Path -LiteralPath $runtime) {
+  Copy-Item -LiteralPath $runtime -Destination ($runtime + ".bak." + (Get-Date -Format "yyyyMMdd-HHmmss"))
+}
+Copy-Item (Join-Path $source "statusline.ps1") $runtime
+Copy-Item (Join-Path $source "themes\*.conf") (Join-Path $target "themes")
+Remove-Item $download -Recurse -Force
+```
+
+Then add to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/you/.claude/coralline/statusline.ps1\""
+  }
+}
+```
+
+Run the wizard-written config from a bash install, or write `~/.claude/coralline.conf` by hand
+(see any file under `themes/` for the shape); both work with `statusline.ps1` unchanged. The
+per-process `ExecutionPolicy Bypass` lets the unsigned local renderer start when the normal
+session default would otherwise be `Restricted`; it does not change any persisted policy, and
+an enforced Group Policy still takes precedence.
+
 ### Updating
 
-Two ways to update, both driven by the same installer. Either way your
+The two installer-driven routes below update Bash-based installs. Either way your
 `~/.claude/coralline.conf` is preserved and the previous `statusline.sh` is backed up
 under `~/.claude/coralline/` (the 3 newest are kept).
+
+#### PowerShell-only update
+
+On a machine without Bash, re-run the PowerShell archive block under
+[Windows without Git Bash](#windows-without-git-bash). The same block is also the native
+update path: it downloads the current `main` archive, backs up an existing
+`statusline.ps1` as `statusline.ps1.bak.<timestamp>`, refreshes the renderer and all themes,
+and leaves `~/.claude/coralline.conf` plus `settings.json` unchanged.
 
 #### Ask Claude (recommended)
 
@@ -246,7 +309,7 @@ that skepticism is inspection, not trust:
 
 ### Uninstall
 
-If you enabled themed subagent rows, remove their settings entry before deleting the tools:
+For a Bash-capable install, remove themed subagent rows before deleting the tools:
 
 ```bash
 bash ~/.claude/coralline/configure.sh --subagent-rows=off
@@ -256,10 +319,29 @@ rm -rf ~/.claude/coralline ~/.claude/coralline.conf
 Then delete the `statusLine` block from `~/.claude/settings.json` (or restore the newest
 `settings.json.bak.*`). If you skipped the first command, also delete `subagentStatusLine`.
 
+For a PowerShell-only native archive install, close Claude Code and back up the settings file:
+
+```powershell
+$settings = Join-Path $HOME '.claude\settings.json'
+Copy-Item -LiteralPath $settings -Destination "$settings.bak.$(Get-Date -Format yyyyMMddHHmmss)"
+notepad.exe $settings
+```
+
+In Notepad, delete the `statusLine` object whose command points to
+`~/.claude/coralline/statusline.ps1`. Also delete `subagentStatusLine` if its command points
+into coralline, then save valid JSON. Finally remove the installed runtime and optional config:
+
+```powershell
+Remove-Item -LiteralPath (Join-Path $HOME '.claude\coralline') -Recurse -Force
+Remove-Item -LiteralPath (Join-Path $HOME '.claude\coralline.conf') -Force -ErrorAction SilentlyContinue
+```
+
 ## Setup
 
-Both paths use the same installer. Humans run it with no mode and get the visual setup. Claude
-uses it with `--install-only`, then follows `INSTALL.md` to interview you and write config.
+Both Bash setup paths use the same installer. Humans run it with no mode and get the visual
+setup. Claude uses it with `--install-only`, then follows `INSTALL.md` to interview you and
+write config. The native PowerShell archive path does not install a PowerShell wizard; it reads
+the same `coralline.conf`, which can come from an existing Bash setup or be written manually.
 
 ### Setup modes
 
@@ -274,12 +356,15 @@ operate that TUI unless you explicitly ask for visual customization.
 
 ### Reconfigure
 
-Every install path copies the wizard into `~/.claude/coralline`, so you can rerun it anytime to
-restyle:
+Both Bash install paths copy the wizard into `~/.claude/coralline`, so Bash-capable users can
+rerun it anytime to restyle:
 
 ```bash
 bash ~/.claude/coralline/configure.sh
 ```
+
+PowerShell-only installs do not include a native wizard. Back up and edit
+`$HOME\.claude\coralline.conf` manually, or reuse a config produced on a Bash-capable host.
 
 ### Testing a fork
 
@@ -487,12 +572,11 @@ The wizard discovers themes automatically from `themes/*.conf` and nested collec
 | macOS | ✅ supported (works on the stock bash 3.2) |
 | Linux | ✅ supported |
 | Windows + Git Bash | ✅ supported — Claude Code runs the status line through Git Bash when it's installed |
-| Windows without Git Bash | ❌ not yet — Claude Code falls back to PowerShell, which can't run the bash script ([roadmap](https://github.com/Nanako0129/coralline/issues)) |
+| Windows without Git Bash | ✅ supported for the main bar through native Windows PowerShell 5.1 |
 
-> **Windows note:** install [Git for Windows](https://git-scm.com/download/win) (which bundles
-> Git Bash) and `jq`, and coralline runs natively. A native PowerShell port for the no-Git-Bash
-> case is on the roadmap. The render path is built to stay cheap under Git Bash's emulated
-> `fork()` — one `jq`, one `git`, and no per-field subprocess spawning.
+> **Windows note:** the native PowerShell renderer needs neither Git Bash nor `jq`. `git.exe`
+> is optional and only enables the `git`, `stash`, and `project` segments. The interactive
+> wizard and themed `--subagent` rows remain bash-only.
 
 ## Why it's fast
 

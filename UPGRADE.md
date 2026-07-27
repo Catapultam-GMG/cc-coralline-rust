@@ -4,6 +4,11 @@
 > backs up the old `statusline.sh` and never touches `~/.claude/coralline.conf`. It
 > only *reports* what is new; you enable the new opt-in features additively, with the
 > user's consent.
+>
+> This playbook updates Bash-based installs. On PowerShell-only Windows, do not run
+> `install.sh`; re-run the native archive procedure under
+> [Windows without Git Bash](README.md#windows-without-git-bash), which preserves
+> `coralline.conf` and `settings.json`.
 
 ## Overview
 
@@ -77,6 +82,11 @@ append the approved segments:
     VL_SEGMENTS="dir git model ctx limit5h limit7d cost clock <approved segments>"
 
 followed by one line per approved option.
+
+Before writing an existing `coralline.conf`, show the bounded additive diff and obtain
+explicit approval. Leave the file byte-for-byte unchanged when no change was approved.
+When a write is approved, create a timestamped byte-exact backup and replace through a
+sibling temporary file; never reorder, drop, or rewrite unrelated content.
 
 ## Verification
 
