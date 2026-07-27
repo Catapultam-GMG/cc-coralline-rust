@@ -439,16 +439,6 @@ state_same_path() {  # true for proven or platform-conservative store-root ident
   return 1
 }
 
-state_dir_empty() {
-  local child
-  [ -d "$1" ] && [ ! -L "$1" ] || return 1
-  for child in "$1"/* "$1"/.[!.]* "$1"/..?*; do
-    [ -e "$child" ] || [ -L "$child" ] || continue
-    return 1
-  done
-  return 0
-}
-
 state_burn_name() {  # → _SBN_* for one strict live basename
   local name="$1" pr ps pc LC_ALL=C
   _SBN_RST=""; _SBN_SAMP=""; _SBN_PCT=""; _SBN_SLOT=""
@@ -488,7 +478,7 @@ state_add_limit_path() {  # $1=5|7 $2=path $3=name
   if [ "$which" = 5 ]; then _SL5_RAW=$(( _SL5_RAW + 1 )); max=$RL_MAX_5H
   else _SL7_RAW=$(( _SL7_RAW + 1 )); max=$RL_MAX_7D; fi
   state_limit_name "$name" || return 0
-  state_dir_empty "$path" || return 0
+  [ -d "$path" ] && [ ! -L "$path" ] || return 0
   if [ "$_SLN_RST" -gt "$NOW" ] && [ "$_SLN_RST" -le $(( NOW + max )) ]; then plausible=1; fi
   if [ "$which" = 5 ]; then
     i=${#_SL5_NAMES[@]}; _SL5_NAMES[$i]="$name"; _SL5_PATHS[$i]="$path"
@@ -496,6 +486,19 @@ state_add_limit_path() {  # $1=5|7 $2=path $3=name
   else
     i=${#_SL7_NAMES[@]}; _SL7_NAMES[$i]="$name"; _SL7_PATHS[$i]="$path"
     _SL7_RSTS[$i]="$_SLN_RST"; _SL7_PCTS[$i]="$_SLN_PCT"; _SL7_PLAUS[$i]="$plausible"
+  fi
+}
+
+state_mark_limit_nonempty() {  # $1=5|7 $2=strict parent basename
+  local which="$1" name="$2" i
+  if [ "$which" = 5 ]; then
+    for ((i=0; i<${#_SL5_NAMES[@]}; i++)); do
+      [ "${_SL5_NAMES[$i]}" = "$name" ] && _SL5_PLAUS[$i]=0
+    done
+  else
+    for ((i=0; i<${#_SL7_NAMES[@]}; i++)); do
+      [ "${_SL7_NAMES[$i]}" = "$name" ] && _SL7_PLAUS[$i]=0
+    done
   fi
 }
 
@@ -517,7 +520,7 @@ state_snapshot() {  # one framed controller for every gated state root + legacy 
   _LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=()
   exec 9< <(
     if [ "${#_STATE_FIND_ARGS[@]}" -gt 0 ]; then
-      LC_ALL=C find -P "${_STATE_FIND_ARGS[@]}" ! -name . -prune -print0 2>/dev/null
+      LC_ALL=C find -P "${_STATE_FIND_ARGS[@]}" -mindepth 1 -maxdepth 2 -print0 2>/dev/null
       _sf=$?
     else
       _sf=0
@@ -604,6 +607,27 @@ state_snapshot() {  # one framed controller for every gated state root + legacy 
         [ "$phase" = paths ] || { bad=1; continue; }
         combined=$(( combined + 1 )); matched=0
         if [ "$_STATE_BURN_GATE" = 1 ]; then
+          case "$record" in ("$_SB_ROOT/./"*/*) matched=1 ;; esac
+        fi
+        if [ "$matched" -eq 0 ] && [ "$_STATE_RL5_GATE" = 1 ]; then
+          case "$record" in
+            ("$_SL5_ROOT/./"*/*)
+              name="${record#"$_SL5_ROOT/./"}"; name="${name%%/*}"
+              state_mark_limit_nonempty 5 "$name"; _SL5_CHILD_RAW=$(( _SL5_CHILD_RAW + 1 )); matched=1
+              [ "$_SL5_CHILD_RAW" -le 512 ] || stream_over=1
+              ;;
+          esac
+        fi
+        if [ "$matched" -eq 0 ] && [ "$_STATE_RL7_GATE" = 1 ]; then
+          case "$record" in
+            ("$_SL7_ROOT/./"*/*)
+              name="${record#"$_SL7_ROOT/./"}"; name="${name%%/*}"
+              state_mark_limit_nonempty 7 "$name"; _SL7_CHILD_RAW=$(( _SL7_CHILD_RAW + 1 )); matched=1
+              [ "$_SL7_CHILD_RAW" -le 512 ] || stream_over=1
+              ;;
+          esac
+        fi
+        if [ "$matched" -eq 0 ] && [ "$_STATE_BURN_GATE" = 1 ]; then
           case "$record" in ("$_SB_ROOT/./"*) name="${record#"$_SB_ROOT/./"}"; state_add_burn_path "$_SB_ROOT/$name" "$name"; matched=1 ;; esac
           [ "$_SB_RAW" -le 4096 ] || stream_over=1
         fi
@@ -794,7 +818,7 @@ state_revalidate_limit() {
   state_no_symlink_path "$root" || return 1
   [ "$_SNP" = "$root" ] && [ -d "$root" ] || return 1
   state_limit_name "$name" || return 1
-  state_dir_empty "$path"
+  [ -d "$path" ] && [ ! -L "$path" ]
 }
 
 state_gc() {
@@ -1032,8 +1056,8 @@ state_prepare() {  # one state snapshot/GC/publication/estimate pass per render
   fi
 
   _SB_NAMES=(); _SB_PATHS=(); _SB_RSTS=(); _SB_SAMPS=(); _SB_PCTS=(); _SB_PLAUS=(); _SB_RAW=0
-  _SL5_NAMES=(); _SL5_PATHS=(); _SL5_RSTS=(); _SL5_PCTS=(); _SL5_PLAUS=(); _SL5_RAW=0
-  _SL7_NAMES=(); _SL7_PATHS=(); _SL7_RSTS=(); _SL7_PCTS=(); _SL7_PLAUS=(); _SL7_RAW=0
+  _SL5_NAMES=(); _SL5_PATHS=(); _SL5_RSTS=(); _SL5_PCTS=(); _SL5_PLAUS=(); _SL5_RAW=0; _SL5_CHILD_RAW=0
+  _SL7_NAMES=(); _SL7_PATHS=(); _SL7_RSTS=(); _SL7_PCTS=(); _SL7_PLAUS=(); _SL7_RAW=0; _SL7_CHILD_RAW=0
   _STATE_FIND_ARGS=(); _STATE_LEGACY_READ=0
   _SB_DIR_PREOK=1; _SL5_DIR_PREOK=1; _SL7_DIR_PREOK=1; _LEG_PREOK=1
   _SB_DIR_COMPLETE=0; _SL5_COMPLETE=0; _SL7_COMPLETE=0; _LEG_COMPLETE=0; _SB_COMPLETE=0

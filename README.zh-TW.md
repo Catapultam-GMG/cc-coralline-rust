@@ -281,7 +281,7 @@ curl -fsSL https://raw.githubusercontent.com/Nanako0129/coralline/main/install.s
 
 ### 移除
 
-若曾啟用 subagent 列主題，請先移除對應設定，再刪除工具：
+若環境可使用 Bash，請先移除 subagent 列主題，再刪除工具：
 
 ```bash
 bash ~/.claude/coralline/configure.sh --subagent-rows=off
@@ -290,6 +290,23 @@ rm -rf ~/.claude/coralline ~/.claude/coralline.conf
 
 然後把 `~/.claude/settings.json` 裡的 `statusLine` 區塊刪掉（或還原最新的
 `settings.json.bak.*`）。若略過第一個指令，也要一併刪除 `subagentStatusLine`。
+
+若是僅有 PowerShell 的原生 archive 安裝，先關閉 Claude Code 並備份設定檔：
+
+```powershell
+$settings = Join-Path $HOME '.claude\settings.json'
+Copy-Item -LiteralPath $settings -Destination "$settings.bak.$(Get-Date -Format yyyyMMddHHmmss)"
+notepad.exe $settings
+```
+
+在記事本中刪除 command 指向 `~/.claude/coralline/statusline.ps1` 的 `statusLine`
+物件。若 `subagentStatusLine` 的 command 也指向 coralline，請一併刪除，並確認存檔後
+仍是有效 JSON。最後移除已安裝的 runtime 與選用設定檔：
+
+```powershell
+Remove-Item -LiteralPath (Join-Path $HOME '.claude\coralline') -Recurse -Force
+Remove-Item -LiteralPath (Join-Path $HOME '.claude\coralline.conf') -Force -ErrorAction SilentlyContinue
+```
 
 ## 設定
 

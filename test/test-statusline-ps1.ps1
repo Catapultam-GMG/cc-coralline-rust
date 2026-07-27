@@ -698,6 +698,16 @@ shell_quote "$CORALLINE_Q_VALUE"
     Check-Exact 'case-variant segment name stays unknown' $segmentCasePs $segmentCaseBash
     Check 'case-variant segment name renders nothing' ([string]::IsNullOrEmpty($segmentCasePs.Stdout))
 
+    $clockOffCaseConfig = New-Config 'case-sensitive-clock-off' @('VL_SEGMENTS=clock', 'VL_CLOCK=OFF', 'VL_CLOCK_SECONDS=0')
+    $clockOffCasePs = Invoke-Statusline (Json $basePayload) $clockOffCaseConfig @{} '' 5000
+    Check-Run 'PowerShell case-sensitive clock off value' $clockOffCasePs
+    Check 'case-variant OFF keeps the Bash 12h fallback' ((Plain $clockOffCasePs.Stdout) -match '\b(0[1-9]|1[0-2]):[0-5][0-9] (am|pm)\b')
+
+    $clock24CaseConfig = New-Config 'case-sensitive-clock-24h' @('VL_SEGMENTS=clock', 'VL_CLOCK=24H', 'VL_CLOCK_SECONDS=0')
+    $clock24CasePs = Invoke-Statusline (Json $basePayload) $clock24CaseConfig @{} '' 5000
+    Check-Run 'PowerShell case-sensitive clock 24h value' $clock24CasePs
+    Check 'case-variant 24H keeps the Bash 12h fallback' ((Plain $clock24CasePs.Stdout) -match '\b(0[1-9]|1[0-2]):[0-5][0-9] (am|pm)\b')
+
     $styleCaseConfig = New-Config 'case-sensitive-style-value' @('VL_SEGMENTS=model\ ctx', 'VL_CLOCK=off', 'VL_STYLE=CLASSIC')
     $styleCasePs = Invoke-Statusline (Json $basePayload) $styleCaseConfig @{} '' 5000
     $styleCaseBash = Invoke-BashStatusline (Json $basePayload) $styleCaseConfig @{}

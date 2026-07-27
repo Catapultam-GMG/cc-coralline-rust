@@ -289,6 +289,23 @@ state_prepare; count_entries "$CASE/limit5.d"; eq 'limit raw 384 never publishes
 CASE="$TMPD/limit513"; reset_state_case "$CASE"; _STATE_BURN_GATE=0; _STATE_RL7_GATE=0; make_dirs "$CASE/limit5.d" 513
 state_prepare; count_entries "$CASE/limit5.d"; eq 'limit cap+1 freezes store' "$_COUNT" 513
 
+# Limit entries are immutable empty directories. The controller streams one
+# bounded child layer so a poisoned canonical name cannot become stored state
+# or force Bash to materialize an unbounded glob.
+CASE="$TMPD/limit-nonempty"; reset_state_case "$CASE"; _STATE_BURN_GATE=0; _STATE_RL7_GATE=0
+mkdir -p "$CASE/limit5.d/0001015900_041.200"; : > "$CASE/limit5.d/0001015900_041.200/canary"
+state_prepare
+eq 'nonempty limit directory is not stored state' "$_SL5_STORED_VALID" 0
+eq 'nonempty limit directory blocks publication' "$_SL5_CLEAN" 0
+true_case 'nonempty limit directory is preserved' test -f "$CASE/limit5.d/0001015900_041.200/canary"
+
+CASE="$TMPD/limit-child-cap"; reset_state_case "$CASE"; _STATE_BURN_GATE=0; _STATE_RL7_GATE=0
+mkdir -p "$CASE/limit5.d/0001015900_041.200"; i=0
+while [ "$i" -lt 513 ]; do printf -v _N 'child%04d' "$i"; : > "$CASE/limit5.d/0001015900_041.200/$_N"; i=$((i + 1)); done
+state_prepare
+eq 'limit child cap+1 freezes store' "$_SL5_COMPLETE" 0
+true_case 'limit child cap+1 preserves poisoned directory' test -f "$CASE/limit5.d/0001015900_041.200/child0512"
+
 # Legacy byte/row/record caps and newest-512 valid-row ring.
 CASE="$TMPD/legacy-bounds"; reset_state_case "$CASE"; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0; CORALLINE_NO_SAMPLE=1
 LC_ALL=C awk 'BEGIN { for (i=0;i<4096;i++) { for(j=0;j<255;j++) printf "x"; printf "\n" } }' > "$BURN_FILE"

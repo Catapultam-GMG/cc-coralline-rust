@@ -300,7 +300,7 @@ that skepticism is inspection, not trust:
 
 ### Uninstall
 
-If you enabled themed subagent rows, remove their settings entry before deleting the tools:
+For a Bash-capable install, remove themed subagent rows before deleting the tools:
 
 ```bash
 bash ~/.claude/coralline/configure.sh --subagent-rows=off
@@ -309,6 +309,23 @@ rm -rf ~/.claude/coralline ~/.claude/coralline.conf
 
 Then delete the `statusLine` block from `~/.claude/settings.json` (or restore the newest
 `settings.json.bak.*`). If you skipped the first command, also delete `subagentStatusLine`.
+
+For a PowerShell-only native archive install, close Claude Code and back up the settings file:
+
+```powershell
+$settings = Join-Path $HOME '.claude\settings.json'
+Copy-Item -LiteralPath $settings -Destination "$settings.bak.$(Get-Date -Format yyyyMMddHHmmss)"
+notepad.exe $settings
+```
+
+In Notepad, delete the `statusLine` object whose command points to
+`~/.claude/coralline/statusline.ps1`. Also delete `subagentStatusLine` if its command points
+into coralline, then save valid JSON. Finally remove the installed runtime and optional config:
+
+```powershell
+Remove-Item -LiteralPath (Join-Path $HOME '.claude\coralline') -Recurse -Force
+Remove-Item -LiteralPath (Join-Path $HOME '.claude\coralline.conf') -Force -ErrorAction SilentlyContinue
+```
 
 ## Setup
 

@@ -1381,7 +1381,7 @@ function Format-Duration([double]$Ms, [bool]$IncludeSeconds) {
 
 function Get-ClockText {
     $now = Get-Date
-    if ($Cfg.VL_CLOCK -eq '24h') {
+    if ($Cfg.VL_CLOCK -ceq '24h') {
         if ($Cfg.VL_CLOCK_SECONDS -eq '1') { return $now.ToString('HH:mm:ss', $Invariant) }
         return $now.ToString('HH:mm', $Invariant)
     }
@@ -1953,7 +1953,7 @@ function Add-CostSegment {
 }
 
 function Add-ClockSegment {
-    if ($Cfg.VL_CLOCK -eq 'off') { return }
+    if ($Cfg.VL_CLOCK -ceq 'off') { return }
     $fg = Get-Fg $Cfg.VL_FG_TEXT
     Push-Segment $Cfg.VL_BG_CLOCK "${fg} $($G.Dot) $(Get-ClockText) "
 }
