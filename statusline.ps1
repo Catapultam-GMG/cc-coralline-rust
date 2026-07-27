@@ -236,7 +236,10 @@ function Decode-ShellWord([string]$Text, [bool]$PathContext) {
                 if ($ch -eq '$') {
                     if (-not $PathContext) { return [pscustomobject]@{ Success = $false; Value = '' } }
                     if ($Text.Substring($i).StartsWith('${HOME}', [System.StringComparison]::Ordinal)) { $i += 7 }
-                    elseif ($Text.Substring($i).StartsWith('$HOME', [System.StringComparison]::Ordinal)) { $i += 5 }
+                    elseif (
+                        $Text.Substring($i).StartsWith('$HOME', [System.StringComparison]::Ordinal) -and
+                        ($i + 5 -ge $Text.Length -or [string]$Text[$i + 5] -notmatch '[A-Za-z0-9_]')
+                    ) { $i += 5 }
                     else { return [pscustomobject]@{ Success = $false; Value = '' } }
                     if (-not (Add-Utf8Text $bytes $HomeDir)) { return [pscustomobject]@{ Success = $false; Value = '' } }
                     continue

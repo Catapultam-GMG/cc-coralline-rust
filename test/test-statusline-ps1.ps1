@@ -789,6 +789,16 @@ shell_quote "$CORALLINE_Q_VALUE"
     $homePrefixRun = Invoke-Statusline (Json $basePayload) $homePrefixConfig @{ HOME=$homeRoot; USERPROFILE=$homeRoot } '' 5000
     Check-Run 'PowerShell HOME variable boundary' $homePrefixRun
     Check 'longer HOME-prefixed variable cannot authorize float output' (-not [System.IO.File]::Exists($homePrefixFloat))
+    $quotedHomePrefixConfig = New-Config 'quoted-HOME-variable-boundary' @(
+        'VL_SEGMENTS=model',
+        'VL_CLOCK=off',
+        'VL_FLOAT=1',
+        'VL_FLOAT_SEGMENTS=model',
+        'VL_FLOAT_FILE="$HOME_BACKUP/float.txt"'
+    )
+    $quotedHomePrefixRun = Invoke-Statusline (Json $basePayload) $quotedHomePrefixConfig @{ HOME=$homeRoot; USERPROFILE=$homeRoot } '' 5000
+    Check-Run 'PowerShell quoted HOME variable boundary' $quotedHomePrefixRun
+    Check 'quoted longer HOME-prefixed variable cannot authorize float output' (-not [System.IO.File]::Exists($homePrefixFloat))
 
     $driveConfig = New-Config 'msys-root' @('VL_SEGMENTS=model', 'VL_CLOCK=off', 'VL_BG_MODEL=56')
     $drivePath = Forward-Path $driveConfig
