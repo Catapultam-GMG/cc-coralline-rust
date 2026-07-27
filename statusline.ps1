@@ -2,11 +2,10 @@
 <#
   coralline - native Windows PowerShell statusline for Claude Code.
 
-  This slice implements the fixed pill main bar without Bash, jq, WSL, or
-  PowerShell 7. Config is read from the same coralline.conf through a narrow,
-  non-executing Bash-word parser. Burn and synced limit state share the same
-  immutable store as Bash; alternate styles/layouts, float output, and subagent
-  rows are implemented by later slices.
+  This runtime implements the main bar and optional float producer without Bash,
+  jq, WSL, or PowerShell 7. Config is read from the same coralline.conf through a
+  narrow, non-executing Bash-word parser. Burn and synced limit state share the
+  same immutable store as Bash; subagent rows remain a later protocol slice.
 #>
 
 # Claude Code registers this exact literal. It must leave before stdin, config,
@@ -50,6 +49,7 @@ function Copy-Config([System.Collections.IDictionary]$Source) {
 $HomeDir = [string]$HOME
 if ([string]::IsNullOrEmpty($HomeDir)) { $HomeDir = [Environment]::GetFolderPath('UserProfile') }
 $ScriptDir = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path)
+$ScriptPath = [string]$MyInvocation.MyCommand.Path
 $DefaultFloatFile = [System.IO.Path]::Combine($HomeDir, '.claude\coralline\float.txt')
 $DefaultBurnFile = [string]$env:CORALLINE_BURN_FILE
 if ([string]::IsNullOrEmpty($DefaultBurnFile)) {
@@ -68,6 +68,7 @@ $Defaults = [ordered]@{
     VL_STYLE = 'pill'
     VL_LEAN_SEP = ''
     VL_LEAN_BG = ''
+    VL_LEAN_FG = ''
     VL_LEAN_CAP_R = ''
     VL_LEAN_CAP_L = ''
     VL_LAYOUT = 'fixed'
@@ -360,11 +361,19 @@ function Decode-ShellWord([string]$Text, [bool]$PathContext) {
     return [pscustomobject]@{ Success = $true; Value = $value }
 }
 
-function ConvertTo-LocalFullPath([string]$Path, [string]$BaseDir) {
-    if ([string]::IsNullOrEmpty($Path)) { return $null }
-    if ($Path -match '[\u0000-\u001f\u007f-\u009f]') { return $null }
-    if ($Path.StartsWith('\\', [System.StringComparison]::Ordinal) -or $Path.StartsWith('//', [System.StringComparison]::Ordinal)) { return $null }
-    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal) -or $Path.StartsWith('\\.\', [System.StringComparison]::Ordinal) -or $Path -match '^\\\x3f\x3f\\') { return $null }
+function Test-DosDeviceComponent([string]$Component) {
+    if ([string]::IsNullOrEmpty($Component)) { return $false }
+    $name = $Component.TrimEnd('.', ' ')
+    $dot = $name.IndexOf('.')
+    if ($dot -ge 0) { $name = $name.Substring(0, $dot) }
+    return $name -match '^(?i:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])$'
+}
+
+function Test-LocalPathSyntax([string]$Path, [ref]$Normalized) {
+    if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 4096) { return $false }
+    if ($Path -match '[\u0000-\u001f\u007f-\u009f]') { return $false }
+    if ($Path.StartsWith('\\', [System.StringComparison]::Ordinal) -or $Path.StartsWith('//', [System.StringComparison]::Ordinal)) { return $false }
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal) -or $Path.StartsWith('\\.\', [System.StringComparison]::Ordinal) -or $Path.StartsWith('//?/', [System.StringComparison]::Ordinal) -or $Path.StartsWith('//./', [System.StringComparison]::Ordinal)) { return $false }
 
     $p = $Path
     if ($p -match '^/([A-Za-z])(?:/|$)') {
@@ -372,17 +381,34 @@ function ConvertTo-LocalFullPath([string]$Path, [string]$BaseDir) {
         $p = $drive + ':\' + $p.Substring(2).TrimStart('/')
     }
     $p = $p.Replace('/', '\')
+    if ($p.StartsWith('\', [System.StringComparison]::Ordinal)) { return $false }
 
     $colon = $p.IndexOf(':')
-    if ($colon -ge 0) {
-        if ($colon -ne 1 -or $p.Length -lt 3 -or -not [char]::IsLetter($p[0]) -or $p[2] -ne '\' -or $p.IndexOf(':', 2) -ge 0) { return $null }
-    } elseif ($p.StartsWith('\', [System.StringComparison]::Ordinal)) { return $null }
+    if ($colon -ge 0 -and ($colon -ne 1 -or $p.Length -lt 3 -or -not [char]::IsLetter($p[0]) -or $p[2] -ne '\' -or $p.IndexOf(':', 2) -ge 0)) { return $false }
+    try { $root = [System.IO.Path]::GetPathRoot($p) } catch { return $false }
+    $rest = $p
+    if (-not [string]::IsNullOrEmpty($root)) { $rest = $p.Substring($root.Length) }
+    foreach ($component in $rest.Split(@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        if ($component -eq '.' -or $component -eq '..') { continue }
+        if ($component.EndsWith('.') -or $component.EndsWith(' ')) { return $false }
+        if ($component -match '[<>"\|\?\*:]') { return $false }
+        if (Test-DosDeviceComponent $component) { return $false }
+    }
+    $Normalized.Value = $p
+    return $true
+}
 
+function ConvertTo-LocalFullPath([string]$Path, [string]$BaseDir) {
+    if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 4096) { return $null }
+    $p = ''
+    $normalized = $null
+    if (-not (Test-LocalPathSyntax $Path ([ref]$normalized))) { return $null }
+    $p = $normalized
     try {
         if (-not [System.IO.Path]::IsPathRooted($p)) { $p = [System.IO.Path]::Combine($BaseDir, $p) }
         $full = [System.IO.Path]::GetFullPath($p)
     } catch { return $null }
-    if ($full.StartsWith('\\', [System.StringComparison]::Ordinal)) { return $null }
+    if ([string]::IsNullOrEmpty($full) -or $full.Length -gt 4096 -or $full.StartsWith('\\', [System.StringComparison]::Ordinal)) { return $null }
     return $full
 }
 
@@ -450,6 +476,7 @@ function Import-ConfigFile(
     if ($null -eq $text) { return $failed }
 
     $candidate = Copy-Config $BaseConfig
+    $rootFloatAuthorized = $false
     $stack = New-Object System.Collections.ArrayList
     $active = $true
     $valid = $true
@@ -513,10 +540,17 @@ function Import-ConfigFile(
         if ($statement -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
             $name = $Matches[1]
             $raw = $Matches[2]
-            $pathContext = $PathConfigKeys.Contains($name)
+            $pathContext = $PathConfigKeys.Contains($name) -or $name -ieq 'VL_FLOAT_FILE'
             $decoded = Decode-ShellWord $raw $pathContext
             if (-not $decoded.Success) { $valid = $false; break }
             if ($pathContext -and $decoded.Value -match '[ -\u007f-\u009f]') { $valid = $false; break }
+            if ($name -ieq 'VL_FLOAT_FILE') {
+                if ($Depth -eq 0 -and $name -ceq 'VL_FLOAT_FILE') {
+                    $candidate['VL_FLOAT_FILE'] = $decoded.Value
+                    $rootFloatAuthorized = $true
+                }
+                continue
+            }
             $candidate[$name] = $decoded.Value
             continue
         }
@@ -527,10 +561,11 @@ function Import-ConfigFile(
 
     if ($stack.Count -ne 0) { $valid = $false }
     if (-not $valid) { return $failed }
-    return [pscustomobject]@{ Success = $true; Config = $candidate }
+    return [pscustomobject]@{ Success = $true; Config = $candidate; FloatFileAuthorized = ($Depth -eq 0 -and $rootFloatAuthorized) }
 }
 
 $Cfg = Copy-Config $Defaults
+$FloatFileRootAuthorized = $false
 $ConfigInput = [string]$env:CORALLINE_CONFIG
 if ([string]::IsNullOrEmpty($ConfigInput)) { $ConfigInput = [System.IO.Path]::Combine($HomeDir, '.claude\coralline.conf') }
 $ConfigPath = ConvertTo-LocalFullPath $ConfigInput ([Environment]::CurrentDirectory)
@@ -542,7 +577,14 @@ if (-not [string]::IsNullOrEmpty($ConfigPath)) {
     $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $state = @{ IncludeCount = 0; Visited = $visited }
     $parsed = Import-ConfigFile $ConfigPath $Cfg $state 0 $approved
-    if ($parsed.Success) { $Cfg = $parsed.Config }
+    if ($parsed.Success) {
+        $Cfg = $parsed.Config
+        $FloatFileRootAuthorized = [bool]$parsed.FloatFileAuthorized
+    }
+}
+$ConfigVisitedPaths = @()
+if ($null -ne $visited) {
+    foreach ($visitedPath in $visited) { $ConfigVisitedPaths += [string]$visitedPath }
 }
 
 # Config never supplies terminal controls. The renderer is the sole ANSI source.
@@ -590,6 +632,8 @@ $Cfg.VL_NAME_MAX = [string](Get-BoundedInt $Cfg.VL_NAME_MAX ([int]$Defaults.VL_N
 $Cfg.VL_COST_DECIMALS = [string](Get-BoundedInt $Cfg.VL_COST_DECIMALS ([int]$Defaults.VL_COST_DECIMALS) 0 9)
 $Cfg.VL_WARN_PCT = [string](Get-BoundedInt $Cfg.VL_WARN_PCT ([int]$Defaults.VL_WARN_PCT) 0 100)
 $Cfg.VL_HOT_PCT = [string](Get-BoundedInt $Cfg.VL_HOT_PCT ([int]$Defaults.VL_HOT_PCT) 0 100)
+$Cfg.VL_MAX_LINES = [string](Get-BoundedInt $Cfg.VL_MAX_LINES ([int]$Defaults.VL_MAX_LINES) 1 64)
+$Cfg.VL_WRAP_MARGIN = [string](Get-BoundedInt $Cfg.VL_WRAP_MARGIN ([int]$Defaults.VL_WRAP_MARGIN) 0 32767)
 if ([int]$Cfg.VL_HOT_PCT -lt [int]$Cfg.VL_WARN_PCT) {
     $Cfg.VL_WARN_PCT = $Defaults.VL_WARN_PCT
     $Cfg.VL_HOT_PCT = $Defaults.VL_HOT_PCT
@@ -597,11 +641,22 @@ if ([int]$Cfg.VL_HOT_PCT -lt [int]$Cfg.VL_WARN_PCT) {
 foreach ($key in @($Cfg.Keys | Where-Object { $_ -like 'VL_BG_*' -or $_ -like 'VL_FG_*' })) {
     if (-not (Test-Color $Cfg[$key])) { $Cfg[$key] = $Defaults[$key] }
 }
+if (-not (Test-Color $Cfg.VL_LEAN_BG)) { $Cfg.VL_LEAN_BG = '' }
+if (-not (Test-Color $Cfg.VL_LEAN_FG)) { $Cfg.VL_LEAN_FG = '' }
 
-# Later slices add the other styles/layout. Existing configs degrade predictably.
-if ($Cfg.VL_STYLE -ne 'pill') { $Cfg.VL_STYLE = 'pill' }
-if ($Cfg.VL_LAYOUT -ne 'fixed') { $Cfg.VL_LAYOUT = 'fixed' }
+$Cfg.VL_STYLE = switch ([string]$Cfg.VL_STYLE) {
+    'pill' { 'pill'; break }
+    'lean' { 'lean'; break }
+    'classic' { 'classic'; break }
+    default { 'pill' }
+}
+$Cfg.VL_LAYOUT = switch ([string]$Cfg.VL_LAYOUT) {
+    'fixed' { 'fixed'; break }
+    'auto' { 'auto'; break }
+    default { 'fixed' }
+}
 
+# Bash applies ASCII first, then classic's lean defaults, then lean overrides.
 if ($Cfg.VL_ASCII -eq '1') {
     $Cfg.VL_CAP_L = ''
     $Cfg.VL_CAP_R = ''
@@ -610,6 +665,16 @@ if ($Cfg.VL_ASCII -eq '1') {
     $Cfg.VL_BAR_EMPTY = '-'
     $Cfg.VL_NODE_GLYPH = 'node'
     $Cfg.VL_PY_GLYPH = 'py'
+}
+if ($Cfg.VL_STYLE -eq 'classic') {
+    $Cfg.VL_STYLE = 'lean'
+    if ([string]::IsNullOrEmpty($Cfg.VL_LEAN_BG)) { $Cfg.VL_LEAN_BG = if ([string]::IsNullOrEmpty($Cfg.VL_BG_BAR)) { '238' } else { $Cfg.VL_BG_BAR } }
+    if ([string]::IsNullOrEmpty($Cfg.VL_LEAN_CAP_R)) { $Cfg.VL_LEAN_CAP_R = $Cfg.VL_SEP }
+}
+if ($Cfg.VL_STYLE -eq 'lean') {
+    $Cfg.VL_CAP_L = ''
+    $Cfg.VL_CAP_R = ''
+    $Cfg.VL_FG_TEXT = $Cfg.VL_LEAN_FG
 }
 
 $NoColor = $Cfg.VL_NOCOLOR -eq '1'
@@ -1522,7 +1587,7 @@ function Read-PinFile([string]$Path) {
     } catch { return '' }
 }
 
-function Get-NodeVersion([string]$Dir) {
+function Get-NodeVersion-Uncached([string]$Dir) {
     if ([string]::IsNullOrEmpty($Dir)) { return '' }
     try { $d = New-Object System.IO.DirectoryInfo($Dir) } catch { $d = $null }
     while ($null -ne $d) {
@@ -1545,7 +1610,7 @@ function Get-NodeVersion([string]$Dir) {
     return ''
 }
 
-function Get-PythonVersion([string]$Dir) {
+function Get-PythonVersion-Uncached([string]$Dir) {
     $venv = Remove-ControlChars ([string]$env:VIRTUAL_ENV)
     if (-not [string]::IsNullOrEmpty($venv)) {
         try { return [System.IO.Path]::GetFileName($venv.TrimEnd('\', '/')) } catch { }
@@ -1573,19 +1638,65 @@ function Get-PythonVersion([string]$Dir) {
     return ''
 }
 
+$script:StashCacheSet = $false
+$script:StashCache = 0
+$script:NodeCacheSet = $false
+$script:NodeCache = ''
+$script:PythonCacheSet = $false
+$script:PythonCache = ''
+
+function Get-StashCount-Cached([string]$Cwd) {
+    if (-not $script:StashCacheSet) {
+        $script:StashCache = Get-StashCount $Cwd
+        $script:StashCacheSet = $true
+    }
+    return [int]$script:StashCache
+}
+
+function Get-NodeVersion([string]$Dir) {
+    if (-not $script:NodeCacheSet) {
+        $script:NodeCache = [string](Get-NodeVersion-Uncached $Dir)
+        $script:NodeCacheSet = $true
+    }
+    return [string]$script:NodeCache
+}
+
+function Get-PythonVersion([string]$Dir) {
+    if (-not $script:PythonCacheSet) {
+        $script:PythonCache = [string](Get-PythonVersion-Uncached $Dir)
+        $script:PythonCacheSet = $true
+    }
+    return [string]$script:PythonCache
+}
+
 function Get-SegmentTokens([string]$List) {
     if ([string]::IsNullOrWhiteSpace($List)) { return @() }
     return @([regex]::Split($List.Trim(), '\s+') | Where-Object { -not [string]::IsNullOrEmpty($_) })
 }
 
-$AllSegmentNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
-foreach ($list in @($Cfg.VL_SEGMENTS, $Cfg.VL_SEGMENTS2, $Cfg.VL_SEGMENTS3)) {
-    foreach ($name in (Get-SegmentTokens $list)) { [void]$AllSegmentNames.Add($name) }
+$MainSegmentNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+$MainSegmentLists = @([string]$Cfg.VL_SEGMENTS, [string]$Cfg.VL_SEGMENTS2, [string]$Cfg.VL_SEGMENTS3)
+foreach ($list in $MainSegmentLists) {
+    foreach ($name in (Get-SegmentTokens $list)) { [void]$MainSegmentNames.Add($name) }
+}
+$FloatSegmentNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+$FloatTokens = @(Get-SegmentTokens ([string]$Cfg.VL_FLOAT_SEGMENTS))
+$FloatEnabled = $Cfg.VL_FLOAT -eq '1' -and ([string]$Cfg.VL_FLOAT_SEGMENTS).Length -le 4096 -and $FloatTokens.Count -le 64 -and ([string]$Cfg.VL_FLOAT_SEP).Length -le 256
+if ($FloatEnabled) { foreach ($name in $FloatTokens) { [void]$FloatSegmentNames.Add($name) } }
+$ProbeSegmentNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+foreach ($name in $MainSegmentNames) { [void]$ProbeSegmentNames.Add($name) }
+foreach ($name in $FloatSegmentNames) { [void]$ProbeSegmentNames.Add($name) }
+
+# Collision derivation is lexical only and runs even when all state gates are off.
+$AllStatePaths = New-Object 'System.Collections.Generic.List[object]'
+foreach ($base in @($Cfg.BURN_FILE, $Cfg.RL5H_FILE, $Cfg.RL7D_FILE)) {
+    $statePath = Get-StatePaths $base
+    if ($null -ne $statePath) { [void]$AllStatePaths.Add($statePath) }
 }
 
-$BurnStateGate = $AllSegmentNames.Contains('burn')
-$Limit5StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and $AllSegmentNames.Contains('limit5h')
-$Limit7StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and ($AllSegmentNames.Contains('limit7d') -or $BurnStateGate)
+$BurnStateGate = $ProbeSegmentNames.Contains('burn')
+$Limit5StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and $ProbeSegmentNames.Contains('limit5h')
+$Limit7StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and ($ProbeSegmentNames.Contains('limit7d') -or $BurnStateGate)
 $State = $null
 if ($BurnStateGate -or $Limit5StateGate -or $Limit7StateGate) {
     $State = Get-CorallineState $BurnStateGate $Limit5StateGate $Limit7StateGate
@@ -1593,16 +1704,51 @@ if ($BurnStateGate -or $Limit5StateGate -or $Limit7StateGate) {
 
 $GitState = @{ Branch = ''; Marks = ''; Ab = ''; Dirty = $false }
 $GitRoot = ''
-if ($AllSegmentNames.Contains('git') -or $AllSegmentNames.Contains('stash') -or $AllSegmentNames.Contains('project')) {
+if ($ProbeSegmentNames.Contains('git') -or $ProbeSegmentNames.Contains('stash') -or $ProbeSegmentNames.Contains('project')) {
     $GitState = Get-GitState $ProbeCwd
 }
-if ($AllSegmentNames.Contains('project') -and -not [string]::IsNullOrEmpty($GitState.Branch)) { $GitRoot = Get-GitRoot $ProbeCwd }
+if ($ProbeSegmentNames.Contains('project') -and -not [string]::IsNullOrEmpty($GitState.Branch)) { $GitRoot = Get-GitRoot $ProbeCwd }
 
 $SegBgs = New-Object System.Collections.Generic.List[string]
 $SegTxt = New-Object System.Collections.Generic.List[string]
+$SegLen = New-Object 'System.Collections.Generic.List[int]'
+
+function Remove-Sgr([string]$Value) {
+    if ([string]::IsNullOrEmpty($Value)) { return '' }
+    return [regex]::Replace($Value, ([string][char]27 + '\[[0-9;]*m'), '')
+}
+
+function Get-DisplayWidth([string]$Value) {
+    $plain = Remove-Sgr $Value
+    $width = 0
+    $i = 0
+    while ($i -lt $plain.Length) {
+        $advance = 1
+        try {
+            $cp = [char]::ConvertToUtf32($plain, $i)
+            if ([char]::IsHighSurrogate($plain[$i])) { $advance = 2 }
+        } catch {
+            $cp = 0xFFFD
+        }
+        if ($cp -ge 0x300 -and $cp -le 0x36F -or $cp -ge 0x200B -and $cp -le 0x200F -or $cp -ge 0xFE00 -and $cp -le 0xFE0F) {
+            $i += $advance
+            continue
+        }
+        if ($cp -ge 0x1100 -and $cp -le 0x115F -or $cp -ge 0x2E80 -and $cp -le 0xA4CF -or $cp -ge 0xAC00 -and $cp -le 0xD7A3 -or $cp -ge 0xF900 -and $cp -le 0xFAFF -or $cp -ge 0xFE10 -and $cp -le 0xFE19 -or $cp -ge 0xFE30 -and $cp -le 0xFE6F -or $cp -ge 0xFF00 -and $cp -le 0xFF60 -or $cp -ge 0xFFE0 -and $cp -le 0xFFE6 -or $cp -ge 0x1F300 -and $cp -le 0x1FAFF -or $cp -ge 0x20000 -and $cp -le 0x3FFFF) {
+            $width += 2
+        } else {
+            $width++
+        }
+        $i += $advance
+    }
+    return $width
+}
+
 function Push-Segment([string]$Bg, [string]$Text) {
     [void]$SegBgs.Add($Bg)
     [void]$SegTxt.Add($Text)
+    if ($Cfg.VL_LAYOUT -eq 'auto') { [void]$SegLen.Add((Get-DisplayWidth $Text)) }
+    else { [void]$SegLen.Add(0) }
 }
 
 function Add-DirSegment {
@@ -1615,7 +1761,7 @@ function Add-DirSegment {
 
 function Add-ProjectSegment {
     if ([string]::IsNullOrEmpty($GitRoot)) {
-        if (-not $AllSegmentNames.Contains('dir')) { Add-DirSegment }
+        if (-not $MainSegmentNames.Contains('dir')) { Add-DirSegment }
         return
     }
     $tr = Get-Trunc $GitRoot ([int]$Cfg.VL_NAME_MAX)
@@ -1636,7 +1782,7 @@ function Add-GitSegment {
 
 function Add-StashSegment {
     if ([string]::IsNullOrEmpty($GitState.Branch)) { return }
-    $count = Get-StashCount $ProbeCwd
+    $count = Get-StashCount-Cached $ProbeCwd
     if ($count -le 0) { return }
     $fg = Get-Fg $Cfg.VL_FG_TEXT
     $bg = $Cfg.VL_BG_STASH
@@ -1827,29 +1973,249 @@ $SegmentBuilders = [ordered]@{
 function Build-Segments([string]$List) {
     $SegBgs.Clear()
     $SegTxt.Clear()
+    $SegLen.Clear()
     foreach ($name in (Get-SegmentTokens $List)) {
         if ($SegmentBuilders.Contains($name)) { & $SegmentBuilders[$name] }
     }
 }
 
-function Render-Row {
-    if ($SegBgs.Count -eq 0) { return '' }
-    $out = $Rst + (Get-Fg $SegBgs[0]) + $Cfg.VL_CAP_L
-    for ($i = 0; $i -lt $SegBgs.Count; $i++) {
+function Render-Range([int]$Start, [int]$End) {
+    if ($SegBgs.Count -eq 0 -or $Start -lt 0 -or $End -lt $Start -or $End -ge $SegBgs.Count) { return '' }
+    if ($Cfg.VL_STYLE -eq 'lean') {
+        $lbg = ''
+        if (-not [string]::IsNullOrEmpty($Cfg.VL_LEAN_BG)) { $lbg = Get-Bg $Cfg.VL_LEAN_BG }
+        $out = ''
+        if (-not [string]::IsNullOrEmpty($lbg) -and -not [string]::IsNullOrEmpty($Cfg.VL_LEAN_CAP_L)) {
+            $out = $Rst + (Get-Fg $Cfg.VL_LEAN_BG) + $Cfg.VL_LEAN_CAP_L
+        }
+        for ($i = $Start; $i -le $End; $i++) {
+            $out += $Rst + $lbg + (Get-Fg $SegBgs[$i]) + $SegTxt[$i]
+            if ($i -lt $End) { $out += $Rst + $lbg + $Cfg.VL_LEAN_SEP }
+        }
+        if (-not [string]::IsNullOrEmpty($lbg) -and -not [string]::IsNullOrEmpty($Cfg.VL_LEAN_CAP_R)) {
+            $out += $Rst + (Get-Fg $Cfg.VL_LEAN_BG) + $Cfg.VL_LEAN_CAP_R
+        }
+        return $out + $Rst
+    }
+    $out = $Rst + (Get-Fg $SegBgs[$Start]) + $Cfg.VL_CAP_L
+    for ($i = $Start; $i -le $End; $i++) {
         $out += (Get-Bg $SegBgs[$i]) + $SegTxt[$i]
-        if ($i -lt ($SegBgs.Count - 1)) {
+        if ($i -lt $End) {
             $out += (Get-Bg $SegBgs[$i + 1]) + (Get-Fg $SegBgs[$i]) + $Cfg.VL_SEP
         }
     }
-    $out += $Rst + (Get-Fg $SegBgs[$SegBgs.Count - 1]) + $Cfg.VL_CAP_R + $Rst
+    $out += $Rst + (Get-Fg $SegBgs[$End]) + $Cfg.VL_CAP_R + $Rst
     return $out
 }
 
+function Get-ScalarCount([string]$Value) {
+    if ([string]::IsNullOrEmpty($Value)) { return 0 }
+    $count = 0
+    $i = 0
+    while ($i -lt $Value.Length) {
+        if ([char]::IsHighSurrogate($Value[$i]) -and $i + 1 -lt $Value.Length -and [char]::IsLowSurrogate($Value[$i + 1])) { $i++ }
+        $count++
+        $i++
+    }
+    return $count
+}
+
+function Test-FloatCollision([string]$Target) {
+    $runtime = ''
+    try { $runtime = [IO.Path]::GetFullPath($ScriptPath) } catch { }
+    $collisionPaths = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($path in @($ConfigPath, $runtime)) { if (-not [string]::IsNullOrEmpty($path)) { [void]$collisionPaths.Add($path) } }
+    foreach ($path in $ConfigVisitedPaths) { if (-not [string]::IsNullOrEmpty([string]$path)) { [void]$collisionPaths.Add([string]$path) } }
+    foreach ($statePath in $AllStatePaths) {
+        if ($null -eq $statePath) { continue }
+        foreach ($path in @($statePath.Base, $statePath.Root)) { if (-not [string]::IsNullOrEmpty($path)) { [void]$collisionPaths.Add($path) } }
+    }
+    foreach ($path in $collisionPaths) {
+        if ($Target.Equals([string]$path, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Get-FloatTarget {
+    if (-not $FloatEnabled) { return $null }
+    if ($FloatFileRootAuthorized -and [string]::IsNullOrEmpty([string]$Cfg.VL_FLOAT_FILE)) { return $null }
+    if (([string]$Cfg.VL_FLOAT_FILE).Length -gt 4096) { return $null }
+    $target = ConvertTo-LocalFullPath ([string]$Cfg.VL_FLOAT_FILE) ([Environment]::CurrentDirectory)
+    if ([string]::IsNullOrEmpty($target) -or (Test-FloatCollision $target)) { return $null }
+    return $target
+}
+
+function Write-FloatAtomic([string]$Target, [byte[]]$Bytes) {
+    $parent = $null
+    try { $parent = [IO.Path]::GetDirectoryName($Target) } catch { return $false }
+    if ([string]::IsNullOrEmpty($parent) -or -not (Test-NoReparseComponents $parent)) { return $false }
+    try {
+        # WIN03_TEST_BEFORE_PARENT_CREATE
+        if (-not [IO.Directory]::Exists($parent)) { [void][IO.Directory]::CreateDirectory($parent) }
+    } catch { return $false }
+    # WIN03_TEST_AFTER_PARENT_CREATE
+    if (-not (Test-NoReparseComponents $parent) -or -not [IO.Directory]::Exists($parent)) { return $false }
+    if ((Test-StateObjectExists $Target) -and -not (Test-SafeRegularFile $Target)) { return $false }
+
+    $temp = ''
+    $backup = ''
+    try {
+        for ($attempt = 0; $attempt -lt 8; $attempt++) {
+            $candidate = [IO.Path]::Combine($parent, '.float.tmp.' + [string]$PID + '.' + [guid]::NewGuid().ToString('N'))
+            if ($candidate.Length -gt 4096) { return $false }
+            $stream = $null
+            try {
+                $stream = New-Object IO.FileStream($candidate, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+                if ($Bytes.Length -gt 0) { $stream.Write($Bytes, 0, $Bytes.Length) }
+                $stream.Flush($true)
+                $stream.Dispose()
+                $stream = $null
+                # WIN03_TEST_AFTER_TEMP_CLOSE
+                $temp = $candidate
+                break
+            } catch [IO.IOException] {
+                if ($null -ne $stream) { $stream.Dispose() }
+            } catch {
+                if ($null -ne $stream) { $stream.Dispose() }
+                return $false
+            }
+        }
+        if ([string]::IsNullOrEmpty($temp)) { return $false }
+        if (-not (Test-NoReparseComponents $parent)) { return $false }
+        if (Test-StateObjectExists $Target) {
+            if (-not (Test-SafeRegularFile $Target)) { return $false }
+            for ($attempt = 0; $attempt -lt 8; $attempt++) {
+                $backup = [IO.Path]::Combine($parent, '.float.bak.' + [string]$PID + '.' + [guid]::NewGuid().ToString('N'))
+                if ($backup.Length -gt 4096) { $backup = ''; return $false }
+                if (-not (Test-StateObjectExists $backup)) { break }
+                $backup = ''
+            }
+            if ([string]::IsNullOrEmpty($backup)) { return $false }
+            [IO.File]::Replace($temp, $Target, $backup)
+            if (Test-SafeRegularFile $backup) { [IO.File]::Delete($backup); $backup = '' }
+            elseif (-not (Test-StateObjectExists $backup)) { $backup = '' }
+        } else {
+            [IO.File]::Move($temp, $Target)
+        }
+        $temp = ''
+        return $true
+    } catch { return $false }
+    finally {
+        foreach ($path in @($temp, $backup)) {
+            if (-not [string]::IsNullOrEmpty($path)) {
+                try {
+                    if (Test-SafeRegularFile $path) { [IO.File]::Delete($path) }
+                } catch { }
+            }
+        }
+    }
+}
+
+function Test-FloatText([string]$Value) {
+    if ($null -eq $Value) { return $false }
+    foreach ($ch in $Value.ToCharArray()) {
+        $code = [int][char]$ch
+        if ($code -lt 0x20 -or $code -eq 0x7F -or $code -ge 0x80 -and $code -le 0x9F -or $code -eq 0x1B) { return $true }
+    }
+    return $false
+}
+
+function Invoke-Float {
+    if (-not $FloatEnabled) { return }
+    $target = Get-FloatTarget
+    if ([string]::IsNullOrEmpty($target)) { return }
+    $oldNoColor = $NoColor
+    $oldBold = $Bold
+    $oldNorm = $Norm
+    $oldRst = $Rst
+    $oldLayout = $Cfg.VL_LAYOUT
+    try {
+        $NoColor = $true
+        $Bold = ''
+        $Norm = ''
+        $Rst = ''
+        $Cfg.VL_LAYOUT = 'fixed'
+        Build-Segments ([string]$Cfg.VL_FLOAT_SEGMENTS)
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = 0; $i -lt $SegTxt.Count; $i++) {
+            $plain = (Remove-Sgr ([string]$SegTxt[$i])).Trim()
+            if ([string]::IsNullOrEmpty($plain)) { continue }
+            if (Test-FloatText $plain) { return }
+            [void]$parts.Add($plain)
+        }
+        $line = [string]::Join([string]$Cfg.VL_FLOAT_SEP, $parts.ToArray())
+        if (Test-FloatText $line) { return }
+        $payload = $line + "`n"
+        $bytes = $StrictUtf8.GetBytes($payload)
+        if ($bytes.Length -gt 65536) { return }
+        [void](Write-FloatAtomic $target $bytes)
+    } catch { }
+    finally {
+        $NoColor = $oldNoColor
+        $Bold = $oldBold
+        $Norm = $oldNorm
+        $Rst = $oldRst
+        $Cfg.VL_LAYOUT = $oldLayout
+    }
+}
+
+function Get-TerminalColumns {
+    $raw = [string]$env:COLUMNS
+    if (-not [string]::IsNullOrEmpty($raw)) {
+        if ($raw -notmatch '^([0-9]+)$') { return 0 }
+        $value = 0
+        if (-not [int]::TryParse($raw, $IntegerStyle, $Invariant, [ref]$value) -or $value -lt 1 -or $value -gt 32767) { return 0 }
+        return $value
+    }
+    if ($Host.Name -ne 'ConsoleHost') { return 0 }
+    try {
+        $value = [int]$Host.UI.RawUI.WindowSize.Width
+        if ($value -ge 1 -and $value -le 32767) { return $value }
+    } catch { }
+    return 0
+}
+
 try {
-    foreach ($list in @($Cfg.VL_SEGMENTS, $Cfg.VL_SEGMENTS2, $Cfg.VL_SEGMENTS3)) {
-        if ([string]::IsNullOrWhiteSpace($list)) { continue }
-        Build-Segments $list
-        if ($SegBgs.Count -gt 0) { $OutputWriter.WriteLine((Render-Row)) }
+    Invoke-Float
+    if ($Cfg.VL_LAYOUT -eq 'auto') {
+        Build-Segments ([string]$Cfg.VL_SEGMENTS)
+        $total = $SegBgs.Count
+        if ($total -gt 0) {
+            $width = Get-TerminalColumns
+            $maxLines = [int]$Cfg.VL_MAX_LINES
+            if ($width -le 0 -or $maxLines -le 1) {
+                $OutputWriter.WriteLine((Render-Range 0 ($total - 1)))
+            } else {
+                $width -= [int]$Cfg.VL_WRAP_MARGIN
+                if ($width -lt 1) { $width = 1 }
+                if ($Cfg.VL_STYLE -eq 'lean') {
+                    $capWidth = (Get-ScalarCount $Cfg.VL_LEAN_CAP_L) + (Get-ScalarCount $Cfg.VL_LEAN_CAP_R)
+                    $sepWidth = Get-ScalarCount $Cfg.VL_LEAN_SEP
+                } else {
+                    $capWidth = 2
+                    $sepWidth = 1
+                }
+                $start = 0
+                $line = 1
+                $current = $capWidth + [int]$SegLen[0]
+                for ($i = 1; $i -lt $total; $i++) {
+                    $need = $current + $sepWidth + [int]$SegLen[$i]
+                    if ($need -gt $width -and $line -lt $maxLines) {
+                        $OutputWriter.WriteLine((Render-Range $start ($i - 1)))
+                        $start = $i
+                        $line++
+                        $current = $capWidth + [int]$SegLen[$i]
+                    } else { $current = $need }
+                }
+                $OutputWriter.WriteLine((Render-Range $start ($total - 1)))
+            }
+        }
+    } else {
+        foreach ($list in $MainSegmentLists) {
+            if ([string]::IsNullOrWhiteSpace($list)) { continue }
+            Build-Segments $list
+            if ($SegBgs.Count -gt 0) { $OutputWriter.WriteLine((Render-Range 0 ($SegBgs.Count - 1))) }
+        }
     }
 } finally {
     $OutputWriter.Flush()

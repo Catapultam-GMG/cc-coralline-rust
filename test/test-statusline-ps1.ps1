@@ -19,7 +19,7 @@ $PowerShellExe = (Get-Process -Id $PID).Path
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
 $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
-$TempRoot = Join-Path $Repo ('.win01-test-' + [guid]::NewGuid().ToString('N'))
+$TempRoot = Join-Path ([IO.Path]::GetTempPath()) ('coralline-win01-test-' + [guid]::NewGuid().ToString('N'))
 $script:Fail = 0
 $script:Pass = 0
 $script:Blocked = 0
@@ -156,13 +156,20 @@ function Wait-CapturedProcessAsync($Handle, [int]$TimeoutMs) {
     [void]$Handle.OutTask.Wait(2000); [void]$Handle.ErrTask.Wait(2000)
     $exitCode = -1
     if (-not $timedOut -and $Handle.Process.HasExited) { $exitCode = $Handle.Process.ExitCode }
-    $result = [pscustomobject]@{ ExitCode=$exitCode; TimedOut=$timedOut; StdoutBytes=$Handle.Stdout.ToArray(); StderrBytes=$Handle.Stderr.ToArray() }
+    $stdoutBytes = $Handle.Stdout.ToArray()
+    $stderrBytes = $Handle.Stderr.ToArray()
+    try { $stdoutText = $StrictUtf8.GetString($stdoutBytes) } catch { $stdoutText = $null }
+    try { $stderrText = $StrictUtf8.GetString($stderrBytes) } catch { $stderrText = $null }
+    $result = [pscustomobject]@{ ExitCode=$exitCode; TimedOut=$timedOut; StdoutBytes=$stdoutBytes; StderrBytes=$stderrBytes; Stdout=$stdoutText; Stderr=$stderrText }
     $Handle.Process.Dispose(); $Handle.Stdout.Dispose(); $Handle.Stderr.Dispose()
     return $result
 }
 
 function Runtime-Environment([string]$ConfigPath, [hashtable]$Extra) {
+    $runtimeHome = Join-Path $TempRoot 'runtime-home'
     $environment = @{
+        HOME = Forward-Path $runtimeHome
+        USERPROFILE = $runtimeHome
         CORALLINE_CONFIG = $null
         CORALLINE_NO_SAMPLE = '1'
         CORALLINE_TEST_NOW = $null
@@ -183,7 +190,9 @@ function Invoke-Statusline(
     [int]$TimeoutMs
 ) {
     $runtimeScript = $Script
-    if ($ExtraEnvironment.ContainsKey('CORALLINE_TEST_NOW') -and $null -ne $ExtraEnvironment.CORALLINE_TEST_NOW) { $runtimeScript = $script:StateScript }
+    if ($ExtraEnvironment.ContainsKey('CORALLINE_TEST_WIDTH_SCRIPT') -and $null -ne $ExtraEnvironment.CORALLINE_TEST_WIDTH_SCRIPT) { $runtimeScript = $script:WidthScript }
+    elseif ($ExtraEnvironment.ContainsKey('CORALLINE_TEST_FLOAT_SCRIPT') -and $null -ne $ExtraEnvironment.CORALLINE_TEST_FLOAT_SCRIPT) { $runtimeScript = $script:FloatScript }
+    elseif ($ExtraEnvironment.ContainsKey('CORALLINE_TEST_NOW') -and $null -ne $ExtraEnvironment.CORALLINE_TEST_NOW) { $runtimeScript = $script:StateScript }
     $psArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $runtimeScript + '"'
     if (-not [string]::IsNullOrEmpty($Arguments)) { $psArgs += ' ' + $Arguments }
     return Invoke-CapturedProcess $PowerShellExe $psArgs $Json (Runtime-Environment $ConfigPath $ExtraEnvironment) $Repo $TimeoutMs
@@ -355,6 +364,41 @@ function Assert-NoUnexpectedResidue([string]$Root, [string]$Name) {
     Check "$Name no runtime residue" ($bad.Count -eq 0)
 }
 
+function New-FloatConfig([string]$Name, [string]$Target, [string]$Segments, [string]$Separator, [string[]]$Extra) {
+    $lines = @(('VL_SEGMENTS=' + (Quote-FromConfigure 'model ctx cost')), 'VL_CLOCK=off', 'VL_FLOAT=1', ('VL_FLOAT_SEGMENTS=' + (Quote-FromConfigure $Segments)), ('VL_FLOAT_FILE=' + (Quote-FromConfigure $Target)), ('VL_FLOAT_SEP=' + (Quote-FromConfigure $Separator)))
+    if ($null -ne $Extra) { $lines += $Extra }
+    return New-Config $Name $lines
+}
+
+function Invoke-Float([string]$Json, [string]$ConfigPath, [hashtable]$Extra) {
+    return Invoke-Statusline $Json $ConfigPath $Extra '' 10000
+}
+
+function Wait-Ready([string]$Barrier, [int]$TimeoutMs) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.ElapsedMilliseconds -lt $TimeoutMs) {
+        if (@([IO.Directory]::GetFiles([IO.Path]::GetDirectoryName($Barrier), ([IO.Path]::GetFileName($Barrier) + '.*.ready'))).Count -gt 0) { return $true }
+        Start-Sleep -Milliseconds 10
+    }
+    return $false
+}
+
+function Float-Bytes([string]$Path) {
+    if (-not [IO.File]::Exists($Path)) { return $null }
+    return [IO.File]::ReadAllBytes($Path)
+}
+
+function Bytes-Same([byte[]]$Left, [byte[]]$Right) {
+    if ($null -eq $Left -or $null -eq $Right -or $Left.Length -ne $Right.Length) { return $false }
+    for ($i=0; $i -lt $Left.Length; $i++) { if ($Left[$i] -ne $Right[$i]) { return $false } }
+    return $true
+}
+
+function Start-FloatAsync([string]$Json, [string]$ConfigPath, [hashtable]$Extra) {
+    $psArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $script:FloatScript + '"'
+    return Start-CapturedProcessAsync $PowerShellExe $psArgs $Json (Runtime-Environment $ConfigPath $Extra) $Repo
+}
+
 [void][System.IO.Directory]::CreateDirectory($TempRoot)
 $cleanupOk = $false
 try {
@@ -423,6 +467,32 @@ function Format-StatePct([int]$Milli) {
     if (-not $source.Contains($psClock) -or -not $source.Contains($psBarrierMarker) -or -not $source.Contains($psDumpMarker) -or -not $source.Contains($psAfterCreateMarker) -or -not $source.Contains($psMathMarker)) { throw 'PowerShell state test marker missing' }
     $statePsSource = $source.Replace($psClock, $psClockHook.TrimEnd()).Replace($psBarrierMarker, $psBarrierHook.TrimEnd()).Replace($psDumpMarker, $psDumpHook.TrimEnd()).Replace($psAfterCreateMarker, $psAfterCreateHook.TrimEnd()).Replace($psMathMarker, $psMathHook.TrimEnd())
     Write-Utf8 $script:StateScript $statePsSource
+
+    $script:FloatScript = Join-Path $TempRoot 'statusline-float-test.ps1'
+    $floatBeforeParentMarker = '        # WIN03_TEST_BEFORE_PARENT_CREATE'
+    $floatAfterParentMarker = '    # WIN03_TEST_AFTER_PARENT_CREATE'
+    $floatAfterTempMarker = '                # WIN03_TEST_AFTER_TEMP_CLOSE'
+    $floatBeforeParentHook = @'
+        if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_FLOAT_BEFORE_PARENT)) {
+            [IO.File]::WriteAllBytes(([string]$env:CORALLINE_TEST_FLOAT_BEFORE_PARENT + '.' + [string]$PID + '.ready'), [byte[]]@())
+            while (-not [IO.File]::Exists([string]$env:CORALLINE_TEST_FLOAT_BEFORE_PARENT)) { Start-Sleep -Milliseconds 10 }
+        }
+'@
+    $floatAfterParentHook = @'
+    if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_FLOAT_AFTER_PARENT)) {
+        [IO.File]::WriteAllBytes(([string]$env:CORALLINE_TEST_FLOAT_AFTER_PARENT + '.' + [string]$PID + '.ready'), [byte[]]@())
+        while (-not [IO.File]::Exists([string]$env:CORALLINE_TEST_FLOAT_AFTER_PARENT)) { Start-Sleep -Milliseconds 10 }
+    }
+'@
+    $floatAfterTempHook = @'
+                if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_FLOAT_AFTER_TEMP)) {
+                    [IO.File]::WriteAllBytes(([string]$env:CORALLINE_TEST_FLOAT_AFTER_TEMP + '.' + [string]$PID + '.ready'), [byte[]]@())
+                    while (-not [IO.File]::Exists([string]$env:CORALLINE_TEST_FLOAT_AFTER_TEMP)) { Start-Sleep -Milliseconds 10 }
+                }
+'@
+    if (-not $source.Contains($floatBeforeParentMarker) -or -not $source.Contains($floatAfterParentMarker) -or -not $source.Contains($floatAfterTempMarker)) { throw 'WIN-03 float barrier marker missing' }
+    $floatSource = $source.Replace($floatBeforeParentMarker, $floatBeforeParentHook.TrimEnd()).Replace($floatAfterParentMarker, $floatAfterParentHook.TrimEnd()).Replace($floatAfterTempMarker, $floatAfterTempHook.TrimEnd())
+    Write-Utf8 $script:FloatScript $floatSource
 
     $script:StateBashScript = Join-Path $TempRoot 'statusline-state-test.sh'
     $bashClock = 'printf -v NOW ''%(%s)T'' -1 2>/dev/null || NOW=$(date +%s)'
@@ -851,6 +921,23 @@ fi
     Check-Run 'Bash full stateless oracle' $bashOrder
     Check-Exact 'full fixed-pill differential is byte exact' $orderRun $bashOrder
     if (-not ($orderRun.Stdout -ceq $bashOrder.Stdout)) { [Console]::Out.WriteLine('DIAG  order-config=' + [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($orderConfig))) }
+
+    $crossListRoot = Join-Path $TempRoot 'fixed-cross-list-no-repo'
+    [void][IO.Directory]::CreateDirectory($crossListRoot)
+    $crossListGitProbe = Invoke-CapturedProcess $script:GitExe 'rev-parse --show-toplevel' '' @{} $crossListRoot 5000
+    Check 'WIN-03 fixed cross-list fixture has no enclosing Git repository' (-not $crossListGitProbe.TimedOut -and $crossListGitProbe.ExitCode -ne 0)
+    $crossListPath = Forward-Path $crossListRoot
+    $crossListPayload = Clone-Object $basePayload
+    $crossListPayload.cwd = $crossListPath
+    $crossListPayload.workspace.current_dir = $crossListPath
+    $crossListConfig = New-Config 'fixed-cross-list-project-dir' @('VL_LAYOUT=fixed','VL_SEGMENTS=project','VL_SEGMENTS2=dir','VL_CLOCK=off')
+    $crossListPs = Invoke-Statusline (Json $crossListPayload) $crossListConfig @{} '' 5000
+    $crossListBash = Invoke-BashStatusline (Json $crossListPayload) $crossListConfig @{}
+    Check-Run 'WIN-03 PowerShell fixed cross-list project dir' $crossListPs
+    Check-Run 'WIN-03 Bash fixed cross-list project dir' $crossListBash
+    Check-Exact 'WIN-03 fixed cross-list project dir differential' $crossListPs $crossListBash
+    $crossListRows = @($crossListPs.Stdout.Split([char]"`n") | Where-Object { $_.Length -gt 0 })
+    Check 'WIN-03 fixed cross-list project dir emits one row' ($crossListRows.Count -eq 1)
 
     $themePs = Invoke-Statusline (Json $basePayload) $themeConfig @{} '' 5000
     $themeBash = Invoke-BashStatusline (Json $basePayload) $themeConfig @{}
@@ -1730,7 +1817,8 @@ fi
     Check 'SEC-INC-01 completes within five seconds' ($run01.ElapsedMs -lt 5000)
     Assert-NoUnexpectedResidue $secRoot 'SEC-INC-01'
 
-    $uncCanary = '\\localhost\C$\tmp\' + [System.IO.Path]::GetFileName($Repo) + '\' + [System.IO.Path]::GetFileName($TempRoot) + '\security\outside\evil.conf'
+    $uncCanaryRoot = [IO.Path]::GetPathRoot($evil)
+    $uncCanary = '\\localhost\' + $uncCanaryRoot.Substring(0,1) + '$\' + $evil.Substring($uncCanaryRoot.Length)
     $probeCommand = "try { [IO.File]::ReadAllText('$uncCanary') | Out-Null; exit 0 } catch { exit 2 }"
     $uncProbe = Invoke-CapturedProcess $PowerShellExe ('-NoLogo -NoProfile -NonInteractive -Command "' + $probeCommand + '"') '' @{} $Repo 3000
     $staticUnc = $source.IndexOf("StartsWith('\\'") -ge 0 -and $source.IndexOf("StartsWith('\\'") -lt $source.IndexOf('GetFullPath($p)')
@@ -1790,6 +1878,241 @@ fi
         Blocked 'SEC-INC-05' 'junction creation capability unavailable'
     }
     Assert-NoUnexpectedResidue $secRoot 'SEC-INC matrix'
+
+    # WIN-03 style/layout/float producer matrix.
+    $win03Root = Join-Path $TempRoot 'win03'
+    [void][IO.Directory]::CreateDirectory($win03Root)
+    $styleCases = @(
+        [pscustomobject]@{ Name='pill'; Lines=@('VL_STYLE=pill') },
+        [pscustomobject]@{ Name='lean'; Lines=@('VL_STYLE=lean',('VL_LEAN_SEP=' + (Quote-FromConfigure '|'))) },
+        [pscustomobject]@{ Name='classic'; Lines=@('VL_STYLE=classic') },
+        [pscustomobject]@{ Name='ascii'; Lines=@('VL_ASCII=1') },
+        [pscustomobject]@{ Name='classic-ascii'; Lines=@('VL_STYLE=classic','VL_ASCII=1') },
+        [pscustomobject]@{ Name='lean-bar'; Lines=@('VL_STYLE=lean','VL_LEAN_BG=238','VL_LEAN_FG=231',('VL_LEAN_CAP_L=' + (Quote-FromConfigure '<')),('VL_LEAN_CAP_R=' + (Quote-FromConfigure '>')),('VL_LEAN_SEP=' + (Quote-FromConfigure '|'))) }
+    )
+    foreach ($case in $styleCases) {
+        $styleConfig = New-Config ('win03-style-' + $case.Name) (@('VL_SEGMENTS=model\ ctx\ cost','VL_CLOCK=off') + $case.Lines)
+        $psStyle = Invoke-Statusline (Json $basePayload) $styleConfig @{} '' 10000
+        $bashStyle = Invoke-BashStatusline (Json $basePayload) $styleConfig @{}
+        Check-Run ('WIN-03 PowerShell style ' + $case.Name) $psStyle
+        Check-Run ('WIN-03 Bash style ' + $case.Name) $bashStyle
+        Check-Exact ('WIN-03 style differential ' + $case.Name) $psStyle $bashStyle
+    }
+    $invalidColorConfig = New-Config 'win03-invalid-lean-color' @('VL_SEGMENTS=model','VL_CLOCK=off','VL_STYLE=lean','VL_LEAN_BG=2J','VL_LEAN_FG=999999')
+    $invalidColorRun = Invoke-Statusline (Json $basePayload) $invalidColorConfig @{} '' 10000
+    Check-Run 'WIN-03 invalid lean color' $invalidColorRun
+    Check 'WIN-03 invalid lean color cannot inject CSI' (-not $invalidColorRun.Stdout.Contains(([string][char]27 + '[2J')))
+
+    foreach ($columns in @('1','20','40','32767','0','bad','999999999999')) {
+        $autoConfig = New-Config ('win03-auto-' + $columns) @('VL_SEGMENTS=model\ ctx\ cost\ lines','VL_CLOCK=off','VL_LAYOUT=auto','VL_MAX_LINES=3','VL_WRAP_MARGIN=0')
+        $env = @{ COLUMNS=$columns }
+        $psAuto = Invoke-Statusline (Json $basePayload) $autoConfig $env '' 10000
+        $bashAuto = Invoke-BashStatusline (Json $basePayload) $autoConfig $env
+        Check-Run ('WIN-03 PowerShell auto width ' + $columns) $psAuto
+        Check-Run ('WIN-03 Bash auto width ' + $columns) $bashAuto
+        Check-Exact ('WIN-03 auto width differential ' + $columns) $psAuto $bashAuto
+    }
+    $unicodePayload = Clone-Object $basePayload
+    $unicodePayload.model.display_name = 'Claude ' + (Glyph 0x1F600) + (Glyph 0x0301) + (Glyph 0xFF21)
+    $unicodeConfig = New-Config 'win03-auto-unicode' @('VL_SEGMENTS=model\ ctx\ cost','VL_CLOCK=off','VL_LAYOUT=auto','VL_MAX_LINES=2','VL_WRAP_MARGIN=0')
+    $unicodePs = Invoke-Statusline (Json $unicodePayload) $unicodeConfig @{ COLUMNS='24' } '' 10000
+    $unicodeBash = Invoke-BashStatusline (Json $unicodePayload) $unicodeConfig @{ COLUMNS='24' }
+    Check-Run 'WIN-03 Unicode width PowerShell' $unicodePs
+    Check-Run 'WIN-03 Unicode width Bash' $unicodeBash
+    Check-Exact 'WIN-03 Unicode width differential' $unicodePs $unicodeBash
+
+    $fixedWidthSource = $source.Replace('function Get-DisplayWidth([string]$Value) {', 'function Get-DisplayWidth([string]$Value) { throw ''fixed layout entered width helper''')
+    $script:WidthScript = Join-Path $TempRoot 'statusline-width-test.ps1'
+    Write-Utf8 $script:WidthScript $fixedWidthSource
+    $fixedWidthConfig = New-Config 'win03-fixed-no-width-scan' @('VL_SEGMENTS=model','VL_CLOCK=off','VL_LAYOUT=fixed')
+    $fixedWidthRun = Invoke-Statusline (Json $basePayload) $fixedWidthConfig @{ CORALLINE_TEST_WIDTH_SCRIPT='1'; COLUMNS='1' } '' 10000
+    Check-Run 'WIN-03 fixed layout skips width helper' $fixedWidthRun
+    Check 'WIN-03 fixed layout source has no width test hook' (-not $source.Contains('CORALLINE_TEST_WIDTH_SCRIPT'))
+    Check 'WIN-03 RawUI width is ConsoleHost-only' $source.Contains("if (`$Host.Name -ne 'ConsoleHost') { return 0 }")
+
+    $floatTarget = Join-Path $win03Root 'float output\float.txt'
+    $floatConfig = New-FloatConfig 'win03-float-standard' $floatTarget 'model ctx cost' '  |  ' @()
+    $floatPs = Invoke-Float (Json $basePayload) $floatConfig @{}
+    Check-Run 'WIN-03 standard float PowerShell' $floatPs
+    $floatPsBytes = Float-Bytes $floatTarget
+    Check 'WIN-03 float creates UTF-8 no-BOM LF file' ($null -ne $floatPsBytes -and $floatPsBytes.Length -gt 0 -and $floatPsBytes[0] -ne 0xEF -and $floatPsBytes[$floatPsBytes.Length - 1] -eq 10 -and -not ($floatPsBytes -contains [byte]13))
+    Check 'WIN-03 float has one trailing LF and no ESC' ($floatPsBytes.Length -eq 0 -or ($floatPsBytes[$floatPsBytes.Length - 1] -eq 10 -and -not ($floatPsBytes[0..($floatPsBytes.Length - 1)] -contains [byte]27)))
+    $floatOld = [byte[]]@(0x6f,0x6c,0x64,0x0a)
+    [IO.File]::WriteAllBytes($floatTarget, $floatOld)
+    $floatReplace = Invoke-Float (Json $basePayload) $floatConfig @{}
+    Check-Run 'WIN-03 existing float replacement' $floatReplace
+    $replacedBytes = Float-Bytes $floatTarget
+    Check 'WIN-03 local File.Replace changes complete destination' ((-not (Bytes-Same $replacedBytes $floatOld)) -and $replacedBytes.Length -gt 1 -and $replacedBytes[$replacedBytes.Length - 1] -eq 10)
+    Check 'WIN-03 float leaves no temp artifact' (@(Get-ChildItem -LiteralPath (Split-Path $floatTarget -Parent) -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.float.tmp.*' }).Count -eq 0)
+
+    $readonlyTarget = Join-Path $win03Root 'readonly.txt'
+    [IO.File]::WriteAllBytes($readonlyTarget, $floatOld)
+    $readonlyInfo = Get-Item -LiteralPath $readonlyTarget -Force
+    $readonlyInfo.Attributes = $readonlyInfo.Attributes -bor [IO.FileAttributes]::ReadOnly
+    $readonlyBefore = Snapshot-File $readonlyTarget
+    $readonlyAttrBefore = (Get-Item -LiteralPath $readonlyTarget -Force).Attributes
+    $readonlyRun = Invoke-Float (Json $basePayload) (New-FloatConfig 'win03-float-readonly' $readonlyTarget 'model' '|' @()) @{}
+    Check-Run 'WIN-03 read-only float target' $readonlyRun
+    Check 'WIN-03 read-only target remains unchanged' ((Snapshot-File $readonlyTarget) -eq $readonlyBefore -and (Get-Item -LiteralPath $readonlyTarget -Force).Attributes -eq $readonlyAttrBefore)
+    $readonlyInfo.Attributes = $readonlyInfo.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)
+
+    $observerTarget = Join-Path $win03Root 'observer.txt'
+    [IO.File]::WriteAllBytes($observerTarget, $floatOld)
+    $observerBarrier = Join-Path $win03Root 'observer-release'
+    $observerConfig = New-FloatConfig 'win03-float-observer' $observerTarget 'model ctx' '|' @()
+    $observerHandle = Start-FloatAsync (Json $basePayload) $observerConfig @{ CORALLINE_TEST_FLOAT_SCRIPT='1'; CORALLINE_TEST_FLOAT_AFTER_TEMP=$observerBarrier }
+    $observerReady = Wait-Ready $observerBarrier 5000
+    Check 'WIN-03 atomic observer reaches post-close barrier' $observerReady
+    $observerOnlyOld = $true
+    if ($observerReady) {
+        for ($i=0; $i -lt 20; $i++) { if (-not (Bytes-Same (Float-Bytes $observerTarget) $floatOld)) { $observerOnlyOld=$false; break }; Start-Sleep -Milliseconds 5 }
+    }
+    [IO.File]::WriteAllBytes($observerBarrier, [byte[]]@())
+    $observerResult = Wait-CapturedProcessAsync $observerHandle 15000
+    Check-Run 'WIN-03 atomic observer writer' $observerResult
+    Check 'WIN-03 atomic observer sees old then complete new' ($observerOnlyOld -and -not (Bytes-Same (Float-Bytes $observerTarget) $floatOld) -and (Float-Bytes $observerTarget)[(Float-Bytes $observerTarget).Length - 1] -eq 10)
+    Remove-Item -LiteralPath $observerBarrier -Force -ErrorAction SilentlyContinue
+
+    $junctionProbeRoot = Join-Path $win03Root 'junction-capability'
+    [void][IO.Directory]::CreateDirectory($junctionProbeRoot)
+    $junctionProbeTarget = Join-Path $junctionProbeRoot 'outside'
+    [void][IO.Directory]::CreateDirectory($junctionProbeTarget)
+    $junctionProbeLink = Join-Path $junctionProbeRoot 'link'
+    $junctionProbe = Invoke-CapturedProcess $env:ComSpec ('/d /s /c "mklink /J ""' + $junctionProbeLink + '"" ""' + $junctionProbeTarget + '"""') '' @{} $Repo 5000
+    $win03JunctionReady = $junctionProbe.ExitCode -eq 0 -and [IO.Directory]::Exists($junctionProbeLink)
+    Check 'WIN-03 required local junction capability' $win03JunctionReady
+    if ($win03JunctionReady) {
+        Remove-Item -LiteralPath $junctionProbeLink -Force -ErrorAction SilentlyContinue
+        foreach ($barrierCase in @('before-parent','after-parent','after-temp')) {
+            $caseRoot = Join-Path $win03Root ('reparse-' + $barrierCase)
+            $outside = Join-Path $caseRoot 'outside'
+            $parent = Join-Path $caseRoot 'parent'
+            $target = Join-Path $parent 'float.txt'
+            $link = Join-Path $caseRoot 'link-target'
+            $barrier = Join-Path $caseRoot 'release'
+            [void][IO.Directory]::CreateDirectory($outside)
+            $barrierExtra = @{ CORALLINE_TEST_FLOAT_SCRIPT='1' }
+            if ($barrierCase -eq 'before-parent') { $barrierExtra.CORALLINE_TEST_FLOAT_BEFORE_PARENT=$barrier }
+            elseif ($barrierCase -eq 'after-parent') { [void][IO.Directory]::CreateDirectory($parent); $barrierExtra.CORALLINE_TEST_FLOAT_AFTER_PARENT=$barrier }
+            else { [void][IO.Directory]::CreateDirectory($parent); $barrierExtra.CORALLINE_TEST_FLOAT_AFTER_TEMP=$barrier }
+            $caseConfig = New-FloatConfig ('win03-reparse-' + $barrierCase) $target 'model' '|' @()
+            $handle = $null
+            try {
+                $handle = Start-FloatAsync (Json $basePayload) $caseConfig $barrierExtra
+                $ready = Wait-Ready $barrier 5000
+                Check ('WIN-03 ' + $barrierCase + ' barrier reaches hook') $ready
+                if ($ready) {
+                    if ($barrierCase -eq 'before-parent') {
+                        $mk = Invoke-CapturedProcess $env:ComSpec ('/d /s /c "mklink /J ""' + $parent + '"" ""' + $outside + '"""') '' @{} $Repo 5000
+                    } elseif ($barrierCase -eq 'after-parent') {
+                        Remove-Item -LiteralPath $parent -Force -Recurse
+                        $mk = Invoke-CapturedProcess $env:ComSpec ('/d /s /c "mklink /J ""' + $parent + '"" ""' + $outside + '"""') '' @{} $Repo 5000
+                    } else {
+                        $backup = Join-Path $caseRoot 'parent-backup'
+                        [IO.Directory]::Move($parent, $backup)
+                        $mk = Invoke-CapturedProcess $env:ComSpec ('/d /s /c "mklink /J ""' + $parent + '"" ""' + $outside + '"""') '' @{} $Repo 5000
+                    }
+                    Check ('WIN-03 ' + $barrierCase + ' junction creation') ($mk.ExitCode -eq 0 -and [IO.Directory]::Exists($parent))
+                }
+                [IO.File]::WriteAllBytes($barrier, [byte[]]@())
+                $result = Wait-CapturedProcessAsync $handle 15000
+                $handle = $null
+                Check-Run ('WIN-03 ' + $barrierCase + ' reparse barrier run') $result
+                Check ('WIN-03 ' + $barrierCase + ' blocks target write') (-not [IO.File]::Exists($target) -and -not [IO.File]::Exists((Join-Path $outside 'float.txt')))
+            } finally {
+                if ($null -ne $handle) { [IO.File]::WriteAllBytes($barrier, [byte[]]@()); [void](Wait-CapturedProcessAsync $handle 15000) }
+                Remove-Item -LiteralPath $parent,$link,$barrier -Force -Recurse -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath (Join-Path $caseRoot 'parent-backup') -Force -Recurse -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    $floatBashRoot = Join-Path $win03Root 'float-bash'
+    [void][IO.Directory]::CreateDirectory($floatBashRoot)
+    $floatBashTarget = Join-Path $floatBashRoot 'float.txt'
+    $floatBashConfig = New-FloatConfig 'win03-float-bash' $floatBashTarget 'model ctx cost' '  |  ' @()
+    $floatBashPs = Invoke-Float (Json $basePayload) $floatBashConfig @{}
+    $floatBashPsBytes = Float-Bytes $floatBashTarget
+    Remove-Item -LiteralPath $floatBashTarget -Force
+    $floatBashRun = Invoke-BashStatusline (Json $basePayload) $floatBashConfig @{}
+    Check-Run 'WIN-03 Bash float oracle' $floatBashRun
+    $floatBashBytes = Float-Bytes $floatBashTarget
+    $floatSame = $null -ne $floatBashPsBytes -and $null -ne $floatBashBytes -and $floatBashPsBytes.Length -eq $floatBashBytes.Length
+    if ($floatSame) { for ($i=0; $i -lt $floatBashPsBytes.Length; $i++) { if ($floatBashPsBytes[$i] -ne $floatBashBytes[$i]) { $floatSame=$false; break } } }
+    Check 'WIN-03 float bytes match Bash producer' $floatSame
+
+    $emptyFloatTarget = Join-Path $win03Root 'empty-float.txt'
+    $emptyFloatConfig = New-FloatConfig 'win03-float-empty' $emptyFloatTarget '' '|' @()
+    $emptyFloatRun = Invoke-Float '{}' $emptyFloatConfig @{}
+    Check-Run 'WIN-03 empty float' $emptyFloatRun
+    $emptyFloatBytes = Float-Bytes $emptyFloatTarget
+    Check 'WIN-03 empty float is exactly LF' ($null -ne $emptyFloatBytes -and $emptyFloatBytes.Length -eq 1 -and $emptyFloatBytes[0] -eq 10)
+
+    # Authorization is depth/case sensitive while the default remains usable.
+    foreach ($kind in @('included-exact','included-mixed','root-mixed')) {
+        $homeCase = Join-Path $win03Root ('home-' + $kind)
+        [void][IO.Directory]::CreateDirectory($homeCase)
+        $targetA = Join-Path $win03Root ($kind + '-a.txt')
+        $targetB = Join-Path $win03Root ($kind + '-b.txt')
+        $include = Join-Path (Join-Path $TempRoot 'config') ($kind + '-include.conf')
+        $authLines = @('VL_SEGMENTS=model','VL_CLOCK=off','VL_FLOAT=1','VL_FLOAT_SEGMENTS=model')
+        if ($kind -eq 'included-exact') {
+            Write-Utf8 $include ('VL_FLOAT_FILE=' + (Quote-FromConfigure $targetB) + "`n")
+            $authLines += ('. ' + (Quote-FromConfigure $include))
+            $authLines += ('VL_FLOAT_FILE=' + (Quote-FromConfigure $targetA))
+        } elseif ($kind -eq 'included-mixed') {
+            Write-Utf8 $include ('vl_float_file=' + (Quote-FromConfigure $targetB) + "`n")
+            $authLines += ('. ' + (Quote-FromConfigure $include))
+            $authLines += ('VL_FLOAT_FILE=' + (Quote-FromConfigure $targetA))
+        } else {
+            $authLines += ('vl_float_file=' + (Quote-FromConfigure $targetB))
+        }
+        $authConfig = New-Config ('win03-auth-' + $kind) $authLines
+        $authRun = Invoke-Float (Json $basePayload) $authConfig @{ HOME=$homeCase; USERPROFILE=$homeCase }
+        Check-Run ('WIN-03 float authorization ' + $kind) $authRun
+        if ($kind -ne 'root-mixed') { Check ('WIN-03 ' + $kind + ' root target wins') ([IO.File]::Exists($targetA) -and -not [IO.File]::Exists($targetB)) }
+        else { Check ('WIN-03 root mixed key is no-op') (-not [IO.File]::Exists($targetB) -and [IO.File]::Exists((Join-Path $homeCase '.claude\coralline\float.txt'))) }
+    }
+    $invalidFloatCases = @(
+        [pscustomobject]@{ Name='empty'; Value="''" },
+        [pscustomobject]@{ Name='unc'; Value="'\\localhost\share\float.txt'" },
+        [pscustomobject]@{ Name='device'; Value="'\\?\C:\float.txt'" },
+        [pscustomobject]@{ Name='ads'; Value="'carrier.txt:float'" },
+        [pscustomobject]@{ Name='dos'; Value="'CON.txt'" },
+        [pscustomobject]@{ Name='trailing'; Value="'bad. '" }
+    )
+    foreach ($bad in $invalidFloatCases) {
+        $homeBad = Join-Path $win03Root ('home-bad-' + $bad.Name)
+        [void][IO.Directory]::CreateDirectory($homeBad)
+        $badConfig = New-Config ('win03-float-bad-' + $bad.Name) @('VL_SEGMENTS=model','VL_CLOCK=off','VL_FLOAT=1','VL_FLOAT_SEGMENTS=model',('VL_FLOAT_FILE=' + $bad.Value))
+        $badRun = Invoke-Float (Json $basePayload) $badConfig @{ HOME=$homeBad; USERPROFILE=$homeBad }
+        Check-Run ('WIN-03 invalid float path ' + $bad.Name) $badRun
+        Check ('WIN-03 invalid float path ' + $bad.Name + ' skips default write') (-not [IO.File]::Exists((Join-Path $homeBad '.claude\coralline\float.txt')))
+    }
+
+    $collisionRoot = Join-Path $win03Root 'dormant-collision'
+    [void][IO.Directory]::CreateDirectory($collisionRoot)
+    $collisionBase = Join-Path $collisionRoot 'burn.tsv'
+    $collisionConfig = New-Config 'win03-dormant-state-collision' @('VL_SEGMENTS=model','VL_CLOCK=off','VL_FLOAT=1','VL_FLOAT_SEGMENTS=model',('VL_FLOAT_FILE=' + (Quote-FromConfigure $collisionBase)),('BURN_FILE=' + (Quote-FromConfigure $collisionBase)))
+    $collisionRun = Invoke-Float (Json $basePayload) $collisionConfig @{}
+    Check-Run 'WIN-03 dormant state collision' $collisionRun
+    Check 'WIN-03 dormant state collision creates no float or state root' (-not [IO.File]::Exists($collisionBase) -and -not [IO.Directory]::Exists((Join-Path $collisionRoot 'burn.d')))
+
+    $longTarget = Join-Path $win03Root 'long.txt'
+    $longSegments = 'model ' + ('x' * 4091)
+    $longConfig = New-FloatConfig 'win03-float-segment-bound' $longTarget $longSegments '|' @()
+    $longRun = Invoke-Float (Json $basePayload) $longConfig @{}
+    Check-Run 'WIN-03 float segment bound' $longRun
+    Check 'WIN-03 overlong float segment list skips write' (-not [IO.File]::Exists($longTarget))
+    $sepTarget = Join-Path $win03Root 'sep.txt'
+    $sepConfig = New-FloatConfig 'win03-float-separator-bound' $sepTarget 'model' ('x' * 257) @()
+    $sepRun = Invoke-Float (Json $basePayload) $sepConfig @{}
+    Check-Run 'WIN-03 float separator bound' $sepRun
+    Check 'WIN-03 overlong float separator skips write' (-not [IO.File]::Exists($sepTarget))
+
+    Check 'WIN-03 source caches stash/node/python probes' ($source.Contains('$script:StashCacheSet') -and $source.Contains('$script:NodeCacheSet') -and $source.Contains('$script:PythonCacheSet'))
+    Check 'WIN-03 state collision derivation is outside state gates' ($source.IndexOf('$AllStatePaths') -lt $source.IndexOf('$BurnStateGate'))
+    Assert-NoUnexpectedResidue $win03Root 'WIN-03 float matrix'
 
 } finally {
     try { Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction Stop } catch { }
