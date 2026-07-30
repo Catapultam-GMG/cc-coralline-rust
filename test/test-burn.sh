@@ -157,6 +157,19 @@ eq 'legacy estimator active' "$_B5_STATE" active
 eq 'legacy estimator eta' "$_B5_ETA" 22080
 true_case 'live samples publish only into .d' test -d "$CASE/burn.d"
 
+# Store roots may contain any byte except / and NUL. bash 5.2's default
+# patsub_replacement expands & in a substitution replacement, so candidate
+# paths must be built by literal concatenation: a root with an ampersand
+# must still GC its stale duplicate for real, not just account for it.
+CASE="$TMPD/amp&root"; reset_state_case "$CASE"
+mkdir -p "$CASE/burn.d"
+: > "$CASE/burn.d/b_000001015900_000001000000_006.000_0000"
+: > "$CASE/burn.d/b_000001015900_000001000000_005.000_0001"
+state_prepare
+true_case 'ampersand root keeps duplicate winner' test -f "$CASE/burn.d/b_000001015900_000001000000_006.000_0000"
+true_case 'ampersand root deletes stale duplicate' test ! -e "$CASE/burn.d/b_000001015900_000001000000_005.000_0001"
+eq 'ampersand root removal accounted once' "$_SB_REMOVED" 1
+
 # Exact estimator contract: same-second maximum, rational rate/ETA, and reset isolation.
 NOW=1000360; CORALLINE_BURN_WINDOW=600; _SB_COMPLETE=1; _CUR_BURN_VALID=0
 _SB_REP_RSTS=(1015900 1015900 1015900 1015900)
@@ -176,6 +189,36 @@ _SB_REP_RSTS=(1010000 1010000 1015900 1015900 1015900 1015900)
 _SB_REP_SAMPS=(1000060 1000180 1000000 1000120 1000300 1000360)
 _SB_REP_PCTS=(50000 51000 6000 7000 8000 8000)
 burn_eta_5h; eq 'latest reset isolates old windows' "$_B5_ETA" 16560
+
+# Migration shape: 1500 live representatives plus 512 same-reset legacy rows,
+# all legacy older than every live sample. Series must be built in bounded
+# work, not by per-row insertion into the full live array.
+NOW=1000360; CORALLINE_BURN_WINDOW=600; _SB_COMPLETE=1; _CUR_BURN_VALID=0
+_SB_REP_RSTS=(); _SB_REP_SAMPS=(); _SB_REP_PCTS=()
+for ((i=0; i<1500; i++)); do
+  _samp=$((998861 + i))
+  _SB_REP_RSTS[i]=1015900; _SB_REP_SAMPS[i]=$_samp
+  if [ "$_samp" -lt 1000000 ]; then _SB_REP_PCTS[i]=6000
+  elif [ "$_samp" -lt 1000300 ]; then _SB_REP_PCTS[i]=7000
+  else _SB_REP_PCTS[i]=8000; fi
+done
+_LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=()
+for ((i=0; i<512; i++)); do
+  _LEG_RSTS[i]=1015900; _LEG_SAMPS[i]=$((998300 + i)); _LEG_PCTS[i]=5000
+done
+_STEPS=0
+set -o functrace
+trap '_STEPS=$((_STEPS+1))' DEBUG
+burn_eta_5h
+trap - DEBUG
+set +o functrace
+eq 'migration backlog state' "$_B5_STATE" active
+eq 'migration backlog series includes legacy' "${#_SER_SAMPS[@]}" 2012
+eq 'migration backlog exact eta' "$_B5_ETA" 27600
+eq 'migration backlog exact rate' "$_B5_RATE" '0.0033333333'
+eq 'migration backlog ttr' "$_B5_TTR" 15540
+[ "$_STEPS" -le 200000 ] && ok 'migration backlog bounded work' || bad 'migration backlog bounded work' "steps=$_STEPS"
+_LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=()
 
 NOW=1000000; burn_eta_7d 30000 1345600
 eq '7d exact eta' "$_B7_ETA" 604800
@@ -227,22 +270,44 @@ true_case 'malformed limit entry preserved' test -d "$CASE/limit5.d/not-state"
 eq 'flat limit file preserved' "$(LC_ALL=C tr -d '\n' < "$RL5H_FILE")" flat-canary
 cmp -s "$BURN_FILE" <(printf '1000000\t99\t99999999\n') && ok 'legacy sentinel row preserved physically' || bad 'legacy sentinel row preserved physically' changed
 
+# A malformed entry whose NAME embeds a newline must never be treated as a
+# legitimate marker: unparseable names are counted but never GC candidates,
+# and their embedded percent never becomes a representative sample.
+CASE="$TMPD/newline-spoof"; reset_state_case "$CASE"; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0
+mkdir -p "$CASE/burn.d"
+: > "$CASE/burn.d/b_000001015900_000001000000_041.200_0000"
+: > "$CASE/burn.d/b_000001015900_000000999940_040.000_0000"
+_SPOOF="$CASE/burn.d/b_000001015900_000000999990_099.000_0000"$'\n'"junk"
+if : > "$_SPOOF" 2>/dev/null && [ -e "$_SPOOF" ]; then
+  state_prepare
+  true_case 'newline-spoofed entry is preserved' test -e "$_SPOOF"
+  true_case 'legitimate marker at 41.200 survives' test -e "$CASE/burn.d/b_000001015900_000001000000_041.200_0000"
+  true_case 'legitimate marker at 40.000 survives' test -e "$CASE/burn.d/b_000001015900_000000999940_040.000_0000"
+  _SPOOF_FOUND=0
+  if [ "${#_SB_REP_PCTS[@]}" -gt 0 ]; then
+    for _P in "${_SB_REP_PCTS[@]}"; do [ "$_P" = 99000 ] && _SPOOF_FOUND=1; done
+  fi
+  [ "$_SPOOF_FOUND" -eq 0 ] && ok 'newline-spoofed name never becomes representative' || bad 'newline-spoofed name never becomes representative' 'found 99000'
+else
+  ok 'newline spoof fixture unavailable on this filesystem'
+fi
+
 # GC is snapshot-bound: an exact newer publication created after enumeration is
-# absent from the candidate set and survives this round.
-CASE="$TMPD/barrier"; reset_state_case "$CASE"; mkdir -p "$CASE/burn.d"
+# absent from the candidate set and survives this round. The writer is injected
+# via a find wrapper that creates the new marker only after the real find has
+# finished enumerating, going through the production path end to end.
+CASE="$TMPD/barrier"; reset_state_case "$CASE"; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0
+mkdir -p "$CASE/burn.d"
 : > "$CASE/burn.d/b_253402300799_000001000000_099.000_0000"
-_SB_NAMES=(); _SB_PATHS=(); _SB_RSTS=(); _SB_SAMPS=(); _SB_PCTS=(); _SB_PLAUS=(); _SB_RAW=0
-_SL5_NAMES=(); _SL5_PATHS=(); _SL5_RSTS=(); _SL5_PCTS=(); _SL5_PLAUS=(); _SL5_RAW=0
-_SL7_NAMES=(); _SL7_PATHS=(); _SL7_RSTS=(); _SL7_PCTS=(); _SL7_PLAUS=(); _SL7_RAW=0
-_SB_ROOT="$CASE/burn.d"; _SB_BASE="$CASE/burn.tsv"; _STATE_FIND_ARGS=("$_SB_ROOT/.")
-_STATE_LEGACY_READ=0; _STATE_BURN_GATE=1; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0
-_SB_DIR_PREOK=1; _SL5_DIR_PREOK=0; _SL7_DIR_PREOK=0; _LEG_PREOK=1
-_SB_DIR_COMPLETE=0; _SL5_COMPLETE=0; _SL7_COMPLETE=0; _LEG_COMPLETE=0
-state_snapshot; _SB_COMPLETE=1; state_burn_retention
-_NEW="$CASE/burn.d/b_000001015900_000001000001_042.000_0000"; : > "$_NEW"
-_STATE_MUTATE=1; _SL5_CAND_PATHS=(); _SL5_CAND_TOTAL=0; _SL7_CAND_PATHS=(); _SL7_CAND_TOTAL=0
-state_gc
-true_case 'post-snapshot writer survives current GC' test -f "$_NEW"
+mkdir -p "$CASE/bin"
+WIN06_NEW="$CASE/burn.d/b_000001015900_000001000001_042.000_0000"
+WIN06_REAL_FIND=$(command -v find)
+printf '%s\n' '#!/bin/bash' '"$WIN06_REAL_FIND" "$@"' 'rc=$?' ': > "$WIN06_NEW"' 'exit "$rc"' > "$CASE/bin/find"
+chmod +x "$CASE/bin/find"
+export WIN06_REAL_FIND WIN06_NEW
+OLD_PATH=$PATH; PATH="$CASE/bin:$PATH"; state_prepare; PATH=$OLD_PATH
+true_case 'snapshot-bound GC removes the enumerated sentinel' test ! -e "$CASE/burn.d/b_253402300799_000001000000_099.000_0000"
+true_case 'post-snapshot writer survives current GC' test -f "$WIN06_NEW"
 
 # Bounded retention deletes at most 128 per render and blocks publication until
 # every strict retention candidate from the complete snapshot is gone.
@@ -257,7 +322,7 @@ true_case 'publication blocked while candidate remains' test ! -e "$CASE/burn.d/
 state_prepare; count_entries "$CASE/burn.d"; eq 'second maintenance converges then publishes once' "$_COUNT" 2
 
 # The default retained set is a normal steady state, not an adversarial input.
-# Descending creation order exercises the O(n log n) in-shell merge sort.
+# Descending creation order exercises the sort inside the single awk pass.
 CASE="$TMPD/steady1500"; reset_state_case "$CASE"; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0; BURN_TRIM=1500
 mkdir -p "$CASE/burn.d"; i=0
 while [ "$i" -lt 1500 ]; do
@@ -280,6 +345,29 @@ state_prepare; count_entries "$CASE/burn.d"; eq 'burn raw 3968 never publishes' 
 CASE="$TMPD/overcap"; reset_state_case "$CASE"; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0; make_files "$CASE/burn.d" 4097
 state_prepare; count_entries "$CASE/burn.d"; eq 'burn cap+1 freezes store' "$_COUNT" 4097
 eq 'burn cap+1 returns warming' "$_B5_STATE" warming
+
+# Deterministic early-stop: a store far past the raw cap must make the
+# producer stop enumerating early, not drain the whole directory into the pass.
+CASE="$TMPD/early-stop"; reset_state_case "$CASE"; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0
+make_files "$CASE/burn.d" 8500
+mkdir -p "$CASE/bin"
+WIN05_REAL_FIND=$(command -v find)
+WIN05_RC="$CASE/find-rc"; : > "$WIN05_RC"
+printf '%s\n' '#!/bin/bash' '"$WIN05_REAL_FIND" "$@"' 'rc=$?' 'printf "%s\n" "$rc" >> "$WIN05_RC"' 'exit "$rc"' > "$CASE/bin/find"
+chmod +x "$CASE/bin/find"
+export WIN05_REAL_FIND WIN05_RC
+OLD_PATH=$PATH; PATH="$CASE/bin:$PATH"; state_prepare; PATH=$OLD_PATH
+eq 'over-cap store marks snapshot incomplete' "$_SB_COMPLETE" 0
+_RC_LAST=""
+while IFS= read -r _RC_LINE; do _RC_LAST=$_RC_LINE; done < "$WIN05_RC"
+if [ -z "$_RC_LAST" ]; then
+  bad 'producer stops early past the cap' 'find never ran'
+elif [ "$_RC_LAST" -ne 0 ]; then
+  ok 'producer stops early past the cap'
+else
+  bad 'producer stops early past the cap' "find exited $_RC_LAST"
+fi
+count_entries "$CASE/burn.d"; eq 'over-cap store is frozen' "$_COUNT" 8500
 
 make_dirs() { local dir="$1" n="$2" i=0 paths=(); mkdir -p "$dir"; while [ "$i" -lt "$n" ]; do printf -v _N 'x%04d' "$i"; paths[${#paths[@]}]="$dir/$_N"; i=$((i + 1)); done; mkdir -p "${paths[@]}"; }
 CASE="$TMPD/limit383"; reset_state_case "$CASE"; _STATE_BURN_GATE=0; _STATE_RL7_GATE=0; make_dirs "$CASE/limit5.d" 383
@@ -347,6 +435,49 @@ eq 'partial od failure marks legacy incomplete' "$_SB_COMPLETE" 0
 eq 'partial od failure discards buffered rows' "${#_LEG_RSTS[@]}" 0
 true_case 'partial od failure publishes nothing' test ! -e "$CASE/burn.d"
 
+# A legacy TSV that exists but cannot be read fails only the legacy source
+# closed. The limit roots are enumerated by the same controller and their
+# completeness must not ride on the legacy reader's exit status.
+CASE="$TMPD/legacy-unreadable"; reset_state_case "$CASE"
+mkdir -p "$CASE/limit5.d/0001015900_040.000" "$CASE/limit7.d/0001345600_029.000"
+printf '1000000\t41.2\t1015900\n' > "$BURN_FILE"
+chmod 000 "$BURN_FILE" 2>/dev/null
+if [ -r "$BURN_FILE" ]; then
+  chmod 644 "$BURN_FILE" 2>/dev/null
+  ok 'unreadable legacy fixture unavailable'
+else
+  state_prepare
+  chmod 644 "$BURN_FILE" 2>/dev/null
+  eq 'unreadable legacy keeps 5h store complete' "$_SL5_COMPLETE" 1
+  eq 'unreadable legacy keeps 7d store complete' "$_SL7_COMPLETE" 1
+  eq 'unreadable legacy marks legacy incomplete' "$_LEG_COMPLETE" 0
+  eq 'unreadable legacy marks burn incomplete' "$_SB_COMPLETE" 0
+  true_case 'unreadable legacy still publishes 5h' test -d "$CASE/limit5.d/0001015900_041.200"
+  true_case 'unreadable legacy still publishes 7d' test -d "$CASE/limit7.d/0001345600_030.000"
+  true_case 'unreadable legacy publishes no burn marker' test ! -e "$CASE/burn.d"
+fi
+
+# Closing the controller fd must not silence the rest of the process. `exec
+# 9<&- 2>/dev/null` carries no command word, so its redirection is permanent and
+# every later diagnostic disappears — that is what kept a bash 3.2 parse failure
+# invisible. Save and restore fd 2 around the call, with no assertion in
+# between, so a regression here cannot strand the suite's own stderr.
+CASE="$TMPD/stderr-scope"; reset_state_case "$CASE"; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0
+mkdir -p "$CASE/burn.d"
+: > "$CASE/burn.d/b_000001015900_000000999940_040.000_0000"
+exec 7>&2
+exec 2>"$CASE/err.out"
+state_prepare
+printf 'stderr-canary\n' >&2
+exec 2>&7 7>&-
+_ERR_CANARY=0; _ERR_LINES=0
+while IFS= read -r _EL; do
+  _ERR_LINES=$(( _ERR_LINES + 1 ))
+  case "$_EL" in (*stderr-canary*) _ERR_CANARY=1 ;; esac
+done < "$CASE/err.out"
+eq 'scan leaves script stderr writable' "$_ERR_CANARY" 1
+eq 'scan writes nothing to stderr itself' "$_ERR_LINES" 1
+
 # Symlink stores and ancestors fail closed without touching their targets. Git
 # Bash's default ln -s emulation copies directories, so create a real Windows
 # reparse point there; native links are visible to Git Bash's -L predicate.
@@ -400,6 +531,18 @@ if command -v jq >/dev/null 2>&1; then
   _TRACE=1; while IFS= read -r _; do _TRACE=$((_TRACE + 1)); done < "$CASE/read.log"
   [ "$_TRACE" -le 4 ] && ok 'no-sample descendant ceiling <=4' || bad 'no-sample descendant ceiling <=4' "count=$_TRACE"
   eq 'no-sample process trace stderr empty' "$(wc -c < "$CASE/read.err" | tr -d ' ')" 0
+
+  # Fresh-install path: markers present, no legacy TSV file.
+  rm -rf "$CASE/state"; mkdir -p "$CASE/state/burn.d"
+  now=$(date +%s); old=$((now - 10)); reset=$((now + 10800)); printf -v oldname 'b_%012d_%012d_010.000_0000' "$reset" "$old"; : > "$CASE/state/burn.d/$oldname"
+  printf '%s\n' 'VL_SEGMENTS=burn' 'VL_CLOCK=off' "BURN_FILE=$CASE/state/burn.tsv" > "$CASE/noleg.conf"
+  : > "$CASE/noleg.log"
+  WIN02_TRACE="$CASE/noleg.log" CORALLINE_CONFIG="$CASE/noleg.conf" CORALLINE_NO_SAMPLE=1 PATH="$CASE/bin:$PATH" bash "$SCRIPT" < "$CASE/input" >/dev/null 2> "$CASE/noleg.err"
+  eq 'absent-legacy render exits zero' "$?" 0
+  _TRACE=1; while IFS= read -r _; do _TRACE=$((_TRACE + 1)); done < "$CASE/noleg.log"
+  [ "$_TRACE" -le 4 ] && ok 'absent-legacy descendant ceiling <=4' || bad 'absent-legacy descendant ceiling <=4' "count=$_TRACE"
+  eq 'absent-legacy scan path ran' "$(sort "$CASE/noleg.log" | tr '\n' ' ')" 'awk find od '
+  eq 'absent-legacy process trace stderr empty' "$(wc -c < "$CASE/noleg.err" | tr -d ' ')" 0
 
   rm -rf "$CASE/state"; mkdir -p "$CASE/state/burn.d"
   now=$(date +%s); old=$((now - 10)); reset=$((now + 10800)); printf -v oldname 'b_%012d_%012d_010.000_0000' "$reset" "$old"; : > "$CASE/state/burn.d/$oldname"

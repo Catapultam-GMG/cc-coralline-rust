@@ -555,16 +555,16 @@ case "${CORALLINE_TEST_NOW:-}" in
     fi ;;
 esac
 '@
-    $bashBarrierMarker = '  state_snapshot' + "`n" + '  if [ "$_STATE_BURN_GATE" = 1 ]; then'
+    $bashBarrierMarker = '  state_scan' + "`n" + '  if [ "$_STATE_BURN_GATE" = 1 ]; then [ "$_SB_DIR_COMPLETE" = 1 ] && [ "$_LEG_COMPLETE" = 1 ] && _SB_COMPLETE=1; fi'
     $bashBarrierHook = @'
-  state_snapshot
+  state_scan
   if [ -n "${CORALLINE_TEST_BARRIER:-}" ]; then
     set -C
     { : > "${CORALLINE_TEST_BARRIER}.$$.ready"; } 2>/dev/null || true
     set +C
     while [ ! -e "$CORALLINE_TEST_BARRIER" ]; do sleep 0.01; done
   fi
-  if [ "$_STATE_BURN_GATE" = 1 ]; then
+  if [ "$_STATE_BURN_GATE" = 1 ]; then [ "$_SB_DIR_COMPLETE" = 1 ] && [ "$_LEG_COMPLETE" = 1 ] && _SB_COMPLETE=1; fi
 '@
     $bashDumpMarker = "  state_prepare`nfi`n`n# Defensive ANSI stripper"
     $bashDumpHook = @'
