@@ -529,353 +529,409 @@ state_limit_name() {  # → _SLN_RST _SLN_PCT for one strict limit basename
   [ "$_SLN_PCT" -le 100000 ] || return 1
 }
 
-state_add_burn_path() {
-  local path="$1" name="$2" i plausible=0
-  _SB_RAW=$(( _SB_RAW + 1 ))
-  state_burn_name "$name" || return 0
-  [ -f "$path" ] && [ ! -L "$path" ] && [ ! -s "$path" ] || return 0
-  if [ "$_SBN_SAMP" -le $(( NOW + 300 )) ] && [ "$_SBN_RST" -ge "$_SBN_SAMP" ] \
-     && [ "$_SBN_RST" -le $(( NOW + RL_MAX_5H )) ]; then plausible=1; fi
-  i=${#_SB_NAMES[@]}
-  _SB_NAMES[$i]="$name"; _SB_PATHS[$i]="$path"; _SB_RSTS[$i]="$_SBN_RST"
-  _SB_SAMPS[$i]="$_SBN_SAMP"; _SB_PCTS[$i]="$_SBN_PCT"; _SB_PLAUS[$i]="$plausible"
-}
-
-state_add_limit_path() {  # $1=5|7 $2=path $3=name
-  local which="$1" path="$2" name="$3" i plausible=0 max
-  if [ "$which" = 5 ]; then _SL5_RAW=$(( _SL5_RAW + 1 )); max=$RL_MAX_5H
-  else _SL7_RAW=$(( _SL7_RAW + 1 )); max=$RL_MAX_7D; fi
-  state_limit_name "$name" || return 0
-  [ -d "$path" ] && [ ! -L "$path" ] || return 0
-  if [ "$_SLN_RST" -gt "$NOW" ] && [ "$_SLN_RST" -le $(( NOW + max )) ]; then plausible=1; fi
-  if [ "$which" = 5 ]; then
-    i=${#_SL5_NAMES[@]}; _SL5_NAMES[$i]="$name"; _SL5_PATHS[$i]="$path"
-    _SL5_RSTS[$i]="$_SLN_RST"; _SL5_PCTS[$i]="$_SLN_PCT"; _SL5_PLAUS[$i]="$plausible"
-  else
-    i=${#_SL7_NAMES[@]}; _SL7_NAMES[$i]="$name"; _SL7_PATHS[$i]="$path"
-    _SL7_RSTS[$i]="$_SLN_RST"; _SL7_PCTS[$i]="$_SLN_PCT"; _SL7_PLAUS[$i]="$plausible"
-  fi
-}
-
-state_mark_limit_nonempty() {  # $1=5|7 $2=strict parent basename
-  local which="$1" name="$2" i
-  if [ "$which" = 5 ]; then
-    for ((i=0; i<${#_SL5_NAMES[@]}; i++)); do
-      [ "${_SL5_NAMES[$i]}" = "$name" ] && _SL5_PLAUS[$i]=0
-    done
-  else
-    for ((i=0; i<${#_SL7_NAMES[@]}; i++)); do
-      [ "${_SL7_NAMES[$i]}" = "$name" ] && _SL7_PLAUS[$i]=0
-    done
-  fi
-}
-
-state_add_legacy_record() {
-  local record="$1" a b c rest i
-  case "$record" in (*$'\t'*$'\t'*) ;; (*) return 1 ;; esac
-  a="${record%%$'\t'*}"; rest="${record#*$'\t'}"
-  b="${rest%%$'\t'*}"; c="${rest#*$'\t'}"
-  case "$c" in (*$'\t'*) return 1 ;; esac
-  [[ "$a" =~ ^[0-9]{12}$ ]] && [[ "$b" =~ ^[0-9]{12}$ ]] && [[ "$c" =~ ^[0-9]{1,6}$ ]] || return 1
-  [ "$(( 10#$c ))" -le 100000 ] || return 1
-  i=${#_LEG_RSTS[@]}
-  _LEG_RSTS[$i]=$(( 10#$a )); _LEG_SAMPS[$i]=$(( 10#$b )); _LEG_PCTS[$i]=$(( 10#$c ))
-}
-
-state_snapshot() {  # one framed controller for every gated state root + legacy TSV
-  local record name phase=paths ctrl=$'\001' f_seen=0 l_seen=0 e_seen=0 bad=0
-  local f_status=missing l_status=missing combined=0 matched stream_over=0
+state_scan() {  # one bounded pass: enumerate, retain, and load every gated store
+  # A single find | od | awk pass enumerates, retains, and loads every gated
+  # store. Two ceilings are enforced in-stream by awk rather than after the
+  # fact, so a store far past its raw cap makes awk exit, od die, and find
+  # stop enumerating instead of draining the whole directory; render cost
+  # stays bounded by those caps rather than by the size of the store. The
+  # globals produced here are exactly the ones state_gc, state_publish,
+  # state_select_limit and burn_eta_5h already consume.
+  local _fstat _bad _over _lbad _sent _rep_n _leg_n _cand_k _k5 _k7 _off _odst _num _pi _ok=0
+  local _FB_OUT=() _FB_SLICE=() _FB_TMP=() _S5=() _S7=() _SCAN_AWKV=()
+  local _SCAN_LEG=/dev/null _SCAN_BROOT="" _SCAN_L5ROOT="" _SCAN_L7ROOT="" _SCAN_NOFIND=0
+  _SB_RAW=0; _SB_CAND_TOTAL=0; _SB_CAND_NAMES=(); _SB_CAND_PATHS=()
+  _SB_REP_RSTS=(); _SB_REP_SAMPS=(); _SB_REP_PCTS=()
   _LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=()
+  _SL5_RAW=0; _SL5_CAND_TOTAL=0; _SL5_CAND_NAMES=(); _SL5_CAND_PATHS=()
+  _SL5_STORED_VALID=0; _SL5_STORED_RST=0; _SL5_STORED_PCT=0
+  _SL7_RAW=0; _SL7_CAND_TOTAL=0; _SL7_CAND_NAMES=(); _SL7_CAND_PATHS=()
+  _SL7_STORED_VALID=0; _SL7_STORED_RST=0; _SL7_STORED_PCT=0
+  _SB_DIR_COMPLETE=0; _SL5_COMPLETE=0; _SL7_COMPLETE=0; _LEG_COMPLETE=0
+  [ "$_STATE_BURN_GATE" = 1 ] || [ "$_STATE_RL5_GATE" = 1 ] || [ "$_STATE_RL7_GATE" = 1 ] || return 0
+  [ "${#_STATE_FIND_ARGS[@]}" -gt 0 ] || _SCAN_NOFIND=1
+  [ "$_STATE_LEGACY_READ" != 1 ] || _SCAN_LEG="$_SB_BASE"
+  [ "$_STATE_BURN_GATE" != 1 ] || _SCAN_BROOT="$_SB_ROOT/./"
+  [ "$_STATE_RL5_GATE" != 1 ] || _SCAN_L5ROOT="$_SL5_ROOT/./"
+  [ "$_STATE_RL7_GATE" != 1 ] || _SCAN_L7ROOT="$_SL7_ROOT/./"
+
+  # The awk source is hoisted out of the process substitution below: bash 3.2
+  # cannot scan a process-substitution body this large, and test-burn.sh evals
+  # this whole block out of the file, so the program must stay free of single
+  # quotes and must not live in a separate file.
+  local _SCAN_PROG='
+    function pct_milli(raw,   pp, parts, whole, frac, six, keep, rest, milli) {
+      if (raw !~ /^(0|[1-9][0-9]?|100)(\.[0-9]{1,6})?$/) return -1
+      parts = split(raw, pp, ".")
+      whole = pp[1]
+      frac = (parts == 2 ? pp[2] : "")
+      if (whole == "100" && frac ~ /[1-9]/) return -1
+      six = substr(frac "000000", 1, 6)
+      keep = substr(six, 1, 3) + 0; rest = substr(six, 4, 3) + 0
+      milli = (whole + 0) * 1000 + keep
+      if (rest > 500 || (rest == 500 && milli % 2 == 1)) milli++
+      if (milli < 0 || milli > 100000) return -1
+      return milli
+    }
+    function epoch_ok(raw) {
+      if (raw !~ /^(0|[1-9][0-9]*)$/ || length(raw) > 12) return 0
+      if (length(raw) == 12 && raw > "253402300799") return 0
+      return 1
+    }
+    function pmark(n) {
+      if (length(n) != 40) return 0
+      if (n !~ /^b_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_(0[0-9][0-9]|100)\.[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9]$/) return 0
+      mrst = substr(n, 3, 12) + 0; msamp = substr(n, 16, 12) + 0
+      if (mrst > 253402300799 || msamp > 253402300799) return 0
+      mpct = (substr(n, 29, 3) + 0) * 1000 + (substr(n, 33, 3) + 0)
+      if (mpct > 100000) return 0
+      return 1
+    }
+    function lmark(n) {
+      if (length(n) != 18) return 0
+      if (n !~ /^[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_(0[0-9][0-9]|100)\.[0-9][0-9][0-9]$/) return 0
+      qrst = substr(n, 1, 10) + 0
+      qpct = (substr(n, 12, 3) + 0) * 1000 + (substr(n, 16, 3) + 0)
+      if (qpct > 100000) return 0
+      return 1
+    }
+    function qsort(a, lo, hi,   i, j, mid, t) {
+      while (lo < hi) {
+        i = lo; j = hi; mid = a[int((lo + hi) / 2)] ""
+        while (i <= j) {
+          while (a[i] "" < mid) i++
+          while (a[j] "" > mid) j--
+          if (i <= j) { t = a[i]; a[i] = a[j]; a[j] = t; i++; j-- }
+        }
+        if (j - lo < hi - i) { qsort(a, lo, j); lo = i } else { qsort(a, i, hi); hi = j }
+      }
+    }
+    function addcand(n) { ncand++; if (ncand <= 128) cand[ncand] = n }
+    function flushgrp(   j, rep) {
+      if (gn == 0) return
+      rep = 1
+      for (j = 2; j <= gn; j++) if (gpct[j] > gpct[rep]) rep = j
+      for (j = 1; j <= gn; j++) if (j != rep) addcand(gnam[j])
+      nrep++
+      rnam[nrep] = gnam[rep]; rrst[nrep] = grst[rep]
+      rsam[nrep] = gsam[rep]; rpct[nrep] = gpct[rep]
+      gn = 0; gkey = ""
+    }
+    function markchild(w, rest,   par) {
+      par = substr(rest, 1, index(rest, "/") - 1)
+      if (w == 5) {
+        c5n++
+        if (c5n > 512) { over = 1; return }
+        if (par in pl5) pl5[par] = 0
+      } else {
+        c7n++
+        if (c7n > 512) { over = 1; return }
+        if (par in pl7) pl7[par] = 0
+      }
+    }
+    function burnent(nm, cls) {
+      braw++
+      if (braw > 4096) { over = 1; return }
+      if (cls != 1) return
+      if (!pmark(nm)) return
+      bn++; bnam[bn] = nm
+      plb[nm] = (msamp <= now + 300 && mrst >= msamp && mrst <= now + maxahead) ? 1 : 0
+    }
+    function limitent(w, nm, cls) {
+      if (w == 5) { raw5++; if (raw5 > 512) { over = 1; return } }
+      else { raw7++; if (raw7 > 512) { over = 1; return } }
+      if (cls != 2) return
+      if (!lmark(nm)) return
+      if (w == 5) {
+        n5++; e5[n5] = nm; r5[nm] = qrst; v5[nm] = qpct
+        pl5[nm] = (qrst > now && qrst <= now + maxahead) ? 1 : 0
+      } else {
+        n7++; e7[n7] = nm; r7[nm] = qrst; v7[nm] = qpct
+        pl7[nm] = (qrst > now && qrst <= now + max7) ? 1 : 0
+      }
+    }
+    function emit(p, cls,   rest) {
+      if (over) return
+      if (blen > 0 && p == broot0) return
+      if (l5len > 0 && p == l5root0) return
+      if (l7len > 0 && p == l7root0) return
+      comb++
+      if (comb > 5120) { over = 1; return }
+      if (blen > 0 && substr(p, 1, blen) == broot) {
+        rest = substr(p, blen + 1)
+        if (index(rest, "/") > 0) return
+      }
+      if (l5len > 0 && substr(p, 1, l5len) == l5root) {
+        rest = substr(p, l5len + 1)
+        if (index(rest, "/") > 0) { markchild(5, rest); return }
+      }
+      if (l7len > 0 && substr(p, 1, l7len) == l7root) {
+        rest = substr(p, l7len + 1)
+        if (index(rest, "/") > 0) { markchild(7, rest); return }
+      }
+      if (blen > 0 && substr(p, 1, blen) == broot) { burnent(substr(p, blen + 1), cls); return }
+      if (l5len > 0 && substr(p, 1, l5len) == l5root) { limitent(5, substr(p, l5len + 1), cls); return }
+      if (l7len > 0 && substr(p, 1, l7len) == l7root) { limitent(7, substr(p, l7len + 1), cls); return }
+      bad = 1
+    }
+    function flushrun() {
+      if (runn > 0) emit(runp, runn)
+      runn = 0; runp = ""
+    }
+    function pathrec(p) {
+      if (p == "/dev/null") { flushrun(); sawend = 1; seg = 2; return }
+      if (substr(p, 1, 1) != "/") { bad = 1; return }
+      if (runn > 0 && p == runp) { runn++; return }
+      flushrun()
+      runp = p; runn = 1
+    }
+    function legrec(   f, nf, sample, reset, pctm, slot) {
+      lrows++
+      if (lrows > 4096) { lbad = 1; return }
+      if (!rascii) { lrec = ""; llen = 0; rascii = 1; return }
+      nf = split(lrec, f, "\t")
+      if (nf == 3 && epoch_ok(f[1]) && epoch_ok(f[3])) {
+        sample = f[1] + 0; reset = f[3] + 0; pctm = pct_milli(f[2])
+        if (pctm >= 0 && sample <= now + 300 && reset >= sample && reset <= now + maxahead) {
+          lval++
+          slot = ((lval - 1) % 512) + 1
+          kr[slot] = reset; ks[slot] = sample; kp[slot] = pctm
+        }
+      }
+      lrec = ""; llen = 0; rascii = 1
+    }
+    BEGIN {
+      seg = 1; rascii = 1; runn = 0
+      blen = length(broot); l5len = length(l5root); l7len = length(l7root)
+      broot0 = substr(broot, 1, blen - 1)
+      l5root0 = substr(l5root, 1, l5len - 1)
+      l7root0 = substr(l7root, 1, l7len - 1)
+      if (nofind) { seg = 2; sawend = 1 }
+      for (i = 1; i < 256; i++) ch[i] = sprintf("%c", i)
+    }
+    {
+      for (i = 1; i <= NF; i++) {
+        b = $i + 0
+        if (seg == 1) {
+          if (b == 0) {
+            pathrec(prec); prec = ""; plen = 0
+            if (over) { exit 0 }
+          } else {
+            plen++
+            if (plen > 65536) { bad = 1; exit 0 }
+            prec = prec ch[b]
+          }
+        } else {
+          lbytes++
+          if (lbytes > 1048576) { lbad = 1; exit 0 }
+          if (b == 10) { legrec(); if (lbad) { exit 0 }; continue }
+          llen++
+          if (llen > 4096) { lbad = 1; exit 0 }
+          if (b == 9 || b == 46 || (b >= 48 && b <= 57)) lrec = lrec ch[b]
+          else rascii = 0
+        }
+      }
+    }
+    END {
+      if (seg == 1) { flushrun(); if (plen > 0) bad = 1 }
+      else if (!lbad && llen > 0) legrec()
+      qsort(bnam, 1, bn)
+      gn = 0; gkey = ""
+      for (i = 1; i <= bn; i++) {
+        nm = bnam[i]
+        pmark(nm)
+        if (plb[nm] != 1) { flushgrp(); addcand(nm); continue }
+        key = mrst "_" msamp
+        if (key != gkey) { flushgrp(); gkey = key }
+        gn++; gnam[gn] = nm; grst[gn] = mrst; gsam[gn] = msamp; gpct[gn] = mpct
+      }
+      flushgrp()
+      keep = nrep - trim; if (keep < 0) keep = 0
+      for (i = 1; i <= keep; i++) addcand(rnam[i])
+      qsort(e5, 1, n5); qsort(e7, 1, n7)
+      w5 = ""; for (i = 1; i <= n5; i++) if (pl5[e5[i]] == 1) w5 = e5[i]
+      w7 = ""; for (i = 1; i <= n7; i++) if (pl7[e7[i]] == 1) w7 = e7[i]
+      nc5 = 0; k5 = 0
+      for (i = 1; i <= n5; i++) if (e5[i] != w5) { nc5++; if (nc5 <= 128) { k5++; cd5[k5] = e5[i] } }
+      nc7 = 0; k7 = 0
+      for (i = 1; i <= n7; i++) if (e7[i] != w7) { nc7++; if (nc7 <= 128) { k7++; cd7[k7] = e7[i] } }
+      sv5 = 0; sr5 = 0; sp5 = 0
+      if (w5 != "") { sv5 = 1; sr5 = r5[w5]; sp5 = v5[w5] }
+      sv7 = 0; sr7 = 0; sp7 = 0
+      if (w7 != "") { sv7 = 1; sr7 = r7[w7]; sp7 = v7[w7] }
+      if (lbad) lval = 0
+      lfirst = lval - 511; if (lfirst < 1) lfirst = 1
+      # v0.11 append order can contain same-second cache-lag rows whose pct
+      # decreases. Sort the capped source by the estimator key so the Bash merge
+      # always takes its constant-time tail-append path.
+      nleg = 0
+      for (i = lfirst; i <= lval; i++) {
+        sl = ((i - 1) % 512) + 1; nleg++
+        lout[nleg] = sprintf("%012d_%012d_%06d_%04d", kr[sl], ks[sl], kp[sl], nleg)
+      }
+      qsort(lout, 1, nleg)
+      k = (ncand < 128 ? ncand : 128)
+      printf "SENT %d\n", (sawend ? 1 : 0)
+      printf "BAD %d\n", (bad ? 1 : 0)
+      printf "OVER %d\n", (over ? 1 : 0)
+      printf "LBAD %d\n", (lbad ? 1 : 0)
+      printf "RAW %d\n", braw
+      printf "CTOTAL %d\n", ncand
+      printf "REPN %d\n", nrep
+      printf "LEGN %d\n", nleg
+      printf "S5 %d %d %d %d %d %d\n", raw5, nc5, sv5, sr5, sp5, k5
+      printf "S7 %d %d %d %d %d %d\n", raw7, nc7, sv7, sr7, sp7, k7
+      for (i = 1; i <= k; i++) printf "%s\n", cand[i]
+      for (i = 1; i <= nleg; i++)
+        printf "%d %d %d\n", substr(lout[i], 1, 12) + 0, substr(lout[i], 14, 12) + 0, substr(lout[i], 27, 6) + 0
+      for (i = 1; i <= nrep; i++) printf "%d %d %d\n", rrst[i], rsam[i], rpct[i]
+      for (i = 1; i <= k5; i++) printf "%s\n", cd5[i]
+      for (i = 1; i <= k7; i++) printf "%s\n", cd7[i]
+      printf "EOD\n"
+    }
+  '
+
+  # One controller shell, exactly as before this file grew a second pass: the
+  # process substitution below is the only shell forked per render, and find, od
+  # and awk are plain members of its pipeline, so the shell reaps all three and
+  # PIPESTATUS carries find's and od's exit codes out as trailer lines.
+  #
+  # /dev/null is find's last path operand, so it is enumerated after every root
+  # and its record is the in-band end-of-enumeration sentinel; everything the od
+  # stream carries after it is legacy TSV. It gets its own -path branch (one
+  # print) rather than falling into the catch-all, because the catch-all prints
+  # three times and the classification below only learns a run length once the
+  # *next* record arrives — nothing follows the sentinel. No store path can
+  # collide with it: roots end in .d and their entries carry the root prefix.
+  #
+  # od reads the enumeration by name, not from its stdin: BSD od switches
+  # operands with freopen(path, "r", stdin), which closes fd 0 before opening
+  # the path, so a /dev/stdin operand always dies with EBADF. The pipe is
+  # therefore duplicated onto fd 8 and named as /dev/fd/8 — freopen then
+  # closes only the throwaway /dev/null on fd 0 — which both BSD and GNU od
+  # open like any other file.
+  #
+  # Type and size are read at enumeration time and carried out-of-band as the
+  # number of times find repeats a path: 1 = zero-byte regular file (a live burn
+  # marker), 2 = directory (a limit entry), 3 = anything else (symlink, non-empty
+  # file, …). -P makes -type f/-type d false for symlinks, so the multiplicity
+  # reproduces the [ -f ] && [ ! -L ] && [ ! -s ] and [ -d ] && [ ! -L ] trust
+  # checks without a second stat pass or a second process. Dropping -mindepth 1
+  # to let /dev/null through also admits the depth-0 root records, which awk
+  # discards by comparing against the same roots it is given via -v.
+  _SCAN_AWKV=( -v "now=$NOW" -v "maxahead=$RL_MAX_5H" -v "max7=$RL_MAX_7D" \
+               -v "trim=$BURN_TRIM" -v "nofind=$_SCAN_NOFIND" -v "broot=$_SCAN_BROOT" \
+               -v "l5root=$_SCAN_L5ROOT" -v "l7root=$_SCAN_L7ROOT" )
   exec 9< <(
     if [ "${#_STATE_FIND_ARGS[@]}" -gt 0 ]; then
-      LC_ALL=C find -P "${_STATE_FIND_ARGS[@]}" -mindepth 1 -maxdepth 2 -print0 2>/dev/null
-      _sf=$?
+      LC_ALL=C find -P "${_STATE_FIND_ARGS[@]}" /dev/null -maxdepth 2 \( -path /dev/null -print0 -o -type f -size 0 -print0 -o -type d -print0 -print0 -o -print0 -print0 -print0 \) 2>/dev/null | LC_ALL=C od -An -v -tu1 -- /dev/fd/8 "$_SCAN_LEG" 8<&0 0</dev/null 2>/dev/null | LC_ALL=C awk "${_SCAN_AWKV[@]}" "$_SCAN_PROG"
+      _st=("${PIPESTATUS[@]}")
+      printf 'FSTAT %s\nODSTAT %s\n' "${_st[0]}" "${_st[1]}"
     else
-      _sf=0
+      LC_ALL=C od -An -v -tu1 -- "$_SCAN_LEG" 2>/dev/null | LC_ALL=C awk "${_SCAN_AWKV[@]}" "$_SCAN_PROG"
+      _st=("${PIPESTATUS[@]}")
+      printf 'FSTAT 0\nODSTAT %s\n' "${_st[0]}"
     fi
-    printf '\001F:%s\0' "$_sf" || exit 0
-    if [ "$_STATE_LEGACY_READ" = 1 ]; then
-      LC_ALL=C od -An -v -N 1048577 -tu1 -- "$_SB_BASE" 2>/dev/null | LC_ALL=C awk \
-        -v now="$NOW" -v maxahead="$RL_MAX_5H" '
-        function pct_milli(raw, parts, whole, frac, six, keep, rest, milli, last) {
-          if (raw !~ /^(0|[1-9][0-9]?|100)(\.[0-9]{1,6})?$/) return -1
-          parts = split(raw, p, "."); whole = p[1]
-          frac = (parts == 2 ? p[2] : "")
-          if (whole == "100" && frac ~ /[1-9]/) return -1
-          six = substr(frac "000000", 1, 6)
-          keep = substr(six, 1, 3) + 0; rest = substr(six, 4, 3) + 0
-          milli = (whole + 0) * 1000 + keep
-          if (rest > 500 || (rest == 500 && milli % 2 == 1)) milli++
-          if (milli < 0 || milli > 100000) return -1
-          return milli
-        }
-        function epoch_ok(raw, value) {
-          if (raw !~ /^(0|[1-9][0-9]*)$/ || length(raw) > 12) return 0
-          if (length(raw) == 12 && raw > "253402300799") return 0
-          return 1
-        }
-        function finish_record( fields, nf, sample, reset, pctm, canon, slot) {
-          rows++
-          if (rows > 4096) { bad = 1; return }
-          if (!row_ascii) { rec = ""; rec_len = 0; row_ascii = 1; return }
-          nf = split(rec, fields, "\t")
-          if (nf == 3 && epoch_ok(fields[1]) && epoch_ok(fields[3])) {
-            sample = fields[1] + 0; reset = fields[3] + 0; pctm = pct_milli(fields[2])
-            if (pctm >= 0 && sample <= now + 300 && reset >= sample && reset <= now + maxahead) {
-              canon = sprintf("%012d\t%012d\t%d", reset, sample, pctm)
-              valid++
-              slot = ((valid - 1) % 512) + 1
-              ring[slot] = canon
-            }
-          }
-          rec = ""; rec_len = 0; row_ascii = 1
-        }
-        BEGIN { row_ascii = 1 }
-        {
-          for (i = 1; i <= NF; i++) {
-            byte = $i + 0; bytes++
-            if (bytes > 1048576) { bad = 1; exit 42 }
-            if (byte == 10) { finish_record(); if (bad) exit 42; continue }
-            rec_len++
-            if (rec_len > 4096) { bad = 1; exit 42 }
-            if (byte == 9 || byte == 46 || (byte >= 48 && byte <= 57)) rec = rec sprintf("%c", byte)
-            else row_ascii = 0
-          }
-        }
-        END {
-          if (!bad && rec_len > 0) finish_record()
-          if (bad) exit 42
-          first = valid - 511; if (first < 1) first = 1
-          for (i = first; i <= valid; i++) printf "%s%c", ring[((i - 1) % 512) + 1], 0
-        }'
-      _sp=("${PIPESTATUS[@]}")
-      printf '\001L:%s:%s\0' "${_sp[0]}" "${_sp[1]}" || exit 0
-    else
-      printf '\001L:0:0\0' || exit 0
-    fi
-    printf '\001E\0'
   )
-  while IFS= read -r -d '' -u 9 record; do
-    case "$record" in
-      ("${ctrl}F:"*)
-        [ "$phase" = paths ] && [ "$f_seen" -eq 0 ] || { bad=1; continue; }
-        f_seen=1; f_status="${record#?F:}"; phase=legacy
-        case "$f_status" in (''|*[!0-9]*) bad=1 ;; esac
-        ;;
-      ("${ctrl}L:"*)
-        [ "$phase" = legacy ] && [ "$l_seen" -eq 0 ] || { bad=1; continue; }
-        l_seen=1; l_status="${record#?L:}"; phase=end
-        case "$l_status" in ([0-9]*:[0-9]*) ;; (*) bad=1 ;; esac
-        ;;
-      ("${ctrl}E")
-        [ "$phase" = end ] && [ "$e_seen" -eq 0 ] || { bad=1; continue; }
-        e_seen=1; phase=done
-        ;;
-      (/*)
-        [ "$phase" = paths ] || { bad=1; continue; }
-        combined=$(( combined + 1 )); matched=0
-        if [ "$_STATE_BURN_GATE" = 1 ]; then
-          case "$record" in ("$_SB_ROOT/./"*/*) matched=1 ;; esac
-        fi
-        if [ "$matched" -eq 0 ] && [ "$_STATE_RL5_GATE" = 1 ]; then
-          case "$record" in
-            ("$_SL5_ROOT/./"*/*)
-              name="${record#"$_SL5_ROOT/./"}"; name="${name%%/*}"
-              state_mark_limit_nonempty 5 "$name"; _SL5_CHILD_RAW=$(( _SL5_CHILD_RAW + 1 )); matched=1
-              [ "$_SL5_CHILD_RAW" -le 512 ] || stream_over=1
-              ;;
-          esac
-        fi
-        if [ "$matched" -eq 0 ] && [ "$_STATE_RL7_GATE" = 1 ]; then
-          case "$record" in
-            ("$_SL7_ROOT/./"*/*)
-              name="${record#"$_SL7_ROOT/./"}"; name="${name%%/*}"
-              state_mark_limit_nonempty 7 "$name"; _SL7_CHILD_RAW=$(( _SL7_CHILD_RAW + 1 )); matched=1
-              [ "$_SL7_CHILD_RAW" -le 512 ] || stream_over=1
-              ;;
-          esac
-        fi
-        if [ "$matched" -eq 0 ] && [ "$_STATE_BURN_GATE" = 1 ]; then
-          case "$record" in ("$_SB_ROOT/./"*) name="${record#"$_SB_ROOT/./"}"; state_add_burn_path "$_SB_ROOT/$name" "$name"; matched=1 ;; esac
-          [ "$_SB_RAW" -le 4096 ] || stream_over=1
-        fi
-        if [ "$matched" -eq 0 ] && [ "$_STATE_RL5_GATE" = 1 ]; then
-          case "$record" in ("$_SL5_ROOT/./"*) name="${record#"$_SL5_ROOT/./"}"; state_add_limit_path 5 "$_SL5_ROOT/$name" "$name"; matched=1 ;; esac
-          [ "$_SL5_RAW" -le 512 ] || stream_over=1
-        fi
-        if [ "$matched" -eq 0 ] && [ "$_STATE_RL7_GATE" = 1 ]; then
-          case "$record" in ("$_SL7_ROOT/./"*) name="${record#"$_SL7_ROOT/./"}"; state_add_limit_path 7 "$_SL7_ROOT/$name" "$name"; matched=1 ;; esac
-          [ "$_SL7_RAW" -le 512 ] || stream_over=1
-        fi
-        [ "$matched" -eq 1 ] || bad=1
-        [ "$combined" -le 5120 ] || stream_over=1
-        if [ "$stream_over" -eq 1 ]; then exec 9<&-; break; fi
-        ;;
-      (*)
-        if [ "$phase" = legacy ] && [ "${record:0:1}" != "$ctrl" ]; then
-          state_add_legacy_record "$record" || bad=1
-        else bad=1; fi
-        ;;
-    esac
-  done
-  exec 9<&- 2>/dev/null || true
-  if [ "$stream_over" -eq 1 ]; then
-    _SB_DIR_COMPLETE=0; _SL5_COMPLETE=0; _SL7_COMPLETE=0; _LEG_COMPLETE=0
-    _LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=()
-    return 0
+  IFS=$'\n' read -r -d '' -a _FB_OUT <&9 || true
+  # The brace group scopes the guard: `exec 9<&- 2>/dev/null` has no command
+  # word, so its redirection would stick for the rest of the process and silence
+  # every later diagnostic. Wrapping it keeps the close permanent and the
+  # silence temporary — one close error swallowed, nothing else.
+  { exec 9<&-; } 2>/dev/null || true
+
+  [ "${#_FB_OUT[@]}" -ge 13 ] || return 0
+  case "${_FB_OUT[0]}"  in ("SENT "*)   _sent="${_FB_OUT[0]#SENT }" ;;     (*) return 0 ;; esac
+  case "${_FB_OUT[1]}"  in ("BAD "*)    _bad="${_FB_OUT[1]#BAD }" ;;       (*) return 0 ;; esac
+  case "${_FB_OUT[2]}"  in ("OVER "*)   _over="${_FB_OUT[2]#OVER }" ;;     (*) return 0 ;; esac
+  case "${_FB_OUT[3]}"  in ("LBAD "*)   _lbad="${_FB_OUT[3]#LBAD }" ;;     (*) return 0 ;; esac
+  case "${_FB_OUT[4]}"  in ("RAW "*)    _SB_RAW="${_FB_OUT[4]#RAW }" ;;    (*) return 0 ;; esac
+  case "${_FB_OUT[5]}"  in ("CTOTAL "*) _SB_CAND_TOTAL="${_FB_OUT[5]#CTOTAL }" ;; (*) return 0 ;; esac
+  case "${_FB_OUT[6]}"  in ("REPN "*)   _rep_n="${_FB_OUT[6]#REPN }" ;;    (*) return 0 ;; esac
+  case "${_FB_OUT[7]}"  in ("LEGN "*)   _leg_n="${_FB_OUT[7]#LEGN }" ;;    (*) return 0 ;; esac
+  case "${_FB_OUT[8]}"  in ("S5 "*)     _S5=( ${_FB_OUT[8]#S5 } ) ;;       (*) return 0 ;; esac
+  case "${_FB_OUT[9]}"  in ("S7 "*)     _S7=( ${_FB_OUT[9]#S7 } ) ;;      (*) return 0 ;; esac
+  [ "${#_S5[@]}" -eq 6 ] && [ "${#_S7[@]}" -eq 6 ] || return 0
+  _num="$_SB_RAW$_SB_CAND_TOTAL$_rep_n$_leg_n"
+  for _off in "${_S5[@]}" "${_S7[@]}"; do _num="$_num$_off"; done
+  case "$_num" in (''|*[!0-9]*) _SB_RAW=0; _SB_CAND_TOTAL=0; return 0 ;; esac
+
+  _cand_k=$_SB_CAND_TOTAL; [ "$_cand_k" -gt 128 ] && _cand_k=128
+  _k5="${_S5[5]}"; _k7="${_S7[5]}"
+  # EOD is awk's own terminator: it is the last thing END prints, so seeing it in
+  # the expected slot proves awk ran to completion rather than being killed.
+  _off=$(( 10 + _cand_k + _leg_n + _rep_n + _k5 + _k7 ))
+  [ "${#_FB_OUT[@]}" -eq $(( _off + 3 )) ] || { _SB_RAW=0; _SB_CAND_TOTAL=0; return 0; }
+  [ "${_FB_OUT[$_off]}" = EOD ] || { _SB_RAW=0; _SB_CAND_TOTAL=0; return 0; }
+  case "${_FB_OUT[$(( _off + 1 ))]}" in
+    ("FSTAT "*) _fstat="${_FB_OUT[$(( _off + 1 ))]#FSTAT }" ;;
+    (*) _SB_RAW=0; _SB_CAND_TOTAL=0; return 0 ;;
+  esac
+  case "${_FB_OUT[$(( _off + 2 ))]}" in
+    ("ODSTAT "*) _odst="${_FB_OUT[$(( _off + 2 ))]#ODSTAT }" ;;
+    (*) _SB_RAW=0; _SB_CAND_TOTAL=0; return 0 ;;
+  esac
+
+  _off=10
+  if [ "$_cand_k" -gt 0 ]; then
+    _SB_CAND_NAMES=("${_FB_OUT[@]:$_off:$_cand_k}")
+    # Literal concatenation, not ${a[@]/#/...}: bash 5.2's default
+    # patsub_replacement expands & in the replacement, corrupting roots
+    # that contain an ampersand.
+    _SB_CAND_PATHS=()
+    for ((_pi=0; _pi<_cand_k; _pi++)); do _SB_CAND_PATHS[_pi]="$_SB_ROOT/${_SB_CAND_NAMES[$_pi]}"; done
   fi
-  [ "$f_seen" -eq 1 ] && [ "$l_seen" -eq 1 ] && [ "$e_seen" -eq 1 ] && [ "$phase" = done ] || bad=1
-  [ "$bad" -eq 0 ] || { _SB_DIR_COMPLETE=0; _SL5_COMPLETE=0; _SL7_COMPLETE=0; _LEG_COMPLETE=0; _LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=(); return 0; }
-  if [ "$f_status" = 0 ]; then
-    [ "$_SB_DIR_PREOK" = 1 ] && _SB_DIR_COMPLETE=1
-    [ "$_SL5_DIR_PREOK" = 1 ] && _SL5_COMPLETE=1
-    [ "$_SL7_DIR_PREOK" = 1 ] && _SL7_COMPLETE=1
+  _off=$(( _off + _cand_k ))
+  if [ "$_leg_n" -gt 0 ]; then
+    _FB_SLICE=("${_FB_OUT[@]:$_off:$_leg_n}")
+    _LEG_RSTS=("${_FB_SLICE[@]%% *}")
+    _FB_TMP=("${_FB_SLICE[@]#* }")
+    _LEG_SAMPS=("${_FB_TMP[@]%% *}")
+    _LEG_PCTS=("${_FB_TMP[@]##* }")
   fi
-  if [ "$l_status" = 0:0 ] && [ "$_LEG_PREOK" = 1 ]; then _LEG_COMPLETE=1
+  _off=$(( _off + _leg_n ))
+  if [ "$_rep_n" -gt 0 ]; then
+    _FB_SLICE=("${_FB_OUT[@]:$_off:$_rep_n}")
+    _SB_REP_RSTS=("${_FB_SLICE[@]%% *}")
+    _FB_TMP=("${_FB_SLICE[@]#* }")
+    _SB_REP_SAMPS=("${_FB_TMP[@]%% *}")
+    _SB_REP_PCTS=("${_FB_TMP[@]##* }")
+  fi
+  _off=$(( _off + _rep_n ))
+  if [ "$_k5" -gt 0 ]; then
+    _SL5_CAND_NAMES=("${_FB_OUT[@]:$_off:$_k5}")
+    _SL5_CAND_PATHS=()
+    for ((_pi=0; _pi<_k5; _pi++)); do _SL5_CAND_PATHS[_pi]="$_SL5_ROOT/${_SL5_CAND_NAMES[$_pi]}"; done
+  fi
+  _off=$(( _off + _k5 ))
+  if [ "$_k7" -gt 0 ]; then
+    _SL7_CAND_NAMES=("${_FB_OUT[@]:$_off:$_k7}")
+    _SL7_CAND_PATHS=()
+    for ((_pi=0; _pi<_k7; _pi++)); do _SL7_CAND_PATHS[_pi]="$_SL7_ROOT/${_SL7_CAND_NAMES[$_pi]}"; done
+  fi
+  _SL5_RAW="${_S5[0]}"; _SL5_CAND_TOTAL="${_S5[1]}"; _SL5_STORED_VALID="${_S5[2]}"
+  _SL5_STORED_RST="${_S5[3]}"; _SL5_STORED_PCT="${_S5[4]}"
+  _SL7_RAW="${_S7[0]}"; _SL7_CAND_TOTAL="${_S7[1]}"; _SL7_STORED_VALID="${_S7[2]}"
+  _SL7_STORED_RST="${_S7[3]}"; _SL7_STORED_PCT="${_S7[4]}"
+
+  # The two sources stay independently trusted even though one od now reads both.
+  # od takes its operands in order, so the enumeration is fully delivered before
+  # the legacy TSV is ever opened, and the sentinel certifies that delivery: no
+  # /dev/null record means od died mid-enumeration, so fail closed. That lets the
+  # directory flags rest on the enumeration alone — an unreadable or unopenable
+  # legacy TSV must not freeze the limit stores, exactly as when the legacy
+  # reader was its own pipeline. find itself exiting nonzero still fails closed.
+  [ "$_bad" = 0 ] && [ "$_over" = 0 ] && [ "$_sent" = 1 ] && [ "$_fstat" = 0 ] && _ok=1
+  [ "$_ok" = 1 ] && [ "$_SB_DIR_PREOK" = 1 ] && _SB_DIR_COMPLETE=1
+  [ "$_ok" = 1 ] && [ "$_SL5_DIR_PREOK" = 1 ] && _SL5_COMPLETE=1
+  [ "$_ok" = 1 ] && [ "$_SL7_DIR_PREOK" = 1 ] && _SL7_COMPLETE=1
+  # Every deliberate in-stream stop by awk also sets over, bad, or lbad, and
+  # this condition already rejects all three, so od's exit status only gates
+  # the legacy source when the teardown was not awk's own doing.
+  if [ "$_bad" = 0 ] && [ "$_over" = 0 ] && [ "$_lbad" = 0 ] && [ "$_sent" = 1 ] \
+     && [ "$_LEG_PREOK" = 1 ] \
+     && [ "$_odst" = 0 ]; then _LEG_COMPLETE=1
   else _LEG_RSTS=(); _LEG_SAMPS=(); _LEG_PCTS=(); fi
-}
-
-state_sort_order() {  # → _SORT_ORDER; stable bottom-up merge sort of _SORT_KEYS
-  local n i width left mid right a b k pick LC_ALL=C
-  local work=()
-  _SORT_ORDER=(); n=${#_SORT_KEYS[@]}
-  for ((i=0; i<n; i++)); do _SORT_ORDER[$i]=$i; done
-  width=1
-  while [ "$width" -lt "$n" ]; do
-    work=(); left=0
-    while [ "$left" -lt "$n" ]; do
-      mid=$(( left + width )); [ "$mid" -gt "$n" ] && mid=$n
-      right=$(( left + width + width )); [ "$right" -gt "$n" ] && right=$n
-      a=$left; b=$mid; k=$left
-      while [ "$a" -lt "$mid" ] || [ "$b" -lt "$right" ]; do
-        if [ "$b" -ge "$right" ]; then pick=${_SORT_ORDER[$a]}; a=$(( a + 1 ))
-        elif [ "$a" -ge "$mid" ]; then pick=${_SORT_ORDER[$b]}; b=$(( b + 1 ))
-        elif [[ "${_SORT_KEYS[${_SORT_ORDER[$b]}]}" < "${_SORT_KEYS[${_SORT_ORDER[$a]}]}" ]]; then
-          pick=${_SORT_ORDER[$b]}; b=$(( b + 1 ))
-        else pick=${_SORT_ORDER[$a]}; a=$(( a + 1 ))
-        fi
-        work[$k]=$pick; k=$(( k + 1 ))
-      done
-      left=$right
-    done
-    _SORT_ORDER=("${work[@]}"); width=$(( width + width ))
-  done
-}
-
-state_sort_burn() {
-  local i j n
-  local names=() paths=() rsts=() samps=() pcts=() plaus=()
-  [ "${#_SB_NAMES[@]}" -gt 0 ] || return 0
-  _SORT_KEYS=("${_SB_NAMES[@]}"); state_sort_order; n=${#_SORT_ORDER[@]}
-  for ((i=0; i<n; i++)); do
-    j=${_SORT_ORDER[$i]}; names[$i]="${_SB_NAMES[$j]}"; paths[$i]="${_SB_PATHS[$j]}"
-    rsts[$i]="${_SB_RSTS[$j]}"; samps[$i]="${_SB_SAMPS[$j]}"
-    pcts[$i]="${_SB_PCTS[$j]}"; plaus[$i]="${_SB_PLAUS[$j]}"
-  done
-  _SB_NAMES=("${names[@]}"); _SB_PATHS=("${paths[@]}"); _SB_RSTS=("${rsts[@]}")
-  _SB_SAMPS=("${samps[@]}"); _SB_PCTS=("${pcts[@]}"); _SB_PLAUS=("${plaus[@]}")
-  _SORT_KEYS=(); _SORT_ORDER=()
-}
-
-state_sort_limit() {  # $1=5|7
-  local which="$1" i j n
-  local names=() paths=() rsts=() pcts=() plaus=()
-  if [ "$which" = 5 ]; then
-    [ "${#_SL5_NAMES[@]}" -gt 0 ] || return 0
-    _SORT_KEYS=("${_SL5_NAMES[@]}")
-  else
-    [ "${#_SL7_NAMES[@]}" -gt 0 ] || return 0
-    _SORT_KEYS=("${_SL7_NAMES[@]}")
-  fi
-  state_sort_order; n=${#_SORT_ORDER[@]}
-  for ((i=0; i<n; i++)); do
-    j=${_SORT_ORDER[$i]}
-    if [ "$which" = 5 ]; then
-      names[$i]="${_SL5_NAMES[$j]}"; paths[$i]="${_SL5_PATHS[$j]}"; rsts[$i]="${_SL5_RSTS[$j]}"
-      pcts[$i]="${_SL5_PCTS[$j]}"; plaus[$i]="${_SL5_PLAUS[$j]}"
-    else
-      names[$i]="${_SL7_NAMES[$j]}"; paths[$i]="${_SL7_PATHS[$j]}"; rsts[$i]="${_SL7_RSTS[$j]}"
-      pcts[$i]="${_SL7_PCTS[$j]}"; plaus[$i]="${_SL7_PLAUS[$j]}"
-    fi
-  done
-  if [ "$which" = 5 ]; then
-    _SL5_NAMES=("${names[@]}"); _SL5_PATHS=("${paths[@]}"); _SL5_RSTS=("${rsts[@]}")
-    _SL5_PCTS=("${pcts[@]}"); _SL5_PLAUS=("${plaus[@]}")
-  else
-    _SL7_NAMES=("${names[@]}"); _SL7_PATHS=("${paths[@]}"); _SL7_RSTS=("${rsts[@]}")
-    _SL7_PCTS=("${pcts[@]}"); _SL7_PLAUS=("${plaus[@]}")
-  fi
-  _SORT_KEYS=(); _SORT_ORDER=()
-}
-
-state_burn_retention() {
-  local i n key group_key="" rep=-1 j keep_from reps=0 LC_ALL=C
-  local group=() rep_names=() rep_paths=() rep_rsts=() rep_samps=() rep_pcts=()
-  _SB_CAND_NAMES=(); _SB_CAND_PATHS=()
-  state_sort_burn
-  n=${#_SB_NAMES[@]}
-  for ((i=0; i<=n; i++)); do
-    if [ "$i" -lt "$n" ] && [ "${_SB_PLAUS[$i]}" = 1 ]; then key="${_SB_RSTS[$i]}_${_SB_SAMPS[$i]}"; else key=""; fi
-    if [ -n "$group_key" ] && { [ "$key" != "$group_key" ] || [ "$i" -eq "$n" ]; }; then
-      for j in "${group[@]}"; do
-        if [ "$j" -ne "$rep" ]; then
-          _SB_CAND_NAMES[${#_SB_CAND_NAMES[@]}]="${_SB_NAMES[$j]}"
-          _SB_CAND_PATHS[${#_SB_CAND_PATHS[@]}]="${_SB_PATHS[$j]}"
-        fi
-      done
-      rep_names[$reps]="${_SB_NAMES[$rep]}"; rep_paths[$reps]="${_SB_PATHS[$rep]}"
-      rep_rsts[$reps]="${_SB_RSTS[$rep]}"; rep_samps[$reps]="${_SB_SAMPS[$rep]}"; rep_pcts[$reps]="${_SB_PCTS[$rep]}"
-      reps=$(( reps + 1 )); group=(); group_key=""; rep=-1
-    fi
-    [ "$i" -lt "$n" ] || continue
-    if [ "${_SB_PLAUS[$i]}" != 1 ]; then
-      _SB_CAND_NAMES[${#_SB_CAND_NAMES[@]}]="${_SB_NAMES[$i]}"
-      _SB_CAND_PATHS[${#_SB_CAND_PATHS[@]}]="${_SB_PATHS[$i]}"
-      continue
-    fi
-    key="${_SB_RSTS[$i]}_${_SB_SAMPS[$i]}"
-    if [ -z "$group_key" ]; then group_key="$key"; rep=$i; group=($i)
-    else
-      group[${#group[@]}]=$i
-      if [ "${_SB_PCTS[$i]}" -gt "${_SB_PCTS[$rep]}" ] || { [ "${_SB_PCTS[$i]}" -eq "${_SB_PCTS[$rep]}" ] && [[ "${_SB_NAMES[$i]}" < "${_SB_NAMES[$rep]}" ]]; }; then rep=$i; fi
-    fi
-  done
-  keep_from=$(( reps - BURN_TRIM )); [ "$keep_from" -lt 0 ] && keep_from=0
-  for ((i=0; i<keep_from; i++)); do
-    _SB_CAND_NAMES[${#_SB_CAND_NAMES[@]}]="${rep_names[$i]}"
-    _SB_CAND_PATHS[${#_SB_CAND_PATHS[@]}]="${rep_paths[$i]}"
-  done
-  _SB_REP_RSTS=(); _SB_REP_SAMPS=(); _SB_REP_PCTS=()
-  for ((i=0; i<reps; i++)); do
-    _SB_REP_RSTS[${#_SB_REP_RSTS[@]}]="${rep_rsts[$i]}"
-    _SB_REP_SAMPS[${#_SB_REP_SAMPS[@]}]="${rep_samps[$i]}"
-    _SB_REP_PCTS[${#_SB_REP_PCTS[@]}]="${rep_pcts[$i]}"
-  done
-  _SB_CAND_TOTAL=${#_SB_CAND_PATHS[@]}
-}
-
-state_limit_retention() {  # $1=5|7
-  local which="$1" i n winner=-1
-  state_sort_limit "$which"
-  if [ "$which" = 5 ]; then
-    _SL5_CAND_NAMES=(); _SL5_CAND_PATHS=(); n=${#_SL5_NAMES[@]}
-    for ((i=0; i<n; i++)); do [ "${_SL5_PLAUS[$i]}" = 1 ] && winner=$i; done
-    for ((i=0; i<n; i++)); do
-      [ "$i" -eq "$winner" ] && continue
-      _SL5_CAND_NAMES[${#_SL5_CAND_NAMES[@]}]="${_SL5_NAMES[$i]}"; _SL5_CAND_PATHS[${#_SL5_CAND_PATHS[@]}]="${_SL5_PATHS[$i]}"
-    done
-    _SL5_CAND_TOTAL=${#_SL5_CAND_PATHS[@]}; _SL5_STORED_VALID=0
-    if [ "$winner" -ge 0 ]; then _SL5_STORED_VALID=1; _SL5_STORED_RST="${_SL5_RSTS[$winner]}"; _SL5_STORED_PCT="${_SL5_PCTS[$winner]}"; fi
-  else
-    _SL7_CAND_NAMES=(); _SL7_CAND_PATHS=(); n=${#_SL7_NAMES[@]}
-    for ((i=0; i<n; i++)); do [ "${_SL7_PLAUS[$i]}" = 1 ] && winner=$i; done
-    for ((i=0; i<n; i++)); do
-      [ "$i" -eq "$winner" ] && continue
-      _SL7_CAND_NAMES[${#_SL7_CAND_NAMES[@]}]="${_SL7_NAMES[$i]}"; _SL7_CAND_PATHS[${#_SL7_CAND_PATHS[@]}]="${_SL7_PATHS[$i]}"
-    done
-    _SL7_CAND_TOTAL=${#_SL7_CAND_PATHS[@]}; _SL7_STORED_VALID=0
-    if [ "$winner" -ge 0 ]; then _SL7_STORED_VALID=1; _SL7_STORED_RST="${_SL7_RSTS[$winner]}"; _SL7_STORED_PCT="${_SL7_PCTS[$winner]}"; fi
-  fi
 }
 
 state_revalidate_burn() {
@@ -1024,6 +1080,7 @@ burn_eta_5h() {  # → _B5_STATE _B5_ETA _B5_RATE _B5_TTR from complete state sn
   local i n maxrst=0 rst samp pct last_key="" last_samp=-1 last_pct=0
   local a b ct cutoff fc_t=0 fc_p=-1 lc_t=0 lc_p=-1 ncross=0 anycross=0
   local minspan span delta latest_pct=0
+  local mi mj mn mm
   _B5_STATE=warming; _B5_ETA=inf; _B5_RATE="0.0000000000"; _B5_TTR=0
   [ "$_SB_COMPLETE" = 1 ] || return 0
   for ((i=0; i<${#_SB_REP_RSTS[@]}; i++)); do [ "${_SB_REP_RSTS[$i]}" -gt "$maxrst" ] && maxrst="${_SB_REP_RSTS[$i]}"; done
@@ -1031,11 +1088,27 @@ burn_eta_5h() {  # → _B5_STATE _B5_ETA _B5_RATE _B5_TTR from complete state sn
   [ "$_CUR_BURN_VALID" != 1 ] || [ "$_CUR_BURN_RST" -le "$maxrst" ] || maxrst=$_CUR_BURN_RST
   [ "$maxrst" -gt 0 ] || return 0
   _EST_KEYS=(); _EST_RSTS=(); _EST_SAMPS=(); _EST_PCTS=()
-  for ((i=0; i<${#_SB_REP_RSTS[@]}; i++)); do
-    [ "${_SB_REP_RSTS[$i]}" -eq "$maxrst" ] && state_est_insert "${_SB_REP_RSTS[$i]}" "${_SB_REP_SAMPS[$i]}" "${_SB_REP_PCTS[$i]}"
-  done
-  for ((i=0; i<${#_LEG_RSTS[@]}; i++)); do
-    [ "${_LEG_RSTS[$i]}" -eq "$maxrst" ] && state_est_insert "${_LEG_RSTS[$i]}" "${_LEG_SAMPS[$i]}" "${_LEG_PCTS[$i]}"
+  # state_scan key-sorts both live and retained legacy rows, so feed the
+  # insertion sort a merged sequence: every production insert lands at the tail
+  # in constant time. Direct callers with out-of-order arrays stay correct via
+  # the old insertion fallback. Ties take the live element first, matching
+  # the old order (inserts landed after equal keys, and live rows were
+  # inserted before legacy ones).
+  mi=0; mj=0; mn=${#_SB_REP_RSTS[@]}; mm=${#_LEG_RSTS[@]}
+  while :; do
+    while [ "$mi" -lt "$mn" ] && [ "${_SB_REP_RSTS[$mi]}" -ne "$maxrst" ]; do mi=$((mi+1)); done
+    while [ "$mj" -lt "$mm" ] && [ "${_LEG_RSTS[$mj]}" -ne "$maxrst" ]; do mj=$((mj+1)); done
+    if [ "$mi" -lt "$mn" ] && [ "$mj" -lt "$mm" ]; then
+      if [ "${_LEG_SAMPS[$mj]}" -lt "${_SB_REP_SAMPS[$mi]}" ] || { [ "${_LEG_SAMPS[$mj]}" -eq "${_SB_REP_SAMPS[$mi]}" ] && [ "${_LEG_PCTS[$mj]}" -lt "${_SB_REP_PCTS[$mi]}" ]; }; then
+        state_est_insert "${_LEG_RSTS[$mj]}" "${_LEG_SAMPS[$mj]}" "${_LEG_PCTS[$mj]}"; mj=$((mj+1))
+      else
+        state_est_insert "${_SB_REP_RSTS[$mi]}" "${_SB_REP_SAMPS[$mi]}" "${_SB_REP_PCTS[$mi]}"; mi=$((mi+1))
+      fi
+    elif [ "$mi" -lt "$mn" ]; then
+      state_est_insert "${_SB_REP_RSTS[$mi]}" "${_SB_REP_SAMPS[$mi]}" "${_SB_REP_PCTS[$mi]}"; mi=$((mi+1))
+    elif [ "$mj" -lt "$mm" ]; then
+      state_est_insert "${_LEG_RSTS[$mj]}" "${_LEG_SAMPS[$mj]}" "${_LEG_PCTS[$mj]}"; mj=$((mj+1))
+    else break; fi
   done
   [ "$_CUR_BURN_VALID" != 1 ] || [ "$_CUR_BURN_RST" -ne "$maxrst" ] || state_est_insert "$_CUR_BURN_RST" "$_CUR_BURN_SAMP" "$_CUR_BURN_PCT"
   _SER_SAMPS=(); _SER_PCTS=(); n=${#_EST_KEYS[@]}
@@ -1130,9 +1203,7 @@ state_prepare() {  # one state snapshot/GC/publication/estimate pass per render
     [ "$_CUR_BURN_SAMP" -le $(( NOW + 300 )) ] && [ "$_CUR_BURN_RST" -ge "$_CUR_BURN_SAMP" ] && _CUR_BURN_VALID=1
   fi
 
-  _SB_NAMES=(); _SB_PATHS=(); _SB_RSTS=(); _SB_SAMPS=(); _SB_PCTS=(); _SB_PLAUS=(); _SB_RAW=0
-  _SL5_NAMES=(); _SL5_PATHS=(); _SL5_RSTS=(); _SL5_PCTS=(); _SL5_PLAUS=(); _SL5_RAW=0; _SL5_CHILD_RAW=0
-  _SL7_NAMES=(); _SL7_PATHS=(); _SL7_RSTS=(); _SL7_PCTS=(); _SL7_PLAUS=(); _SL7_RAW=0; _SL7_CHILD_RAW=0
+  _SB_RAW=0; _SL5_RAW=0; _SL7_RAW=0
   _STATE_FIND_ARGS=(); _STATE_LEGACY_READ=0
   _SB_DIR_PREOK=1; _SL5_DIR_PREOK=1; _SL7_DIR_PREOK=1; _LEG_PREOK=1
   _SB_DIR_COMPLETE=0; _SL5_COMPLETE=0; _SL7_COMPLETE=0; _LEG_COMPLETE=0; _SB_COMPLETE=0
@@ -1177,11 +1248,11 @@ state_prepare() {  # one state snapshot/GC/publication/estimate pass per render
   if [ "$_STATE_BURN_GATE" = 1 ] && [ "$_STATE_RL7_GATE" = 1 ] && state_same_path "$_SB_ROOT" "$_SL7_ROOT"; then _SB_DIR_PREOK=0; _SL7_DIR_PREOK=0; fi
   if [ "$_STATE_RL5_GATE" = 1 ] && [ "$_STATE_RL7_GATE" = 1 ] && state_same_path "$_SL5_ROOT" "$_SL7_ROOT"; then _SL5_DIR_PREOK=0; _SL7_DIR_PREOK=0; fi
 
-  state_snapshot
+  state_scan
   if [ "$_STATE_BURN_GATE" = 1 ]; then [ "$_SB_DIR_COMPLETE" = 1 ] && [ "$_LEG_COMPLETE" = 1 ] && _SB_COMPLETE=1; fi
-  if [ "$_SB_COMPLETE" = 1 ]; then state_burn_retention; else _SB_CAND_NAMES=(); _SB_CAND_PATHS=(); _SB_CAND_TOTAL=0; _SB_REP_RSTS=(); _SB_REP_SAMPS=(); _SB_REP_PCTS=(); fi
-  if [ "$_SL5_COMPLETE" = 1 ]; then state_limit_retention 5; else _SL5_CAND_NAMES=(); _SL5_CAND_PATHS=(); _SL5_CAND_TOTAL=0; _SL5_STORED_VALID=0; fi
-  if [ "$_SL7_COMPLETE" = 1 ]; then state_limit_retention 7; else _SL7_CAND_NAMES=(); _SL7_CAND_PATHS=(); _SL7_CAND_TOTAL=0; _SL7_STORED_VALID=0; fi
+  if [ "$_SB_COMPLETE" != 1 ]; then _SB_CAND_NAMES=(); _SB_CAND_PATHS=(); _SB_CAND_TOTAL=0; _SB_REP_RSTS=(); _SB_REP_SAMPS=(); _SB_REP_PCTS=(); fi
+  if [ "$_SL5_COMPLETE" != 1 ]; then _SL5_CAND_NAMES=(); _SL5_CAND_PATHS=(); _SL5_CAND_TOTAL=0; _SL5_STORED_VALID=0; fi
+  if [ "$_SL7_COMPLETE" != 1 ]; then _SL7_CAND_NAMES=(); _SL7_CAND_PATHS=(); _SL7_CAND_TOTAL=0; _SL7_STORED_VALID=0; fi
   state_gc
   state_select_limit 5; state_select_limit 7
   state_publish
