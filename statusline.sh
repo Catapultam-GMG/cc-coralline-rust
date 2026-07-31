@@ -761,7 +761,15 @@ state_scan() {  # one bounded pass: enumerate, retain, and load every gated stor
       if (w7 != "") { sv7 = 1; sr7 = r7[w7]; sp7 = v7[w7] }
       if (lbad) lval = 0
       lfirst = lval - 511; if (lfirst < 1) lfirst = 1
-      nleg = (lval > 0 ? lval - lfirst + 1 : 0)
+      # v0.11 append order can contain same-second cache-lag rows whose pct
+      # decreases. Sort the capped source by the estimator key so the Bash merge
+      # always takes its constant-time tail-append path.
+      nleg = 0
+      for (i = lfirst; i <= lval; i++) {
+        sl = ((i - 1) % 512) + 1; nleg++
+        lout[nleg] = sprintf("%012d_%012d_%06d_%04d", kr[sl], ks[sl], kp[sl], nleg)
+      }
+      qsort(lout, 1, nleg)
       k = (ncand < 128 ? ncand : 128)
       printf "SENT %d\n", (sawend ? 1 : 0)
       printf "BAD %d\n", (bad ? 1 : 0)
@@ -774,7 +782,8 @@ state_scan() {  # one bounded pass: enumerate, retain, and load every gated stor
       printf "S5 %d %d %d %d %d %d\n", raw5, nc5, sv5, sr5, sp5, k5
       printf "S7 %d %d %d %d %d %d\n", raw7, nc7, sv7, sr7, sp7, k7
       for (i = 1; i <= k; i++) printf "%s\n", cand[i]
-      for (i = lfirst; i <= lval; i++) { sl = ((i - 1) % 512) + 1; printf "%d %d %d\n", kr[sl], ks[sl], kp[sl] }
+      for (i = 1; i <= nleg; i++)
+        printf "%d %d %d\n", substr(lout[i], 1, 12) + 0, substr(lout[i], 14, 12) + 0, substr(lout[i], 27, 6) + 0
       for (i = 1; i <= nrep; i++) printf "%d %d %d\n", rrst[i], rsam[i], rpct[i]
       for (i = 1; i <= k5; i++) printf "%s\n", cd5[i]
       for (i = 1; i <= k7; i++) printf "%s\n", cd7[i]
@@ -1079,10 +1088,10 @@ burn_eta_5h() {  # → _B5_STATE _B5_ETA _B5_RATE _B5_TTR from complete state sn
   [ "$_CUR_BURN_VALID" != 1 ] || [ "$_CUR_BURN_RST" -le "$maxrst" ] || maxrst=$_CUR_BURN_RST
   [ "$maxrst" -gt 0 ] || return 0
   _EST_KEYS=(); _EST_RSTS=(); _EST_SAMPS=(); _EST_PCTS=()
-  # Live and legacy rows normally arrive sample-ordered already, so feed the
-  # insertion sort a merged sequence: every insert then lands at the tail in
-  # constant time, and out-of-order input degrades to the old per-row cost
-  # instead of relying on order. Ties take the live element first, matching
+  # state_scan key-sorts both live and retained legacy rows, so feed the
+  # insertion sort a merged sequence: every production insert lands at the tail
+  # in constant time. Direct callers with out-of-order arrays stay correct via
+  # the old insertion fallback. Ties take the live element first, matching
   # the old order (inserts landed after equal keys, and live rows were
   # inserted before legacy ones).
   mi=0; mj=0; mn=${#_SB_REP_RSTS[@]}; mm=${#_LEG_RSTS[@]}

@@ -335,6 +335,25 @@ eq '1500-entry steady sort first sample' "${_SB_REP_SAMPS[0]}" 998500
 eq '1500-entry steady sort last sample' "${_SB_REP_SAMPS[1499]}" 999999
 count_entries "$CASE/burn.d"; eq '1500-entry steady render publishes once' "$_COUNT" 1501
 
+# A v0.11 resize burst can append many rows for one second while concurrent
+# session caches make pct decrease. The controller must key-sort the retained
+# legacy rows before the Bash merge or insertion fallback exceeds the 1s budget.
+: > "$BURN_FILE"; i=0
+while [ "$i" -lt 384 ]; do printf '%d\t5\t1015900\n' $(( 997988 + i )) >> "$BURN_FILE"; i=$(( i + 1 )); done
+i=0
+while [ "$i" -lt 128 ]; do printf '998372\t5.%03d\t1015900\n' $(( 127 - i )) >> "$BURN_FILE"; i=$(( i + 1 )); done
+CORALLINE_NO_SAMPLE=1; state_prepare
+eq 'same-second legacy burst retained' "${#_LEG_RSTS[@]}" 512
+eq 'same-second legacy burst sorts low pct first' "${_LEG_PCTS[384]}" 5000
+eq 'same-second legacy burst sorts high pct last' "${_LEG_PCTS[511]}" 5127
+_CUR_BURN_VALID=0; _STEPS=0
+set -o functrace
+trap '_STEPS=$((_STEPS+1))' DEBUG
+burn_eta_5h
+trap - DEBUG
+set +o functrace
+[ "$_STEPS" -le 100000 ] && ok 'same-second legacy burst bounded work' || bad 'same-second legacy burst bounded work' "steps=$_STEPS"
+
 # Raw snapshot and publication watermarks: malformed names consume capacity but
 # are never deletion targets.
 make_files() { local dir="$1" n="$2" i=0; mkdir -p "$dir"; while [ "$i" -lt "$n" ]; do printf -v _N 'x%04d' "$i"; : > "$dir/$_N"; i=$((i + 1)); done; }
