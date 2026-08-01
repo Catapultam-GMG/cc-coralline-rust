@@ -1926,13 +1926,18 @@ function Remove-StateCandidates([string]$Root, [object[]]$Candidates, [string]$K
     return [pscustomobject]@{ Resolved=$resolved; Clean=($resolved -eq $Candidates.Count) }
 }
 
+# Valid stays strict — it gates sampling and publication. Canon* records the same
+# canonical reading independently of the window check, so a renderer can still show
+# an elapsed window's last value without ever seeing an unvalidated payload word.
 function Get-CurrentLimit([string]$RawPct, [string]$RawReset, [long]$NowValue, [long]$MaxAhead) {
     $pct = ConvertTo-StatePct $RawPct
     $reset = ConvertTo-StatePayloadEpoch $RawReset 10
-    if ($null -eq $pct -or $null -eq $reset) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L } }
+    if ($null -eq $pct) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L; Canon=$false; CanonPct=0; CanonReset=0L } }
+    $milli = [int]$pct.Milli
+    if ($null -eq $reset) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L; Canon=$true; CanonPct=$milli; CanonReset=0L } }
     $value = [long]$reset.Value
-    if ($value -le $NowValue -or $value -gt ($NowValue + $MaxAhead)) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L } }
-    return [pscustomobject]@{ Valid=$true; Pct=[int]$pct.Milli; Reset=$value }
+    if ($value -le $NowValue -or $value -gt ($NowValue + $MaxAhead)) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L; Canon=$true; CanonPct=$milli; CanonReset=$value } }
+    return [pscustomobject]@{ Valid=$true; Pct=$milli; Reset=$value; Canon=$true; CanonPct=$milli; CanonReset=$value }
 }
 
 function Select-LimitResult($Snapshot, $Retention, $Current) {
@@ -2656,10 +2661,22 @@ function Add-LimitSegment([string]$Label, [string]$RawPct, [string]$ResetsAt, [s
     Push-Segment $Bg "${pfg} $Label ${bar} ${pct}% ${reset} "
 }
 
+# Synced state overrides the payload but must not gate the segment: a window is
+# only Valid while its reset is still ahead, and that holds for the payload
+# snapshot and every store entry alike. Claude Code re-renders an idle session
+# from its last-seen snapshot, so once a window elapses with no interaction both
+# sources fall invalid in the same render and returning here blanked the segment
+# until the next keystroke. Fall back to Current*.Canon*, which survives the
+# window check but still passed ConvertTo-StatePct, so an unvalidated pct is
+# never drawn. Format-Countdown reports an elapsed reset as "now".
 function Add-Limit5Segment {
     if ($Cfg.VL_LIMIT_SYNC -eq '1') {
-        if ($null -eq $State -or -not $State.Limit5.Valid) { return }
-        Add-LimitSegment '5h' (Format-StatePct $State.Limit5.Pct) ([string]$State.Limit5.Reset) $Cfg.VL_BG_5H $State.Limit5.Pct
+        if ($null -eq $State) { return }
+        if ($State.Limit5.Valid) {
+            Add-LimitSegment '5h' (Format-StatePct $State.Limit5.Pct) ([string]$State.Limit5.Reset) $Cfg.VL_BG_5H $State.Limit5.Pct
+        } elseif ($State.Current5.Canon) {
+            Add-LimitSegment '5h' (Format-StatePct $State.Current5.CanonPct) ([string]$State.Current5.CanonReset) $Cfg.VL_BG_5H $State.Current5.CanonPct
+        }
         return
     }
     Add-LimitSegment '5h' $fhPct $fhRst $Cfg.VL_BG_5H
@@ -2667,8 +2684,12 @@ function Add-Limit5Segment {
 
 function Add-Limit7Segment {
     if ($Cfg.VL_LIMIT_SYNC -eq '1') {
-        if ($null -eq $State -or -not $State.Limit7.Valid) { return }
-        Add-LimitSegment '7d' (Format-StatePct $State.Limit7.Pct) ([string]$State.Limit7.Reset) $Cfg.VL_BG_7D $State.Limit7.Pct
+        if ($null -eq $State) { return }
+        if ($State.Limit7.Valid) {
+            Add-LimitSegment '7d' (Format-StatePct $State.Limit7.Pct) ([string]$State.Limit7.Reset) $Cfg.VL_BG_7D $State.Limit7.Pct
+        } elseif ($State.Current7.Canon) {
+            Add-LimitSegment '7d' (Format-StatePct $State.Current7.CanonPct) ([string]$State.Current7.CanonReset) $Cfg.VL_BG_7D $State.Current7.CanonPct
+        }
         return
     }
     Add-LimitSegment '7d' $wdPct $wdRst $Cfg.VL_BG_7D

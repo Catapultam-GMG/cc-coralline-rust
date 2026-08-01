@@ -2119,6 +2119,37 @@ fi
         Check ('WIN-02 high-water maintenance converges ' + $limitSpec.Name) ($highNames.Count -eq 1 -and $highNames[0] -ceq $expectedHigh)
     }
 
+    # An elapsed window keeps its last canonical reading on the bar. Both runtimes
+    # stop treating the payload snapshot and every store entry as valid the moment
+    # resets_at passes, and Claude Code re-renders an idle session from its
+    # last-seen snapshot, so gating the segment on validity blanked it for the
+    # whole idle stretch. Read-only mode leaves the payload as the only source.
+    $elapsedRoot = Join-Path $stateRoot 'elapsed'
+    $elapsedConfig = New-StateConfig 'win02-elapsed' $elapsedRoot 'limit5h limit7d' $true
+    $elapsedEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow }
+    $elapsedPayload = Clone-Object $statePayload
+    $elapsedPayload.rate_limits.five_hour.used_percentage = '41.2'
+    $elapsedPayload.rate_limits.five_hour.resets_at = [string]($fixedNow - 60L)
+    $elapsedPayload.rate_limits.seven_day.used_percentage = '30'
+    $elapsedPayload.rate_limits.seven_day.resets_at = [string]($fixedNow + 345600L)
+    $psElapsed = Invoke-Statusline (Json $elapsedPayload) $elapsedConfig $elapsedEnv '' 10000
+    $bashElapsed = Invoke-BashStatusline (Json $elapsedPayload) $elapsedConfig $elapsedEnv
+    Check-Run 'WIN-02 PowerShell elapsed 5h window' $psElapsed
+    Check-Run 'WIN-02 Bash elapsed 5h window' $bashElapsed
+    Check 'WIN-02 elapsed 5h window still renders its last reading' ($psElapsed.Stdout.Contains('5h ') -and $psElapsed.Stdout.Contains('41%'))
+    Check-Exact 'WIN-02 elapsed 5h window differential' $psElapsed $bashElapsed
+
+    # A malformed pct leaves no canonical reading at all, so the fallback must
+    # draw nothing rather than push an unvalidated payload word through the bar.
+    $malformedPayload = Clone-Object $elapsedPayload
+    $malformedPayload.rate_limits.five_hour.used_percentage = '1e2'
+    $psMalformed = Invoke-Statusline (Json $malformedPayload) $elapsedConfig $elapsedEnv '' 10000
+    $bashMalformed = Invoke-BashStatusline (Json $malformedPayload) $elapsedConfig $elapsedEnv
+    Check-Run 'WIN-02 PowerShell elapsed malformed pct' $psMalformed
+    Check-Run 'WIN-02 Bash elapsed malformed pct' $bashMalformed
+    Check 'WIN-02 unvalidated pct draws no 5h segment' (-not $psMalformed.Stdout.Contains('5h '))
+    Check-Exact 'WIN-02 elapsed malformed pct differential' $psMalformed $bashMalformed
+
     # Concurrent mixed-runtime cohorts use unique canonical pct values so every
     # successful writer has one observable immutable commit.
     foreach ($count in @(1,2,4,8,128)) {
