@@ -2110,8 +2110,9 @@ fi
         # payload's 15 the way a pure high-water would.
         Check ('WIN-02 own reading wins its own window ' + $limitSpec.Name) ([string]$psPct -eq '15000' -and [string]$psReset -eq [string]($fixedNow + 200L) -and $bashState.Contains($prefix + 'Pct=15000'))
 
-        # Without a reading of its own the store is the sole source, and its winner
-        # is still the newest reset with the highest pct for that reset.
+        # Without a reading of its own a session draws no gauge: the store retires
+        # nothing, so its winner may be a value no session still reports. Selection
+        # itself is still asserted, through the state dump rather than the bar.
         $blindPayload = Clone-Object $highPayload
         $blindPayload.rate_limits.($limitSpec.Field).used_percentage = $null
         $blindPayload.rate_limits.($limitSpec.Field).resets_at = $null
@@ -2126,7 +2127,8 @@ fi
         Check-Exact ('WIN-02 store-only differential ' + $limitSpec.Name) $psBlind $bashBlind
         $blindState = [IO.File]::ReadAllText($blindDump, $StrictUtf8) | ConvertFrom-Json
         $blindBash = [IO.File]::ReadAllText($blindBashDump, $StrictUtf8).Trim()
-        Check ('WIN-02 store supplies a blind session ' + $limitSpec.Name) ([string]$blindState.($prefix + 'Pct') -eq '20000' -and $blindBash.Contains($prefix + 'Pct=20000'))
+        Check ('WIN-02 store still selects the canonical winner ' + $limitSpec.Name) ([string]$blindState.($prefix + 'Pct') -eq '20000' -and $blindBash.Contains($prefix + 'Pct=20000'))
+        Check ('WIN-02 a blind session draws no gauge ' + $limitSpec.Name) (-not $psBlind.Stdout.Contains($limitSpec.Name + ' '))
 
         $highPayload.rate_limits.($limitSpec.Field).used_percentage = '25'
         $writeRun = Invoke-Statusline (Json $highPayload) $highConfig $stateEnvWrite '' 10000
