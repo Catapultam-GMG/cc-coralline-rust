@@ -590,7 +590,7 @@ function Import-ConfigFile(
             $pathContext = $PathConfigKeys.Contains($name) -or $name -ieq 'VL_FLOAT_FILE'
             $decoded = Decode-ShellWord $raw $pathContext
             if (-not $decoded.Success) { $valid = $false; break }
-            if ($pathContext -and $decoded.Value -match '[ -\u007f-\u009f]') { $valid = $false; break }
+            if ($pathContext -and $decoded.Value -match '[\x00-\x1f\u007f-\u009f]') { $valid = $false; break }
             if ($name -ieq 'VL_FLOAT_FILE') {
                 if ($Depth -eq 0 -and $name -ceq 'VL_FLOAT_FILE') {
                     $candidate['VL_FLOAT_FILE'] = $decoded.Value
