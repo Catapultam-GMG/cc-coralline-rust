@@ -203,9 +203,32 @@ mkdir -p "$_SL5_ROOT/0001015800_090.000" "$_SL5_ROOT/0001015900_010.000" "$_SL5_
 rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0
 eq 'limit high-water pct' "$_LL_PCT" '020.000'
 eq 'limit high-water reset' "$_LL_RST" 1015900
-rl_choose 5; eq 'current lower pct cannot regress high-water' "$_STATE_RL5_PCT" 20000
+# Own window, own reading. The store used to win on a higher pct for the same
+# reset, which pinned the recorded maximum for the rest of the window whenever the
+# percentage legitimately dropped (upstream reset, plan upgrade).
+rl_choose 5; eq 'own reading beats a higher stored pct' "$_STATE_RL5_PCT" 15000
+eq 'own reading keeps its own reset' "$_STATE_RL5_RST" 1015900
 rl_latest "$_SL5_BASE" "$RL_MAX_5H" 1
 entry_count "$_SL5_ROOT"; eq 'limit mutable GC keeps winner' "$_COUNT" 1
+
+# A drop inside one window is followed, and the store still wins when it holds a
+# newer window than this session has caught up to.
+rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/0001015900_090.000"
+_CUR5_VALID=1; _CUR5_RST=1015900; _CUR5_PCT=5000
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0; rl_choose 5
+eq 'pct drop inside one window is followed' "$_STATE_RL5_PCT" 5000
+
+rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/0001016900_007.000"
+_CUR5_VALID=1; _CUR5_RST=1015900; _CUR5_PCT=90000
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0; rl_choose 5
+eq 'newer stored window beats an older own reading' "$_STATE_RL5_PCT" 7000
+eq 'newer stored window carries its reset' "$_STATE_RL5_RST" 1016900
+
+rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/0001015900_042.000"
+_CUR5_VALID=0; _CUR5_RST=0; _CUR5_PCT=0
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0; rl_choose 5
+eq 'store is the sole source without an own reading' "$_STATE_RL5_PCT" 42000
+_CUR5_VALID=1; _CUR5_RST=1015900; _CUR5_PCT=15000
 
 rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/0001015900_041.200"
 rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0; eq 'limit fractional pct preserved' "$_LL_PCT" '041.200'
@@ -417,7 +440,13 @@ true_case 'metachar basename one preserved' test -d "$CASE/state/limit5.d/$_META
 true_case 'metachar basename two preserved' test -d "$CASE/state/limit5.d/$_META2"
 true_case 'metachar basename three preserved' test -d "$CASE/state/limit5.d/$_META3"
 true_case 'nonempty canonical-looking entry preserved' test -f "$CASE/state/limit5.d/$_NONEMPTY/canary"
-if LC_ALL=C grep -q '20%' "$CASE/out"; then ok 'malformed names do not displace canonical winner'; else bad 'malformed names do not displace canonical winner' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/out")"; fi
+if LC_ALL=C grep -q '15%' "$CASE/out"; then ok 'own reading wins its own window'; else bad 'own reading wins its own window' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/out")"; fi
+if LC_ALL=C grep -q '99%' "$CASE/out"; then bad 'malformed names never reach the bar' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/out")"; else ok 'malformed names never reach the bar'; fi
+# Without an own reading the store is the sole source, so its canonical winner has
+# to survive the malformed neighbours rather than merely be outranked by the payload.
+make_payload "$CASE/blank" '' '' '' ''
+run_runtime_cwd "$CASE" "$BASH_BIN" "$CASE/conf" "$CASE/blank" "$CASE/blank.out" "$CASE/blank.err" 0
+if LC_ALL=C grep -q '20%' "$CASE/blank.out"; then ok 'malformed names do not displace canonical winner'; else bad 'malformed names do not displace canonical winner' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/blank.out")"; fi
 
 # No immutable-controller tools remain on the state path. Wrappers would fail the
 # render if find or od were invoked.

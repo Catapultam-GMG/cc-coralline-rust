@@ -1947,12 +1947,18 @@ function Get-CurrentLimit([string]$RawPct, [string]$RawReset, [long]$NowValue, [
     return $none
 }
 
+# This session's own reading wins its own window; the store wins only when it holds
+# a newer one. Preferring the stored maximum for the same reset assumed usage inside
+# a window only rises, which breaks whenever the percentage legitimately drops while
+# resets_at stays put (upstream limit reset, plan upgrade, server-side adjustment):
+# the recorded maximum then became unbeatable for the rest of the window. Nothing in
+# the payload timestamps an observation, so a stale high reading cannot be aged out.
 function Select-LimitResult($Snapshot, $Retention, $Current) {
     $valid = $false
     $reset = 0L
     $pct = 0
     if ($Snapshot.Complete -and $null -ne $Retention.Winner) { $valid=$true; $reset=[long]$Retention.Winner.Reset; $pct=[int]$Retention.Winner.Pct }
-    if ($Current.Valid -and (-not $valid -or $Current.Reset -gt $reset -or ($Current.Reset -eq $reset -and $Current.Pct -gt $pct))) {
+    if ($Current.Valid -and (-not $valid -or $Current.Reset -ge $reset)) {
         $valid=$true; $reset=[long]$Current.Reset; $pct=[int]$Current.Pct
     }
     return [pscustomobject]@{ Valid=$valid; Reset=$reset; Pct=$pct }
