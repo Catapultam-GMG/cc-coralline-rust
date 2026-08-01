@@ -1926,18 +1926,25 @@ function Remove-StateCandidates([string]$Root, [object[]]$Candidates, [string]$K
     return [pscustomobject]@{ Resolved=$resolved; Clean=($resolved -eq $Candidates.Count) }
 }
 
-# Valid stays strict — it gates sampling and publication. Canon* records the same
-# canonical reading independently of the window check, so a renderer can still show
-# an elapsed window's last value without ever seeing an unvalidated payload word.
+# Valid stays strict: it gates sampling, publication, and the burn binding. Elapsed
+# describes the one other state a renderer may show, a window whose pct and reset
+# both passed validation and whose reset has since passed. A missing or malformed
+# reset produces neither, so no renderer can claim an elapsed window that was never
+# observed, and a reset beyond the window ceiling stays rejected as in #32.
 function Get-CurrentLimit([string]$RawPct, [string]$RawReset, [long]$NowValue, [long]$MaxAhead) {
     $pct = ConvertTo-StatePct $RawPct
     $reset = ConvertTo-StatePayloadEpoch $RawReset 10
-    if ($null -eq $pct) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L; Canon=$false; CanonPct=0; CanonReset=0L } }
+    $none = [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L; Elapsed=$false; ElapsedPct=0; ElapsedReset=0L }
+    if ($null -eq $pct -or $null -eq $reset) { return $none }
     $milli = [int]$pct.Milli
-    if ($null -eq $reset) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L; Canon=$true; CanonPct=$milli; CanonReset=0L } }
     $value = [long]$reset.Value
-    if ($value -le $NowValue -or $value -gt ($NowValue + $MaxAhead)) { return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L; Canon=$true; CanonPct=$milli; CanonReset=$value } }
-    return [pscustomobject]@{ Valid=$true; Pct=$milli; Reset=$value; Canon=$true; CanonPct=$milli; CanonReset=$value }
+    if ($value -gt $NowValue -and $value -le ($NowValue + $MaxAhead)) {
+        return [pscustomobject]@{ Valid=$true; Pct=$milli; Reset=$value; Elapsed=$false; ElapsedPct=0; ElapsedReset=0L }
+    }
+    if ($value -gt 0L -and $value -le $NowValue) {
+        return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L; Elapsed=$true; ElapsedPct=$milli; ElapsedReset=$value }
+    }
+    return $none
 }
 
 function Select-LimitResult($Snapshot, $Retention, $Current) {
@@ -2666,16 +2673,17 @@ function Add-LimitSegment([string]$Label, [string]$RawPct, [string]$ResetsAt, [s
 # snapshot and every store entry alike. Claude Code re-renders an idle session
 # from its last-seen snapshot, so once a window elapses with no interaction both
 # sources fall invalid in the same render and returning here blanked the segment
-# until the next keystroke. Fall back to Current*.Canon*, which survives the
-# window check but still passed ConvertTo-StatePct, so an unvalidated pct is
-# never drawn. Format-Countdown reports an elapsed reset as "now".
+# until the next keystroke. Fall back to Current*.Elapsed*, which requires both
+# the pct and the reset to have passed validation and the reset to have actually
+# passed, so neither an unvalidated pct nor an unobserved window reaches the bar.
+# Format-Countdown reports an elapsed reset as "now".
 function Add-Limit5Segment {
     if ($Cfg.VL_LIMIT_SYNC -eq '1') {
         if ($null -eq $State) { return }
         if ($State.Limit5.Valid) {
             Add-LimitSegment '5h' (Format-StatePct $State.Limit5.Pct) ([string]$State.Limit5.Reset) $Cfg.VL_BG_5H $State.Limit5.Pct
-        } elseif ($State.Current5.Canon) {
-            Add-LimitSegment '5h' (Format-StatePct $State.Current5.CanonPct) ([string]$State.Current5.CanonReset) $Cfg.VL_BG_5H $State.Current5.CanonPct
+        } elseif ($State.Current5.Elapsed) {
+            Add-LimitSegment '5h' (Format-StatePct $State.Current5.ElapsedPct) ([string]$State.Current5.ElapsedReset) $Cfg.VL_BG_5H $State.Current5.ElapsedPct
         }
         return
     }
@@ -2687,8 +2695,8 @@ function Add-Limit7Segment {
         if ($null -eq $State) { return }
         if ($State.Limit7.Valid) {
             Add-LimitSegment '7d' (Format-StatePct $State.Limit7.Pct) ([string]$State.Limit7.Reset) $Cfg.VL_BG_7D $State.Limit7.Pct
-        } elseif ($State.Current7.Canon) {
-            Add-LimitSegment '7d' (Format-StatePct $State.Current7.CanonPct) ([string]$State.Current7.CanonReset) $Cfg.VL_BG_7D $State.Current7.CanonPct
+        } elseif ($State.Current7.Elapsed) {
+            Add-LimitSegment '7d' (Format-StatePct $State.Current7.ElapsedPct) ([string]$State.Current7.ElapsedReset) $Cfg.VL_BG_7D $State.Current7.ElapsedPct
         }
         return
     }

@@ -2150,6 +2150,23 @@ fi
     Check 'WIN-02 unvalidated pct draws no 5h segment' (-not $psMalformed.Stdout.Contains('5h '))
     Check-Exact 'WIN-02 elapsed malformed pct differential' $psMalformed $bashMalformed
 
+    # A canonical pct is not on its own evidence of an elapsed window. An
+    # unparsable reset and a sentinel reset beyond the window ceiling both leave
+    # no observed window, so neither runtime may invent a countdown for one.
+    foreach ($resetSpec in @(
+        [pscustomobject]@{ Name='unparsed reset'; Value='not-an-epoch' },
+        [pscustomobject]@{ Name='sentinel reset'; Value=[string]($fixedNow + 999999L) }
+    )) {
+        $resetPayload = Clone-Object $elapsedPayload
+        $resetPayload.rate_limits.five_hour.resets_at = $resetSpec.Value
+        $psReset = Invoke-Statusline (Json $resetPayload) $elapsedConfig $elapsedEnv '' 10000
+        $bashReset = Invoke-BashStatusline (Json $resetPayload) $elapsedConfig $elapsedEnv
+        Check-Run ('WIN-02 PowerShell ' + $resetSpec.Name) $psReset
+        Check-Run ('WIN-02 Bash ' + $resetSpec.Name) $bashReset
+        Check ('WIN-02 ' + $resetSpec.Name + ' draws no 5h segment') (-not $psReset.Stdout.Contains('5h '))
+        Check-Exact ('WIN-02 ' + $resetSpec.Name + ' differential') $psReset $bashReset
+    }
+
     # Concurrent mixed-runtime cohorts use unique canonical pct values so every
     # successful writer has one observable immutable commit.
     foreach ($count in @(1,2,4,8,128)) {

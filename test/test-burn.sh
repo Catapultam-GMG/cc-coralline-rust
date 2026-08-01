@@ -41,6 +41,7 @@ eval "$(sed -n '/^make_bar() {/,/^}/p' "$SCRIPT")"
 eval "$(sed -n '/^pct_fg() {/,/^}/p' "$SCRIPT")"
 eval "$(sed -n '/^fmt_countdown() {/,/^}/p' "$SCRIPT")"
 eval "$(sed -n '/^seg_limit() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^seg_limit_elapsed() {/,/^}/p' "$SCRIPT")"
 eval "$(sed -n '/^seg_limit5h() {/,/^}/p' "$SCRIPT")"
 eval "$(sed -n '/^seg_limit7d() {/,/^}/p' "$SCRIPT")"
 
@@ -570,7 +571,26 @@ fh_pct=$_LONG_PCT; fh_rst=999000
 seg_limit5h
 eq 'unvalidated payload pct renders nothing' "${#SEG_TXT[@]}" 0
 
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); fh_pct=''; fh_rst=''
+# A canonical pct is not on its own evidence of an elapsed window. A missing or
+# malformed reset leaves _CUR5_RST at 0 and a sentinel reset lands beyond the
+# window ceiling; drawing either would invent a countdown that was never observed.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_CANON='041.200'; _CUR5_PCT=41200; _CUR5_RST=0
+seg_limit5h
+eq 'unparsed reset renders nothing' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_RST=$(( NOW + 999999 ))
+seg_limit5h
+eq 'far-future sentinel reset renders nothing' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_RST=$NOW
+seg_limit5h
+eq 'reset exactly at now counts as elapsed' "${#SEG_TXT[@]}" 1
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL7_VALID=0; _CUR7_RST=0
+seg_limit7d
+eq '7d unparsed reset renders nothing' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_CANON=''; fh_pct=''; fh_rst=''
 seg_limit5h
 eq 'no payload and no synced state renders nothing' "${#SEG_TXT[@]}" 0
 
