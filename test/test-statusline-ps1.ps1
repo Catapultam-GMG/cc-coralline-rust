@@ -2105,7 +2105,28 @@ fi
         if ($limitSpec.Name -eq '7d') { $prefix = 'Limit7' }
         $psPct = $psState.($prefix + 'Pct')
         $psReset = $psState.($prefix + 'Reset')
-        Check ('WIN-02 reset-first stored high-water ' + $limitSpec.Name) ([string]$psPct -eq '20000' -and [string]$psReset -eq [string]($fixedNow + 200L) -and $bashState.Contains($prefix + 'Pct=20000'))
+        # The store still ranks reset first and pct second, but a session's own
+        # reading wins its own window, so the stored 20.000 no longer displaces the
+        # payload's 15 the way a pure high-water would.
+        Check ('WIN-02 own reading wins its own window ' + $limitSpec.Name) ([string]$psPct -eq '15000' -and [string]$psReset -eq [string]($fixedNow + 200L) -and $bashState.Contains($prefix + 'Pct=15000'))
+
+        # Without a reading of its own the store is the sole source, and its winner
+        # is still the newest reset with the highest pct for that reset.
+        $blindPayload = Clone-Object $highPayload
+        $blindPayload.rate_limits.($limitSpec.Field).used_percentage = $null
+        $blindPayload.rate_limits.($limitSpec.Field).resets_at = $null
+        $blindDump = Join-Path $highRoot 'ps-blind.json'
+        $blindBashDump = Join-Path $highRoot 'bash-blind.txt'
+        $blindPsEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=$blindDump }
+        $blindBashEnv = @{ CORALLINE_NO_SAMPLE='1'; CORALLINE_TEST_NOW=[string]$fixedNow; CORALLINE_TEST_STATE_DUMP=(Forward-Path $blindBashDump) }
+        $psBlind = Invoke-Statusline (Json $blindPayload) $highConfig $blindPsEnv '' 10000
+        $bashBlind = Invoke-BashStatusline (Json $blindPayload) $highConfig $blindBashEnv
+        Check-Run ('WIN-02 PowerShell store-only ' + $limitSpec.Name) $psBlind
+        Check-Run ('WIN-02 Bash store-only ' + $limitSpec.Name) $bashBlind
+        Check-Exact ('WIN-02 store-only differential ' + $limitSpec.Name) $psBlind $bashBlind
+        $blindState = [IO.File]::ReadAllText($blindDump, $StrictUtf8) | ConvertFrom-Json
+        $blindBash = [IO.File]::ReadAllText($blindBashDump, $StrictUtf8).Trim()
+        Check ('WIN-02 store supplies a blind session ' + $limitSpec.Name) ([string]$blindState.($prefix + 'Pct') -eq '20000' -and $blindBash.Contains($prefix + 'Pct=20000'))
 
         $highPayload.rate_limits.($limitSpec.Field).used_percentage = '25'
         $writeRun = Invoke-Statusline (Json $highPayload) $highConfig $stateEnvWrite '' 10000

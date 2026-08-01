@@ -99,11 +99,15 @@ BURN_TRIM=1500                  # internal: max rows kept in the sample file
 
 # Cross-session limit sync (opt-in). Claude Code only re-renders a session's
 # statusline on activity, and the rate-limit % in each render's JSON is that
-# session's last-seen snapshot, so idle sessions show stale/divergent numbers.
-# With this on, every render records its 5h/7d (reset, pct) to a small per-host
-# high-water store, and limit5h/limit7d show the highest pct any session has seen
-# for the current window — so sessions converge whenever they redraw. It cannot
-# refresh a session that is not redrawing at all (that is a Claude Code limit).
+# session's last-seen snapshot, so a session that has not caught up to the next
+# window shows a stale one. With this on, every render records its 5h/7d
+# (reset, pct) to a small per-host store, and a session that has no valid reading
+# of its own — no rate_limits in the payload, or a window that has already
+# elapsed — displays the newest window any session recorded. A session WITH a
+# valid reading always shows its own: the percentage can legitimately fall inside
+# one window (upstream reset, plan upgrade) and no other session's snapshot is
+# better evidence about it. It cannot refresh a session that is not redrawing at
+# all (that is a Claude Code limit).
 # The store is a directory-set (see rl_sample/rl_latest), race-free by design.
 VL_LIMIT_SYNC=0
 RL5H_FILE="${CORALLINE_RL5H_FILE:-$HOME/.claude/coralline/limit-5h.tsv}"
@@ -756,11 +760,24 @@ rl_latest() {  # $1=canonical base $2=max secs ahead $3=mutate → _LL_*
   done
 }
 
-rl_choose() {  # $1=5|7; merge canonical current value with the read-only high-water
+# This session's own reading wins its own window. The store used to win on a
+# higher pct for the same reset, which assumed usage inside a window only ever
+# rises. That assumption breaks whenever the percentage legitimately DROPS while
+# resets_at stays put: an upstream limit reset, a subscription upgrade (same
+# usage, larger allowance), or any server-side adjustment. The recorded maximum
+# then became unbeatable for the rest of the window — up to five hours for 5h and
+# a full week for 7d — so the bar kept reporting a value no session was seeing.
+# Nothing in the payload timestamps an observation, so a stale high reading is
+# indistinguishable from a current one and cannot be aged out; the only reliable
+# evidence for this session's own window is this session's own snapshot.
+# The store keeps its purpose where it still has better information: it wins when
+# it holds a NEWER reset (another session already rolled into the next window),
+# and it is the sole source whenever this session has no valid reading at all.
+rl_choose() {  # $1=5|7; this session's window beats the store; a newer stored window beats it
   local which="$1" valid="$_LL_VALID" rst="${_LL_RST:-0}" pct="$_LL_PCT_MILLI" crst cpct cvalid
   if [ "$which" = 5 ]; then cvalid=$_CUR5_VALID; crst=$_CUR5_RST; cpct=$_CUR5_PCT
   else cvalid=$_CUR7_VALID; crst=$_CUR7_RST; cpct=$_CUR7_PCT; fi
-  if [ "$cvalid" = 1 ] && { [ "$valid" = 0 ] || [ "$crst" -gt "$rst" ] || { [ "$crst" -eq "$rst" ] && [ "$cpct" -gt "$pct" ]; }; }; then
+  if [ "$cvalid" = 1 ] && { [ "$valid" = 0 ] || [ "$crst" -ge "$rst" ]; }; then
     valid=1; rst=$crst; pct=$cpct
   fi
   if [ "$which" = 5 ]; then _STATE_RL5_VALID=$valid; _STATE_RL5_RST=$rst; _STATE_RL5_PCT=$pct

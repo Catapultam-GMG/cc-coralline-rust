@@ -223,9 +223,11 @@ Ask concise questions. If the user says "you decide", choose the defaults.
 5. **Details**: clock `12h` default, `24h`, or `off`; Nerd Font yes/no; if they use git
    worktrees, suggest enabling `project`. If the user runs many concurrent Claude sessions
    and is bothered by `limit5h` / `limit7d` showing different percentages per session,
-   mention `VL_LIMIT_SYNC=1`: it makes those segments show the freshest reading any session
-   has recorded for the current window (in a `limit-5h.d` / `limit-7d.d` store). Off by
-   default; it only converges sessions when they redraw and cannot refresh a fully idle one.
+   mention `VL_LIMIT_SYNC=1`: a session that has no valid reading of its own borrows the
+   newest window any session recorded (in a `limit-5h.d` / `limit-7d.d` store). Off by
+   default. A session with a valid reading always shows its own, so sync narrows the gap at
+   window boundaries rather than making every session report an identical number, and it
+   cannot refresh a session that is not redrawing at all.
 6. **Subagent panel rows** (optional, needs Claude Code v2.1.205+ for the per-task
    model/context fields): offer to theme only the subagent rows below the prompt — the
    native main-session row remains visible. On Bash-capable installs, if the user says yes, run

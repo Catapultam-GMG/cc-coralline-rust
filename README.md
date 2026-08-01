@@ -462,9 +462,11 @@ fit, so the 7d projection binds and you see `↗ 7d`.
 
 ### Cross-session limit sync (optional)
 
-`VL_LIMIT_SYNC=1` makes `limit5h` / `limit7d` show the freshest rate-limit reading any of your sessions has seen, instead of just this session's own snapshot. Each render records its `5h` / `7d` value to a small per-host store (`limit-5h.d` / `limit-7d.d`), and the segments display the highest percentage recorded for the current window. Off by default.
+`VL_LIMIT_SYNC=1` lets a session that has no rate-limit reading of its own borrow one from your other sessions. Each render records its `5h` / `7d` value to a small per-host store (`limit-5h.d` / `limit-7d.d`). A session displays its own reading whenever it has a valid one; when it has none — no `rate_limits` in the payload, or a window that has already elapsed — it displays the newest window any session recorded. A stored reading for a newer window also wins, so a session that has not yet caught up to the next window follows one that has. Off by default.
 
-This exists because Claude Code re-renders a session's statusline only when that session is active, and the rate-limit numbers it passes are that session's last-seen values. So idle sessions show stale, divergent percentages. With sync on, every session converges to the latest known value the next time it redraws.
+This exists because Claude Code re-renders a session's statusline only when that session is active, and the rate-limit numbers it passes are that session's last-seen values, so a session lagging a window boundary shows a stale one. It cannot refresh a session that is not redrawing at all.
+
+Sync deliberately does not override a session's own reading with a higher one from elsewhere. A percentage can legitimately fall inside a single window — an upstream limit reset, a plan upgrade, any server-side adjustment — and nothing in the payload timestamps an observation, so a stale high reading is indistinguishable from a current one. Preferring the maximum would pin that stale value for the rest of the window, up to five hours for `5h` and a full week for `7d`.
 
 > **It only updates on redraw.** It cannot refresh a session that is not redrawing at all, and "latest known" is only as fresh as your most recently active session. coralline has no API access. So this narrows the gap between sessions, it does not make a fully idle bar live.
 
