@@ -1215,19 +1215,45 @@ seg_limit() {  # $1=label $2=pct $3=resets_at $4=bg $5=canonical pct_milli(optio
   push "$4" "${fgc} $1 ${_BAR} ${v}% ${rst} "
 }
 # With VL_LIMIT_SYNC, render the once-per-render canonical state result.
+# A synced window is only "valid" while its reset is still ahead — that holds for
+# the payload snapshot (state_gate) and for every store entry (rl_latest) alike.
+# Claude Code re-renders an idle session from its last-seen snapshot, so the
+# moment a window elapses with no interaction BOTH sources fall invalid in the
+# same render and gating the segment on validity blanked it until the next
+# keystroke delivered a fresh snapshot. Fall back to the ELAPSED window's last
+# reading instead, which needs both halves of the snapshot to have survived
+# validation: _CUR*_PCT means the pct passed state_pct, and a _CUR*_RST inside
+# (0, NOW] means state_payload_epoch parsed a reset that has since passed. A
+# missing or malformed reset leaves _CUR*_RST at 0 and must NOT render, or the
+# bar would claim an elapsed window that was never observed; a reset beyond the
+# window ceiling is the corrupt/sentinel snapshot rejected in #32 and must not
+# render a countdown days or years out. seg_limit shows an elapsed reset as
+# "now", which is what v0.11 displayed here.
+seg_limit_elapsed() {  # $1=canonical pct $2=parsed reset; sets _SLE_OK
+  _SLE_OK=0
+  [ -n "$1" ] || return 0
+  [ "$2" -gt 0 ] && [ "$2" -le "$NOW" ] && _SLE_OK=1
+  return 0
+}
 seg_limit5h() {  # 5h rate-limit gauge with reset countdown
   local p="$fh_pct" r="$fh_rst" m=""
   if [ "$VL_LIMIT_SYNC" = 1 ]; then
-    [ "${_STATE_RL5_VALID:-0}" = 1 ] || return 0
-    m=$_STATE_RL5_PCT; printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 )); r=$_STATE_RL5_RST
+    seg_limit_elapsed "${_CUR5_CANON:-}" "${_CUR5_RST:-0}"
+    if [ "${_STATE_RL5_VALID:-0}" = 1 ]; then m=$_STATE_RL5_PCT; r=$_STATE_RL5_RST
+    elif [ "$_SLE_OK" = 1 ];            then m=$_CUR5_PCT;       r=$_CUR5_RST
+    else return 0; fi
+    printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 ))
   fi
   seg_limit "5h" "$p" "$r" "$VL_BG_5H" "$m"
 }
 seg_limit7d() {  # 7d rate-limit gauge with reset countdown
   local p="$wd_pct" r="$wd_rst" m=""
   if [ "$VL_LIMIT_SYNC" = 1 ]; then
-    [ "${_STATE_RL7_VALID:-0}" = 1 ] || return 0
-    m=$_STATE_RL7_PCT; printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 )); r=$_STATE_RL7_RST
+    seg_limit_elapsed "${_CUR7_CANON:-}" "${_CUR7_RST:-0}"
+    if [ "${_STATE_RL7_VALID:-0}" = 1 ]; then m=$_STATE_RL7_PCT; r=$_STATE_RL7_RST
+    elif [ "$_SLE_OK" = 1 ];            then m=$_CUR7_PCT;       r=$_CUR7_RST
+    else return 0; fi
+    printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 ))
   fi
   seg_limit "7d" "$p" "$r" "$VL_BG_7D" "$m"
 }
