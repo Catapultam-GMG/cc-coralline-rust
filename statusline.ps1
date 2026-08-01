@@ -2126,7 +2126,10 @@ function Get-CorallineState([bool]$BurnGate, [bool]$Limit5Gate, [bool]$Limit7Gat
     if ($Limit7Gate -and $limit7Snapshot.Complete) { [void](Publish-LimitState $limit7Paths.Root $current7 $limit7Snapshot $limit7Gc 691200L $mutate) }
 
     $five = Get-Burn5Estimate $burnSnapshot $burnRetention $legacy $currentBurn $Now $window
-    if ($Cfg.VL_LIMIT_SYNC -eq '1') { $seven = Get-Burn7Estimate $limit7 $Now }
+    # The ownership rule covers the projection as well: burn can bind to the 7d
+    # window, so a stored percentage from another session would otherwise reach
+    # the bar as an ETA even while the 7d gauge is hidden.
+    if ($Cfg.VL_LIMIT_SYNC -eq '1' -and $current7.Valid) { $seven = Get-Burn7Estimate $limit7 $Now }
     else { $seven = Get-Burn7Estimate $current7 $Now }
     $burn = Get-BurnBinding $five $seven
     $burn | Add-Member -NotePropertyName Reported -NotePropertyValue ($current5.Valid -or $current7.Valid)

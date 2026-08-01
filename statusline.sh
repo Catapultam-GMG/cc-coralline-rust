@@ -929,7 +929,14 @@ burn_eta_7d() {  # → _B7_*; $1=pct_milli $2=reset epoch
 burn_estimate() {  # → _BURN_STATE _BURN_LABEL _BURN_ETA _BURN_RATE _BURN_TTR
   local f5=0 f7=0
   burn_eta_5h "${_STATE_MUTATE:-0}"
-  if [ "$VL_LIMIT_SYNC" = 1 ] && [ "${_STATE_RL7_VALID:-0}" = 1 ]; then burn_eta_7d "$_STATE_RL7_PCT" "$_STATE_RL7_RST"
+  # The ownership rule covers the projection too, not just the gauge. burn can
+  # bind to the 7d window, so a stored percentage from another session would
+  # otherwise reach the bar as an ETA even while the 7d gauge itself is hidden —
+  # and a payload carrying 5h but no 7d is exactly the case that keeps seg_burn
+  # rendering. Requiring _CUR7_VALID leaves the roll-over catch-up intact, since
+  # rl_choose only lets the store win with a strictly newer reset.
+  if [ "$VL_LIMIT_SYNC" = 1 ] && [ "${_CUR7_VALID:-0}" = 1 ] && [ "${_STATE_RL7_VALID:-0}" = 1 ]; then
+    burn_eta_7d "$_STATE_RL7_PCT" "$_STATE_RL7_RST"
   elif [ "${_CUR7_VALID:-0}" = 1 ]; then burn_eta_7d "$_CUR7_PCT" "$_CUR7_RST"
   else burn_eta_7d "" ""; fi
   [ "$_B5_ETA" != inf ] && f5=1

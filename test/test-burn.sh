@@ -567,6 +567,21 @@ M5S=active M5E=21600 M5R=0 M5T=15000 M7E=7200 M7R=0 M7T=86400
 burn_estimate; eq 'binding label 7d' "$_BURN_LABEL" 7d
 M5S=active M5E=5000 M5R=0 M5T=9000 M7E=5000 M7R=0 M7T=9000
 burn_estimate; eq 'binding ETA tie chooses 5h' "$_BURN_LABEL" 5h
+
+# The ownership rule covers the projection, not just the gauge. burn can bind to
+# the 7d window, and a payload carrying 5h but no 7d still renders seg_burn, so a
+# stored percentage from another session must not reach burn_eta_7d either.
+burn_eta_7d() { _B7_ARGS="$1|$2"; mk7d "$M7E" "$M7R" "$M7T"; }
+_VLS_SAVE=$VL_LIMIT_SYNC; VL_LIMIT_SYNC=1
+_STATE_RL7_VALID=1; _STATE_RL7_PCT=99000; _STATE_RL7_RST=1345600
+_CUR7_VALID=0; _CUR7_PCT=0; _CUR7_RST=0
+_B7_ARGS=unset; burn_estimate
+eq 'no own 7d reading keeps the store out of the projection' "$_B7_ARGS" '|'
+_CUR7_VALID=1; _CUR7_PCT=30000; _CUR7_RST=1345600
+_B7_ARGS=unset; burn_estimate
+eq 'own 7d reading admits the synced projection' "$_B7_ARGS" '99000|1345600'
+VL_LIMIT_SYNC=$_VLS_SAVE; _STATE_RL7_VALID=0; _CUR7_VALID=0
+burn_eta_7d() { mk7d "$M7E" "$M7R" "$M7T"; }
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _BURN_STATE=active; _BURN_LABEL=5h; _BURN_ETA=1000; _BURN_RATE=0; _BURN_TTR=900
 seg_burn
 case "${SEG_TXT[0]}" in (*'↗ 5h ⇢ 16m'*) ok 'burn renderer uses precomputed estimate' ;; (*) bad 'burn renderer uses precomputed estimate' "${SEG_TXT[0]}" ;; esac
