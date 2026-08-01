@@ -37,6 +37,12 @@ eval "$(sed -n '/^state_pct() {/,/^seg_burn() {/p' "$SCRIPT" | sed '$d')"
 eval "$(sed -n '/^fg() {/,/^}/p' "$SCRIPT")"
 eval "$(sed -n '/^push() {/,/^}/p' "$SCRIPT")"
 eval "$(sed -n '/^seg_burn() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^make_bar() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^pct_fg() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^fmt_countdown() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^seg_limit() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^seg_limit5h() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^seg_limit7d() {/,/^}/p' "$SCRIPT")"
 
 RL_MAX_5H=21600
 RL_MAX_7D=691200
@@ -531,6 +537,42 @@ case "${SEG_TXT[0]}" in (*$'\033[38;5;179m'*) ok 'burn renderer warning color' ;
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _BURN_STATE=warming; _BURN_LABEL=''; _BURN_ETA=inf; _BURN_RATE=0; _BURN_TTR=0
 seg_burn
 case "${SEG_TXT[0]}" in (*'↗ …'*) ok 'burn renderer warming marker' ;; (*) bad 'burn renderer warming marker' "${SEG_TXT[0]}" ;; esac
+
+# Synced limit segments override the payload but never gate on it. Once a window's
+# reset passes, the payload snapshot and every store entry go invalid in the same
+# render, so gating here blanked the segment for the whole idle stretch until the
+# next keystroke delivered a fresh snapshot. The fallback reads the canonical
+# _CUR*_PCT, never the raw payload, so an unvalidated pct still renders nothing.
+NOW=1000000; VL_BG_7D=236; VL_LIMIT_SYNC=1
+VL_BAR_WIDTH=5; VL_BAR_FILL='▰'; VL_BAR_EMPTY='▱'; VL_WARN_PCT=50; VL_HOT_PCT=75
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+fh_pct=41.2; fh_rst=1015900; _CUR5_CANON='041.200'; _CUR5_PCT=41200; _CUR5_RST=1015900
+_STATE_RL5_VALID=1; _STATE_RL5_PCT=62000; _STATE_RL5_RST=1015900
+seg_limit5h
+case "${SEG_TXT[0]}" in (*'5h '*' 62% '*) ok 'synced high-water overrides the payload' ;; (*) bad 'synced high-water overrides the payload' "${SEG_TXT[0]}" ;; esac
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL5_VALID=0; _CUR5_RST=999000
+seg_limit5h
+eq 'expired 5h window still renders' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*'5h '*' 41% '*) ok 'expired 5h window keeps the canonical reading' ;; (*) bad 'expired 5h window keeps the canonical reading' "${SEG_TXT[0]}" ;; esac
+case "${SEG_TXT[0]}" in (*'↺now'*) ok 'expired 5h window countdown reads now' ;; (*) bad 'expired 5h window countdown reads now' "${SEG_TXT[0]}" ;; esac
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL7_VALID=0
+wd_pct=30; wd_rst=999000; _CUR7_CANON='030.000'; _CUR7_PCT=30000; _CUR7_RST=999000
+seg_limit7d
+eq 'expired 7d window still renders' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*'7d '*' 30% '*) ok 'expired 7d window keeps the canonical reading' ;; (*) bad 'expired 7d window keeps the canonical reading' "${SEG_TXT[0]}" ;; esac
+
+# An oversized/malformed payload pct leaves _CUR5_CANON empty, so the fallback
+# must draw nothing rather than push the raw value through make_bar/pct_fg.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL5_VALID=0; _CUR5_CANON=''; _CUR5_PCT=0
+fh_pct=$_LONG_PCT; fh_rst=999000
+seg_limit5h
+eq 'unvalidated payload pct renders nothing' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); fh_pct=''; fh_rst=''
+seg_limit5h
+eq 'no payload and no synced state renders nothing' "${#SEG_TXT[@]}" 0
 
 printf 'SUMMARY pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

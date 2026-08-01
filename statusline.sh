@@ -1215,19 +1215,33 @@ seg_limit() {  # $1=label $2=pct $3=resets_at $4=bg $5=canonical pct_milli(optio
   push "$4" "${fgc} $1 ${_BAR} ${v}% ${rst} "
 }
 # With VL_LIMIT_SYNC, render the once-per-render canonical state result.
+# A synced window is only "valid" while its reset is still ahead — that holds for
+# the payload snapshot (state_gate) and for every store entry (rl_latest) alike.
+# Claude Code re-renders an idle session from its last-seen snapshot, so the
+# moment a window elapses with no interaction BOTH sources fall invalid in the
+# same render and gating the segment on validity blanked it until the next
+# keystroke delivered a fresh snapshot. Fall back to the elapsed window's last
+# canonical reading instead: _CUR*_PCT is set whenever the payload pct passed
+# state_pct, independently of the reset check, so the fallback still cannot put
+# an unvalidated value on the bar. seg_limit renders the countdown as "now" once
+# the reset is in the past, which is what v0.11 showed here.
 seg_limit5h() {  # 5h rate-limit gauge with reset countdown
   local p="$fh_pct" r="$fh_rst" m=""
   if [ "$VL_LIMIT_SYNC" = 1 ]; then
-    [ "${_STATE_RL5_VALID:-0}" = 1 ] || return 0
-    m=$_STATE_RL5_PCT; printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 )); r=$_STATE_RL5_RST
+    if [ "${_STATE_RL5_VALID:-0}" = 1 ]; then m=$_STATE_RL5_PCT; r=$_STATE_RL5_RST
+    elif [ -n "${_CUR5_CANON:-}" ];    then m=$_CUR5_PCT;       r=$_CUR5_RST
+    else return 0; fi
+    printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 ))
   fi
   seg_limit "5h" "$p" "$r" "$VL_BG_5H" "$m"
 }
 seg_limit7d() {  # 7d rate-limit gauge with reset countdown
   local p="$wd_pct" r="$wd_rst" m=""
   if [ "$VL_LIMIT_SYNC" = 1 ]; then
-    [ "${_STATE_RL7_VALID:-0}" = 1 ] || return 0
-    m=$_STATE_RL7_PCT; printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 )); r=$_STATE_RL7_RST
+    if [ "${_STATE_RL7_VALID:-0}" = 1 ]; then m=$_STATE_RL7_PCT; r=$_STATE_RL7_RST
+    elif [ -n "${_CUR7_CANON:-}" ];    then m=$_CUR7_PCT;       r=$_CUR7_RST
+    else return 0; fi
+    printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 ))
   fi
   seg_limit "7d" "$p" "$r" "$VL_BG_7D" "$m"
 }
