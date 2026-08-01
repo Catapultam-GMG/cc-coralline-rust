@@ -442,11 +442,18 @@ true_case 'metachar basename three preserved' test -d "$CASE/state/limit5.d/$_ME
 true_case 'nonempty canonical-looking entry preserved' test -f "$CASE/state/limit5.d/$_NONEMPTY/canary"
 if LC_ALL=C grep -q '15%' "$CASE/out"; then ok 'own reading wins its own window'; else bad 'own reading wins its own window' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/out")"; fi
 if LC_ALL=C grep -q '99%' "$CASE/out"; then bad 'malformed names never reach the bar' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/out")"; else ok 'malformed names never reach the bar'; fi
-# Without an own reading the store is the sole source, so its canonical winner has
-# to survive the malformed neighbours rather than merely be outranked by the payload.
+# Without a reading of its own a session draws no gauge at all: the store retires
+# nothing, so its winner may be a value no session still reports. Selection itself
+# must still be correct, so the winner is asserted directly rather than through
+# the bar, which keeps the malformed-neighbour coverage.
 make_payload "$CASE/blank" '' '' '' ''
 run_runtime_cwd "$CASE" "$BASH_BIN" "$CASE/conf" "$CASE/blank" "$CASE/blank.out" "$CASE/blank.err" 0
-if LC_ALL=C grep -q '20%' "$CASE/blank.out"; then ok 'malformed names do not displace canonical winner'; else bad 'malformed names do not displace canonical winner' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/blank.out")"; fi
+if LC_ALL=C grep -q '5h ' "$CASE/blank.out"; then bad 'no own reading draws no gauge' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/blank.out")"; else ok 'no own reading draws no gauge'; fi
+eq 'no own reading keeps stderr empty' "$(file_bytes "$CASE/blank.err")" 0
+unit_gate "$CASE/state" "$_now" 15 "$_winner" 30 "$_later" 1
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0
+eq 'malformed names do not displace canonical winner' "$_LL_PCT" '020.000'
+eq 'malformed names do not displace canonical reset' "$_LL_RST" "$_winner"
 
 # No immutable-controller tools remain on the state path. Wrappers would fail the
 # render if find or od were invoked.
@@ -577,6 +584,7 @@ NOW=1000000; VL_BG_7D=236; VL_LIMIT_SYNC=1
 VL_BAR_WIDTH=5; VL_BAR_FILL='▰'; VL_BAR_EMPTY='▱'; VL_WARN_PCT=50; VL_HOT_PCT=75
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
 fh_pct=41.2; fh_rst=1015900; _CUR5_CANON='041.200'; _CUR5_PCT=41200; _CUR5_RST=1015900
+_CUR5_VALID=1; _CUR7_VALID=1
 _STATE_RL5_VALID=1; _STATE_RL5_PCT=62000; _STATE_RL5_RST=1015900
 seg_limit5h
 case "${SEG_TXT[0]}" in (*'5h '*' 62% '*) ok 'synced high-water overrides the payload' ;; (*) bad 'synced high-water overrides the payload' "${SEG_TXT[0]}" ;; esac
@@ -622,6 +630,29 @@ eq '7d unparsed reset renders nothing' "${#SEG_TXT[@]}" 0
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_CANON=''; fh_pct=''; fh_rst=''
 seg_limit5h
 eq 'no payload and no synced state renders nothing' "${#SEG_TXT[@]}" 0
+
+# A stranger's reading is never displayed, in either window. The store retires
+# nothing, so its maximum outlives whoever reported it; 5h only hides that by
+# rolling its window sooner than 7d, which is why both follow the same rule.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+fh_pct=''; fh_rst=''; _CUR5_VALID=0; _CUR5_CANON=''; _CUR5_RST=0
+_STATE_RL5_VALID=1; _STATE_RL5_PCT=99000; _STATE_RL5_RST=1015900
+seg_limit5h
+eq 'no own 5h reading never shows a stored value' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+wd_pct=''; wd_rst=''; _CUR7_VALID=0; _CUR7_CANON=''; _CUR7_RST=0
+_STATE_RL7_VALID=1; _STATE_RL7_PCT=99000; _STATE_RL7_RST=1345600
+seg_limit7d
+eq 'no own 7d reading never shows a stored value' "${#SEG_TXT[@]}" 0
+
+# The roll-over catch-up survives: this session holds a valid but older window and
+# the store holds a strictly newer one, which is the case rl_choose lets win.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+fh_pct=41.2; fh_rst=1015900; _CUR5_VALID=1; _CUR5_CANON='041.200'; _CUR5_PCT=41200; _CUR5_RST=1015900
+_STATE_RL5_VALID=1; _STATE_RL5_PCT=7000; _STATE_RL5_RST=1016900
+seg_limit5h
+case "${SEG_TXT[0]}" in (*'5h '*' 7% '*) ok 'roll-over catch-up still renders the newer window' ;; (*) bad 'roll-over catch-up still renders the newer window' "${SEG_TXT[0]}" ;; esac
 
 printf 'SUMMARY pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

@@ -1252,12 +1252,23 @@ seg_limit_elapsed() {  # $1=canonical pct $2=parsed reset; sets _SLE_OK
   [ "$2" -gt 0 ] && [ "$2" -le "$NOW" ] && _SLE_OK=1
   return 0
 }
+# A reading from ANOTHER session is never displayed. The store ranks entries by
+# reset then percentage, and nothing ever retires an entry, so the maximum any
+# session recorded for a window stays the maximum until the window rolls: five
+# hours for 5h, a week for 7d. A session with no reading of its own would then
+# show a stranger's number indefinitely, and observed values for one 7d window on
+# one host ranged from 5% to 100%, so those numbers are not even comparable.
+# Requiring _CUR*_VALID keeps the store where it still holds better information —
+# it wins only with a strictly newer reset (rl_choose), which is the roll-over
+# catch-up — and drops only the "I have nothing, borrow a stranger's" path.
+# Both windows use the same rule: 5h merely hides the defect by rolling sooner.
 seg_limit5h() {  # 5h rate-limit gauge with reset countdown
   local p="$fh_pct" r="$fh_rst" m=""
   if [ "$VL_LIMIT_SYNC" = 1 ]; then
     seg_limit_elapsed "${_CUR5_CANON:-}" "${_CUR5_RST:-0}"
-    if [ "${_STATE_RL5_VALID:-0}" = 1 ]; then m=$_STATE_RL5_PCT; r=$_STATE_RL5_RST
-    elif [ "$_SLE_OK" = 1 ];            then m=$_CUR5_PCT;       r=$_CUR5_RST
+    if [ "${_CUR5_VALID:-0}" = 1 ] && [ "${_STATE_RL5_VALID:-0}" = 1 ]; then
+      m=$_STATE_RL5_PCT; r=$_STATE_RL5_RST
+    elif [ "$_SLE_OK" = 1 ]; then m=$_CUR5_PCT; r=$_CUR5_RST
     else return 0; fi
     printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 ))
   fi
@@ -1267,8 +1278,9 @@ seg_limit7d() {  # 7d rate-limit gauge with reset countdown
   local p="$wd_pct" r="$wd_rst" m=""
   if [ "$VL_LIMIT_SYNC" = 1 ]; then
     seg_limit_elapsed "${_CUR7_CANON:-}" "${_CUR7_RST:-0}"
-    if [ "${_STATE_RL7_VALID:-0}" = 1 ]; then m=$_STATE_RL7_PCT; r=$_STATE_RL7_RST
-    elif [ "$_SLE_OK" = 1 ];            then m=$_CUR7_PCT;       r=$_CUR7_RST
+    if [ "${_CUR7_VALID:-0}" = 1 ] && [ "${_STATE_RL7_VALID:-0}" = 1 ]; then
+      m=$_STATE_RL7_PCT; r=$_STATE_RL7_RST
+    elif [ "$_SLE_OK" = 1 ]; then m=$_CUR7_PCT; r=$_CUR7_RST
     else return 0; fi
     printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 ))
   fi

@@ -2683,10 +2683,14 @@ function Add-LimitSegment([string]$Label, [string]$RawPct, [string]$ResetsAt, [s
 # the pct and the reset to have passed validation and the reset to have actually
 # passed, so neither an unvalidated pct nor an unobserved window reaches the bar.
 # Format-Countdown reports an elapsed reset as "now".
+# A reading from another session is never displayed: the store retires nothing, so
+# its maximum for a window outlives whoever reported it. Requiring Current*.Valid
+# keeps the roll-over catch-up, where the store holds a strictly newer window, and
+# drops only the borrow-a-stranger's-number path. Same rule for both windows.
 function Add-Limit5Segment {
     if ($Cfg.VL_LIMIT_SYNC -eq '1') {
         if ($null -eq $State) { return }
-        if ($State.Limit5.Valid) {
+        if ($State.Current5.Valid -and $State.Limit5.Valid) {
             Add-LimitSegment '5h' (Format-StatePct $State.Limit5.Pct) ([string]$State.Limit5.Reset) $Cfg.VL_BG_5H $State.Limit5.Pct
         } elseif ($State.Current5.Elapsed) {
             Add-LimitSegment '5h' (Format-StatePct $State.Current5.ElapsedPct) ([string]$State.Current5.ElapsedReset) $Cfg.VL_BG_5H $State.Current5.ElapsedPct
@@ -2699,7 +2703,7 @@ function Add-Limit5Segment {
 function Add-Limit7Segment {
     if ($Cfg.VL_LIMIT_SYNC -eq '1') {
         if ($null -eq $State) { return }
-        if ($State.Limit7.Valid) {
+        if ($State.Current7.Valid -and $State.Limit7.Valid) {
             Add-LimitSegment '7d' (Format-StatePct $State.Limit7.Pct) ([string]$State.Limit7.Reset) $Cfg.VL_BG_7D $State.Limit7.Pct
         } elseif ($State.Current7.Elapsed) {
             Add-LimitSegment '7d' (Format-StatePct $State.Current7.ElapsedPct) ([string]$State.Current7.ElapsedReset) $Cfg.VL_BG_7D $State.Current7.ElapsedPct
