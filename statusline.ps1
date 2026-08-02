@@ -2202,6 +2202,31 @@ function Get-CorallineState([bool]$BurnGate, [bool]$Limit5Gate, [bool]$Limit7Gat
             if ($namespace[$i].Equals($namespace[$j], [StringComparison]::OrdinalIgnoreCase)) { $collision = $true }
         }
     }
+    # A state path must not alias something the renderer reads rather than owns.
+    # The burn base is now an appended file, so BURN_FILE pointing at the active
+    # config, one of its includes, or the runtime script would write a TSV record
+    # into that file: the first render still succeeds, the next one parses a
+    # corrupted config and falls back to defaults, and the user's file is damaged.
+    # Test-FloatCollision already protects the float writer with exactly this set,
+    # so the same set guards state mutation. Protected paths are compared against
+    # state paths only, never against each other, so a repeated include cannot
+    # manufacture a collision.
+    if (-not $collision) {
+        $protected = New-Object 'System.Collections.Generic.List[string]'
+        $runtimePath = ''
+        try { $runtimePath = [IO.Path]::GetFullPath($ScriptPath) } catch { }
+        foreach ($path in @($ConfigPath, $runtimePath)) {
+            if (-not [string]::IsNullOrEmpty([string]$path)) { [void]$protected.Add([string]$path) }
+        }
+        foreach ($path in $ConfigVisitedPaths) {
+            if (-not [string]::IsNullOrEmpty([string]$path)) { [void]$protected.Add([string]$path) }
+        }
+        foreach ($statePath in $namespace) {
+            foreach ($guard in $protected) {
+                if ($statePath.Equals($guard, [StringComparison]::OrdinalIgnoreCase)) { $collision = $true }
+            }
+        }
+    }
     if (-not $collision) {
         if ($BurnGate -and $null -ne $burnPaths) {
             [void](Append-BurnState $burnPaths.Base $currentBurn $mutate)
