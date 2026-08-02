@@ -2202,20 +2202,32 @@ function Get-CorallineState([bool]$BurnGate, [bool]$Limit5Gate, [bool]$Limit7Gat
             if ($namespace[$i].Equals($namespace[$j], [StringComparison]::OrdinalIgnoreCase)) { $collision = $true }
         }
     }
-    # A state path must not alias something the renderer reads rather than owns.
-    # The burn base is now an appended file, so BURN_FILE pointing at the active
-    # config, one of its includes, or the runtime script would write a TSV record
-    # into that file: the first render still succeeds, the next one parses a
-    # corrupted config and falls back to defaults, and the user's file is damaged.
-    # Test-FloatCollision already protects the float writer with exactly this set,
-    # so the same set guards state mutation. Protected paths are compared against
-    # state paths only, never against each other, so a repeated include cannot
-    # manufacture a collision.
+    # A state path must not alias a file the renderer reads or writes for another
+    # purpose. The burn base is now appended to, so any such alias means a TSV
+    # record lands in that file: the render still succeeds, and the damage shows
+    # up on the next one, in a file the user has to repair by hand.
+    #
+    # This is the complete set for the main render path, enumerated rather than
+    # discovered one report at a time. The renderer reads the config, every file
+    # the config includes (themes arrive this way), and its own script; it writes
+    # the float target. Test-FloatCollision already protects the float writer
+    # against the state paths, so this is the same relation in the other
+    # direction, and both must hold because the state append runs first.
+    #
+    # The transcript is deliberately absent: it is used only to derive a subagent
+    # sidecar path under --subagent, and that mode performs no state mutation.
+    #
+    # Protected paths are compared against state paths only, never against each
+    # other, so a repeated include cannot manufacture a collision.
     if (-not $collision) {
         $protected = New-Object 'System.Collections.Generic.List[string]'
         $runtimePath = ''
         try { $runtimePath = [IO.Path]::GetFullPath($ScriptPath) } catch { }
-        foreach ($path in @($ConfigPath, $runtimePath)) {
+        $floatTarget = ''
+        if (-not [string]::IsNullOrEmpty([string]$Cfg.VL_FLOAT_FILE) -and ([string]$Cfg.VL_FLOAT_FILE).Length -le 4096) {
+            $floatTarget = ConvertTo-LocalFullPath ([string]$Cfg.VL_FLOAT_FILE) ([Environment]::CurrentDirectory)
+        }
+        foreach ($path in @($ConfigPath, $runtimePath, $floatTarget)) {
             if (-not [string]::IsNullOrEmpty([string]$path)) { [void]$protected.Add([string]$path) }
         }
         foreach ($path in $ConfigVisitedPaths) {
