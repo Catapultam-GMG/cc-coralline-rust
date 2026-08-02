@@ -1779,20 +1779,26 @@ function ConvertFrom-BurnRecord([string]$Record, [long]$NowValue) {
 
 # A killed render dies before its finally block, leaving the trim temporary (or the
 # replace backup) behind, and nothing retired those. Sweep on the mutating path
-# only, taking only what is unambiguously ours and unambiguously dead: one of our
-# two prefixes, a regular file, and last written before the store it was derived
-# from, since a temporary a live render is still writing is newer than the base it
-# is about to replace. Capped so a pathological directory cannot stall a render.
+# only, taking only what is unambiguously ours and unambiguously dead: the complete
+# name Write-BurnState generates, a regular file, and last written before the store
+# it was derived from, since a temporary a live render is still writing is newer
+# than the base it is about to replace. Matching the whole shape rather than the
+# prefix keeps an unrelated .burn.tmp.* file in a shared directory out of it.
+# Enumeration is lazy and bounded on both counts, so neither the scan nor the
+# deletions can stall a render; whatever is left goes on the next one. A directory
+# holding thousands of NON-generated .burn.* names could keep the tail out of
+# reach, which no store this sweep is meant for looks like.
 function Remove-BurnTemporaries([string]$Parent, [string]$Path) {
     try {
         if (-not (Test-StateRegularFile $Path)) { return }
         $baseWrite = [IO.File]::GetLastWriteTimeUtc($Path)
         $swept = 0
-        foreach ($name in [IO.Directory]::GetFiles($Parent, '.burn.*')) {
-            if ($swept -ge 128) { break }
+        $seen = 0
+        foreach ($name in [IO.Directory]::EnumerateFiles($Parent, '.burn.*')) {
+            $seen++
+            if ($swept -ge 128 -or $seen -gt 4096) { break }
             $leaf = [IO.Path]::GetFileName($name)
-            if (-not ($leaf.StartsWith('.burn.tmp.', [StringComparison]::Ordinal) -or
-                      $leaf.StartsWith('.burn.bak.', [StringComparison]::Ordinal))) { continue }
+            if ($leaf -notmatch '^\.burn\.(tmp|bak)\.[0-9]{1,10}\.[0-9a-fA-F]{32}$') { continue }
             if (-not (Test-StateRegularFile $name)) { continue }
             if ([IO.File]::GetLastWriteTimeUtc($name) -ge $baseWrite) { continue }
             try { [IO.File]::Delete($name); $swept++ } catch { }

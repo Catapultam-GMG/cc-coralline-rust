@@ -1856,14 +1856,18 @@ fi
     $sweepConfig = New-StateConfig 'win02-tmpsweep' $sweepRoot 'burn' $false
     $sweepPath = Join-Path $sweepRoot 'burn.tsv'
     Write-Utf8 $sweepPath (($fixedNow - 100L).ToString($Invariant) + "`t010.000`t1015900`n")
-    $sweepOrphans = @('.burn.tmp.4242.deadbeef', '.burn.bak.4242.deadbeef')
-    $sweepKeep = @('.burn.other.4242', 'burn.tmp.4242')
+    # The generated shape is .burn.<tmp|bak>.<pid>.<32 hex>, so a prefix match alone
+    # would take an unrelated .burn.tmp.* file that happens to share the directory.
+    $sweepOrphans = @('.burn.tmp.4242.0123456789abcdef0123456789abcdef',
+                      '.burn.bak.4242.fedcba9876543210fedcba9876543210')
+    $sweepKeep = @('.burn.tmp.user-backup', '.burn.tmp.4242.short',
+                   '.burn.other.4242', 'burn.tmp.4242')
     foreach ($leaf in ($sweepOrphans + $sweepKeep)) { Write-Utf8 (Join-Path $sweepRoot $leaf) 'x' }
     $sweepStamp = [IO.File]::GetLastWriteTimeUtc($sweepPath)
     foreach ($leaf in ($sweepOrphans + $sweepKeep)) {
         [IO.File]::SetLastWriteTimeUtc((Join-Path $sweepRoot $leaf), $sweepStamp.AddSeconds(-30))
     }
-    $sweepLive = Join-Path $sweepRoot '.burn.tmp.4243.livewrite'
+    $sweepLive = Join-Path $sweepRoot '.burn.tmp.4243.00112233445566778899aabbccddeeff'
     Write-Utf8 $sweepLive 'x'
     [IO.File]::SetLastWriteTimeUtc($sweepLive, $sweepStamp.AddSeconds(30))
     $sweepRun = Invoke-Statusline (Json $statePayload) $sweepConfig $stateEnvWrite '' 10000
