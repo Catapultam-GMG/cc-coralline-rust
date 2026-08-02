@@ -794,6 +794,17 @@ rl_choose() {  # $1=5|7; this session's window beats the store; a newer stored w
 # finds no file, the base stays intact), never data. One batched rm, capped so a
 # pathological directory cannot build an unbounded argument list; what is left
 # over is swept by the next render.
+# The glob is eager: bash expands and sorts every match before the loop runs, so
+# the cap bounds deletions and stat calls but not the expansion. That is accepted
+# rather than fixed, because bash has no fork-free lazy directory walk and find is
+# barred from the state path by both the fork budget and a regression test. The
+# cost was measured on the real backlog that motivated this: a clean store is
+# indistinguishable from bare interpreter startup (24 ms either way), and 1020
+# orphans cost 137 ms on the worst render and drain in nine, after which they
+# cannot come back, since 128 per render outruns accumulation by three orders of
+# magnitude (about 48 per hour observed). Raising the cap to drain in one render
+# is worse, not better: 1024 per pass measured 4385 ms, well past the one-second
+# refresh, because the argument list grows with it.
 burn_tmp_sweep() {  # remove trim temporaries orphaned by killed renders
   local f n c=0
   set --
