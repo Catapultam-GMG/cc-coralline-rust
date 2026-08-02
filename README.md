@@ -464,13 +464,17 @@ fit, so the 7d projection binds and you see `↗ 7d`.
 
 `VL_LIMIT_SYNC=1` helps a session that is lagging a window boundary catch up to one that has already rolled over. Each render records its `5h` / `7d` value to a small per-host store (`limit-5h.d` / `limit-7d.d`), and a session that holds a valid but older window follows a stored reading for a newer one. Off by default.
 
+Your own reading always wins your own window. The store is what a session falls back to when it has no reading of its own: the payload carries rate limits only after the session has received an API response, so a freshly started, resumed, or idle session would otherwise draw no gauge at all even though the account-level window is known. The store only ever holds windows that are still open, and a reading stops standing in for the current window once its own window closed more than six hours ago for `5h` or eight days ago for `7d`. Those are the same ceilings that validate a future reset, so they carry the same skew margin over the nominal window.
+
 This exists because Claude Code re-renders a session's statusline only when that session is active, and the rate-limit numbers it passes are that session's last-seen values, so a session lagging a window boundary shows a stale one. It cannot refresh a session that is not redrawing at all.
 
-**A reading from another session is never displayed as your own.** Sync will not override your reading with a higher one from elsewhere, and it will not fill in for you when you have no reading at all — in that case the gauge is simply not drawn. Two reasons. A percentage can legitimately fall inside a single window (an upstream limit reset, a plan upgrade, any server-side adjustment) and nothing in the payload timestamps an observation, so a stale high reading is indistinguishable from a current one. And the store retires nothing: whatever maximum a window ever recorded outlives whoever reported it, for up to five hours on `5h` and a full week on `7d`. Both windows follow the same rule; `5h` merely hides the problem by rolling over sooner.
+**Your own reading is never overridden by another session's.** Sync will not replace your reading with a higher one from elsewhere. A percentage can legitimately fall inside a single window (an upstream limit reset, a plan upgrade, any server-side adjustment) and nothing in the payload timestamps an observation, so a stale high reading is indistinguishable from a current one.
+
+The store wins in exactly two cases: it holds a strictly newer window, which is the roll-over catch-up, or you have no reading at all, where there is nothing of yours to prefer and the alternative is drawing no gauge for a window your account is plainly inside. A borrowed value is always for the window that is currently open, because an entry is admitted only while its reset is still ahead and every entry it outranks is retired. It is the highest percentage any session recorded for that window, so it over-estimates while sessions disagree.
 
 > **It only updates on redraw.** It cannot refresh a session that is not redrawing at all, and "latest known" is only as fresh as your most recently active session. coralline has no API access. So this narrows the gap between sessions, it does not make a fully idle bar live.
 
-Single-session users gain nothing from it (there is only one snapshot), so it stays opt-in.
+A single session gains only the fallback, where its own earlier renders keep the gauge populated across a restart or resume; the catch-up needs a second session to catch up to. So it stays opt-in.
 
 ### Responsive layout
 

@@ -442,13 +442,14 @@ true_case 'metachar basename three preserved' test -d "$CASE/state/limit5.d/$_ME
 true_case 'nonempty canonical-looking entry preserved' test -f "$CASE/state/limit5.d/$_NONEMPTY/canary"
 if LC_ALL=C grep -q '15%' "$CASE/out"; then ok 'own reading wins its own window'; else bad 'own reading wins its own window' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/out")"; fi
 if LC_ALL=C grep -q '99%' "$CASE/out"; then bad 'malformed names never reach the bar' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/out")"; else ok 'malformed names never reach the bar'; fi
-# Without a reading of its own a session draws no gauge at all: the store retires
-# nothing, so its winner may be a value no session still reports. Selection itself
-# must still be correct, so the winner is asserted directly rather than through
-# the bar, which keeps the malformed-neighbour coverage.
+# Without a reading of its own the session falls back to the store, which is the
+# only source that knows the account's open window. rl_latest admits an entry only
+# while its reset is still ahead, so the borrowed value cannot be a fossil, and the
+# malformed neighbours must still never reach the bar.
 make_payload "$CASE/blank" '' '' '' ''
 run_runtime_cwd "$CASE" "$BASH_BIN" "$CASE/conf" "$CASE/blank" "$CASE/blank.out" "$CASE/blank.err" 0
-if LC_ALL=C grep -q '5h ' "$CASE/blank.out"; then bad 'no own reading draws no gauge' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/blank.out")"; else ok 'no own reading draws no gauge'; fi
+if LC_ALL=C grep -q '20%' "$CASE/blank.out"; then ok 'no own reading falls back to the store'; else bad 'no own reading falls back to the store' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/blank.out")"; fi
+if LC_ALL=C grep -q '99%' "$CASE/blank.out"; then bad 'store fallback never shows a malformed entry' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/blank.out")"; else ok 'store fallback never shows a malformed entry'; fi
 eq 'no own reading keeps stderr empty' "$(file_bytes "$CASE/blank.err")" 0
 unit_gate "$CASE/state" "$_now" 15 "$_winner" 30 "$_later" 1
 rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0
@@ -553,6 +554,26 @@ for _N in 5 12 16; do
   fi
 done
 
+# A killed render leaves its trim temporary behind and nothing used to retire it.
+# The sweep must take only what is unambiguously ours and unambiguously dead: an
+# exactly <base>.<digits>.tmp name, a regular file, and older than the store it was
+# derived from, since a temporary a live render is still writing is newer than the
+# base it is about to replace.
+CASE="$TMPD/tmpsweep"; mkdir -p "$CASE"
+_SB_BASE="$CASE/burn.tsv"
+printf 'x\n' > "$_SB_BASE.111.tmp"; printf 'x\n' > "$_SB_BASE.222.tmp"
+printf 'x\n' > "$_SB_BASE.abc.tmp"; printf 'x\n' > "$_SB_BASE.333.bak"
+ln -s /dev/null "$_SB_BASE.444.tmp"
+sleep 1; printf 'row\n' > "$_SB_BASE"; sleep 1; printf 'live\n' > "$_SB_BASE.555.tmp"
+burn_tmp_sweep
+true_case 'sweep removes an orphaned temporary' test ! -e "$_SB_BASE.111.tmp"
+true_case 'sweep removes every orphaned temporary' test ! -e "$_SB_BASE.222.tmp"
+true_case 'sweep keeps a non-numeric name' test -f "$_SB_BASE.abc.tmp"
+true_case 'sweep keeps a non-temporary suffix' test -f "$_SB_BASE.333.bak"
+true_case 'sweep keeps a symlink' test -L "$_SB_BASE.444.tmp"
+true_case 'sweep keeps a temporary newer than the store' test -f "$_SB_BASE.555.tmp"
+true_case 'sweep leaves the store intact' test -s "$_SB_BASE"
+
 # Binding and renderer regressions after state/storage tests. Stubs isolate the
 # already-tested estimators from the presentation logic.
 VL_BURN_GLYPH='↗'; VL_BG_BURN=''; VL_BG_5H=237; VL_LAYOUT=fixed
@@ -568,20 +589,57 @@ burn_estimate; eq 'binding label 7d' "$_BURN_LABEL" 7d
 M5S=active M5E=5000 M5R=0 M5T=9000 M7E=5000 M7R=0 M7T=9000
 burn_estimate; eq 'binding ETA tie chooses 5h' "$_BURN_LABEL" 5h
 
-# The ownership rule covers the projection, not just the gauge. burn can bind to
-# the 7d window, and a payload carrying 5h but no 7d still renders seg_burn, so a
-# stored percentage from another session must not reach burn_eta_7d either.
+# The projection binds to whatever source the gauge is willing to show, or the bar
+# and the 7d pill would describe different windows in one render. That means the
+# store feeds burn_eta_7d whenever it is valid, with or without a reading of our own.
 burn_eta_7d() { _B7_ARGS="$1|$2"; mk7d "$M7E" "$M7R" "$M7T"; }
 _VLS_SAVE=$VL_LIMIT_SYNC; VL_LIMIT_SYNC=1
 _STATE_RL7_VALID=1; _STATE_RL7_PCT=99000; _STATE_RL7_RST=1345600
 _CUR7_VALID=0; _CUR7_PCT=0; _CUR7_RST=0
 _B7_ARGS=unset; burn_estimate
-eq 'no own 7d reading keeps the store out of the projection' "$_B7_ARGS" '|'
+eq 'no own 7d reading still projects from the store' "$_B7_ARGS" '99000|1345600'
 _CUR7_VALID=1; _CUR7_PCT=30000; _CUR7_RST=1345600
 _B7_ARGS=unset; burn_estimate
 eq 'own 7d reading admits the synced projection' "$_B7_ARGS" '99000|1345600'
+_STATE_RL7_VALID=0
+_B7_ARGS=unset; burn_estimate
+eq 'no store leaves the projection on the payload' "$_B7_ARGS" '30000|1345600'
 VL_LIMIT_SYNC=$_VLS_SAVE; _STATE_RL7_VALID=0; _CUR7_VALID=0
 burn_eta_7d() { mk7d "$M7E" "$M7R" "$M7T"; }
+
+# The 5h projection must describe the same window as the gauge. When only the store
+# supplies that window, a burn history still sitting on the one that just closed
+# would put an active ETA for the old window beside a gauge for the new one; the
+# estimator reports its window as NOW + _B5_TTR.
+NOW=1000000; _VLS_SAVE2=$VL_LIMIT_SYNC; VL_LIMIT_SYNC=1
+_CUR5_VALID=0; _STATE_RL5_VALID=1; _STATE_RL5_RST=$(( NOW + 9000 ))
+_CUR7_VALID=0; _STATE_RL7_VALID=0
+M5S=active M5E=4000 M5R=0 M5T=9000 M7E=inf M7R=0 M7T=0
+burn_estimate
+eq 'store-only 5h projection on the stored window survives' "$_BURN_STATE" active
+M5T=0
+burn_estimate
+eq 'store-only 5h projection on a closed window is dropped' "$_B5_STATE" warming
+eq 'dropped 5h projection leaves burn warming' "$_BURN_STATE" warming
+# A valid reading of our own does not exempt the projection. rl_choose lets a
+# strictly newer stored window beat it, and the session that published that window
+# need not run burn at all, so the shared history can hold only the older one.
+_CUR5_VALID=1; _CUR5_RST=$(( NOW + 1000 )); _STATE_RL5_RST=$(( NOW + 1000 ))
+M5T=1000
+burn_estimate
+eq 'own 5h window matching the store keeps its projection' "$_BURN_STATE" active
+M5T=1000; _STATE_RL5_RST=$(( NOW + 9000 ))
+burn_estimate
+eq 'newer stored window drops a projection still on the older one' "$_B5_STATE" warming
+M5T=9000
+burn_estimate
+eq 'projection rebound to the newer stored window survives' "$_BURN_STATE" active
+_STATE_RL5_VALID=0
+M5T=1000
+burn_estimate
+eq 'no synced state leaves the projection alone' "$_BURN_STATE" active
+VL_LIMIT_SYNC=$_VLS_SAVE2; _STATE_RL5_VALID=0; _CUR5_VALID=0
+M5S=active M5E=21600 M5R=0 M5T=15000 M7E=7200 M7R=0 M7T=86400
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _BURN_STATE=active; _BURN_LABEL=5h; _BURN_ETA=1000; _BURN_RATE=0; _BURN_TTR=900
 seg_burn
 case "${SEG_TXT[0]}" in (*'↗ 5h ⇢ 16m'*) ok 'burn renderer uses precomputed estimate' ;; (*) bad 'burn renderer uses precomputed estimate' "${SEG_TXT[0]}" ;; esac
@@ -589,6 +647,17 @@ case "${SEG_TXT[0]}" in (*$'\033[38;5;179m'*) ok 'burn renderer warning color' ;
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _BURN_STATE=warming; _BURN_LABEL=''; _BURN_ETA=inf; _BURN_RATE=0; _BURN_TTR=0
 seg_burn
 case "${SEG_TXT[0]}" in (*'↗ …'*) ok 'burn renderer warming marker' ;; (*) bad 'burn renderer warming marker' "${SEG_TXT[0]}" ;; esac
+
+# The projection accepts the same sources as the gauges. Leaving burn gated on the
+# payload alone would show 5h and 7d from the store with a hole between them.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_READY=1
+_CUR5_VALID=0; _CUR7_VALID=0; _STATE_RL5_VALID=0; _STATE_RL7_VALID=0
+seg_burn
+eq 'no reading and no store draws no projection' "${#SEG_TXT[@]}" 0
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL7_VALID=1
+seg_burn
+eq 'store window alone draws the projection' "${#SEG_TXT[@]}" 1
+_STATE_READY=0; _STATE_RL7_VALID=0
 
 # Synced limit segments override the payload but never gate on it. Once a window's
 # reset passes, the payload snapshot and every store entry go invalid in the same
@@ -646,20 +715,53 @@ SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_CANON=''; fh_pct=''; fh_rst=''
 seg_limit5h
 eq 'no payload and no synced state renders nothing' "${#SEG_TXT[@]}" 0
 
-# A stranger's reading is never displayed, in either window. The store retires
-# nothing, so its maximum outlives whoever reported it; 5h only hides that by
-# rolling its window sooner than 7d, which is why both follow the same rule.
+# With no reading of its own the session shows the store's open window, in both
+# windows alike. This is the case that blanked both gauges for a freshly started,
+# resumed, or idle session, whose payload carries no rate_limits at all.
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
 fh_pct=''; fh_rst=''; _CUR5_VALID=0; _CUR5_CANON=''; _CUR5_RST=0
 _STATE_RL5_VALID=1; _STATE_RL5_PCT=99000; _STATE_RL5_RST=1015900
 seg_limit5h
-eq 'no own 5h reading never shows a stored value' "${#SEG_TXT[@]}" 0
+eq 'no own 5h reading shows the stored window' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*'5h '*' 99% '*) ok 'stored 5h value reaches the bar' ;; (*) bad 'stored 5h value reaches the bar' "${SEG_TXT[0]}" ;; esac
 
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
 wd_pct=''; wd_rst=''; _CUR7_VALID=0; _CUR7_CANON=''; _CUR7_RST=0
 _STATE_RL7_VALID=1; _STATE_RL7_PCT=99000; _STATE_RL7_RST=1345600
 seg_limit7d
-eq 'no own 7d reading never shows a stored value' "${#SEG_TXT[@]}" 0
+eq 'no own 7d reading shows the stored window' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*'7d '*' 99% '*) ok 'stored 7d value reaches the bar' ;; (*) bad 'stored 7d value reaches the bar' "${SEG_TXT[0]}" ;; esac
+
+# Nothing of our own and nothing in the store still renders nothing.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL5_VALID=0
+seg_limit5h
+eq 'no own 5h reading and no store renders nothing' "${#SEG_TXT[@]}" 0
+
+# An elapsed window is a fallback for one that JUST closed. Claude Code replays the
+# last snapshot an idle session received forever, so past the window ceiling that
+# reading stops standing in for the current window: it falls through to the store,
+# and renders nothing when the store has nothing either.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+fh_pct=41.2; fh_rst=1; _CUR5_CANON='041.200'; _CUR5_PCT=41200
+_CUR5_RST=$(( NOW - RL_MAX_5H )); _CUR5_VALID=0; _STATE_RL5_VALID=0
+seg_limit5h
+eq 'elapsed exactly at the ceiling still renders' "${#SEG_TXT[@]}" 1
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_RST=$(( NOW - RL_MAX_5H - 1 ))
+seg_limit5h
+eq 'elapsed past the ceiling renders nothing' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+_STATE_RL5_VALID=1; _STATE_RL5_PCT=33000; _STATE_RL5_RST=1015900
+seg_limit5h
+eq 'elapsed past the ceiling falls through to the store' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*' 33% '*) ok 'stale reading never outranks the open window' ;; (*) bad 'stale reading never outranks the open window' "${SEG_TXT[0]}" ;; esac
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+wd_pct=30; wd_rst=1; _CUR7_CANON='030.000'; _CUR7_PCT=30000
+_CUR7_RST=$(( NOW - RL_MAX_7D - 1 )); _CUR7_VALID=0; _STATE_RL7_VALID=0
+seg_limit7d
+eq '7d elapsed past the ceiling renders nothing' "${#SEG_TXT[@]}" 0
 
 # The roll-over catch-up survives: this session holds a valid but older window and
 # the store holds a strictly newer one, which is the case rl_choose lets win.

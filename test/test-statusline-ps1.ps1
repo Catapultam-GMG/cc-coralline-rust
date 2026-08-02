@@ -377,19 +377,6 @@ function Get-ImmediateNames([string]$Root) {
     return ,([string[]]@([IO.Directory]::EnumerateFileSystemEntries($Root) | ForEach-Object { [IO.Path]::GetFileName($_) } | Sort-Object))
 }
 
-function Wait-StateBarrier([string]$Barrier, [int]$Count, [int]$TimeoutMs) {
-    $watch = [Diagnostics.Stopwatch]::StartNew()
-    $dir = [IO.Path]::GetDirectoryName($Barrier)
-    $pattern = [IO.Path]::GetFileName($Barrier) + '.*.ready'
-    while ($watch.ElapsedMilliseconds -lt $TimeoutMs) {
-        $ready = 0
-        foreach ($unused in [IO.Directory]::EnumerateFiles($dir, $pattern)) { $ready++ }
-        if ($ready -ge $Count) { return $true }
-        [Threading.Thread]::Sleep(10)
-    }
-    return $false
-}
-
 function Run-Git([string]$WorkingDirectory, [string]$Arguments) {
     $run = Invoke-CapturedProcess $script:GitExe $Arguments '' @{} $WorkingDirectory 10000
     if ($run.TimedOut -or $run.ExitCode -ne 0) { throw "git failed: $Arguments`n$($run.Stderr)" }
@@ -454,8 +441,8 @@ try {
     $source = [System.IO.File]::ReadAllText($Script, $StrictUtf8)
     $bashSource = [System.IO.File]::ReadAllText($BashScript, $StrictUtf8)
 
-    # Deterministic clock, state capture, and snapshot barriers live only in test
-    # copies. Production has no hidden environment-controlled time or I/O hooks.
+    # Deterministic clock and state capture live only in test copies. Production
+    # has no hidden environment-controlled time or I/O hooks.
     $script:StateScript = Join-Path $TempRoot 'statusline-state-test.ps1'
     $psClock = '$Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()'
     $psClockHook = @'
@@ -463,14 +450,6 @@ $Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $testNowValue = 0L
 if ([string]$env:CORALLINE_TEST_STRICT -eq '1') { $ErrorActionPreference = 'Stop' }
 if ([string]$env:CORALLINE_TEST_NOW -match '\A(?:0|[1-9][0-9]{0,11})\z' -and [long]::TryParse([string]$env:CORALLINE_TEST_NOW, $IntegerStyle, $Invariant, [ref]$testNowValue) -and $testNowValue -le 253402300799L) { $Now = $testNowValue }
-'@
-    $psBarrierMarker = '    $burnRetention = [pscustomobject]@{ Candidates=@(); Representatives=@() }'
-    $psBarrierHook = @'
-    if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_BARRIER)) {
-        [IO.File]::WriteAllBytes(([string]$env:CORALLINE_TEST_BARRIER + '.' + [string]$PID + '.ready'), [byte[]]@())
-        while (-not [IO.File]::Exists([string]$env:CORALLINE_TEST_BARRIER)) { Start-Sleep -Milliseconds 10 }
-    }
-    $burnRetention = [pscustomobject]@{ Candidates=@(); Representatives=@() }
 '@
     $psDumpMarker = '    $State = Get-CorallineState $BurnStateGate $Limit5StateGate $Limit7StateGate'
     $psDumpHook = @'
@@ -486,15 +465,6 @@ if ([string]$env:CORALLINE_TEST_NOW -match '\A(?:0|[1-9][0-9]{0,11})\z' -and [lo
         }
         [IO.File]::WriteAllText([string]$env:CORALLINE_TEST_STATE_DUMP, ($capture | ConvertTo-Json -Compress), $Utf8NoBom)
     }
-'@
-    $psAfterCreateMarker = "            `$stream.Dispose()`n            return `$true"
-    $psAfterCreateHook = @'
-            $stream.Dispose()
-            if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_AFTER_CREATE)) {
-                [IO.File]::WriteAllBytes(([string]$env:CORALLINE_TEST_AFTER_CREATE + '.' + [string]$PID + '.ready'), [byte[]]@())
-                while (-not [IO.File]::Exists([string]$env:CORALLINE_TEST_AFTER_CREATE)) { Start-Sleep -Milliseconds 10 }
-            }
-            return $true
 '@
     $psMathMarker = 'function Format-StatePct([int]$Milli) {'
     $psMathHook = @'
@@ -513,8 +483,8 @@ if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_TEST_MATH_DUMP)) {
 }
 function Format-StatePct([int]$Milli) {
 '@
-    if (-not $source.Contains($psClock) -or -not $source.Contains($psBarrierMarker) -or -not $source.Contains($psDumpMarker) -or -not $source.Contains($psAfterCreateMarker) -or -not $source.Contains($psMathMarker)) { throw 'PowerShell state test marker missing' }
-    $statePsSource = $source.Replace($psClock, $psClockHook.TrimEnd()).Replace($psBarrierMarker, $psBarrierHook.TrimEnd()).Replace($psDumpMarker, $psDumpHook.TrimEnd()).Replace($psAfterCreateMarker, $psAfterCreateHook.TrimEnd()).Replace($psMathMarker, $psMathHook.TrimEnd())
+    if (-not $source.Contains($psClock) -or -not $source.Contains($psDumpMarker) -or -not $source.Contains($psMathMarker)) { throw 'PowerShell state test marker missing' }
+    $statePsSource = $source.Replace($psClock, $psClockHook.TrimEnd()).Replace($psDumpMarker, $psDumpHook.TrimEnd()).Replace($psMathMarker, $psMathHook.TrimEnd())
     Write-Utf8 $script:StateScript $statePsSource
 
     $script:FloatScript = Join-Path $TempRoot 'statusline-float-test.ps1'
@@ -555,40 +525,15 @@ case "${CORALLINE_TEST_NOW:-}" in
     fi ;;
 esac
 '@
-    $bashBarrierMarker = '  state_scan' + "`n" + '  if [ "$_STATE_BURN_GATE" = 1 ]; then [ "$_SB_DIR_COMPLETE" = 1 ] && [ "$_LEG_COMPLETE" = 1 ] && _SB_COMPLETE=1; fi'
-    $bashBarrierHook = @'
-  state_scan
-  if [ -n "${CORALLINE_TEST_BARRIER:-}" ]; then
-    set -C
-    { : > "${CORALLINE_TEST_BARRIER}.$$.ready"; } 2>/dev/null || true
-    set +C
-    while [ ! -e "$CORALLINE_TEST_BARRIER" ]; do sleep 0.01; done
-  fi
-  if [ "$_STATE_BURN_GATE" = 1 ]; then [ "$_SB_DIR_COMPLETE" = 1 ] && [ "$_LEG_COMPLETE" = 1 ] && _SB_COMPLETE=1; fi
-'@
-    $bashDumpMarker = "  state_prepare`nfi`n`n# Defensive ANSI stripper"
+    $bashDumpMarker = '  case "$_SEG_SCAN" in (*" burn "*) burn_estimate ;; esac'
     $bashDumpHook = @'
-  state_prepare
+  case "$_SEG_SCAN" in (*" burn "*) burn_estimate ;; esac
   if [ -n "${CORALLINE_TEST_STATE_DUMP:-}" ]; then
     printf '%s\n' "BurnState=$_BURN_STATE BurnLabel=$_BURN_LABEL BurnEta=$_BURN_ETA BurnRate=$_BURN_RATE BurnTtr=$_BURN_TTR FiveState=$_B5_STATE FiveEta=$_B5_ETA FiveRate=$_B5_RATE FiveTtr=$_B5_TTR SevenEta=$_B7_ETA SevenRate=$_B7_RATE SevenTtr=$_B7_TTR Limit5Valid=$_STATE_RL5_VALID Limit5Reset=$_STATE_RL5_RST Limit5Pct=$_STATE_RL5_PCT Limit7Valid=$_STATE_RL7_VALID Limit7Reset=$_STATE_RL7_RST Limit7Pct=$_STATE_RL7_PCT" > "$CORALLINE_TEST_STATE_DUMP"
   fi
-fi
-
-# Defensive ANSI stripper
 '@
-    $bashAfterCreateMarker = '      if { : > "$path"; } 2>/dev/null; then _PUB_BURN_PATH="$path"; break; fi'
-    $bashAfterCreateHook = @'
-      if { : > "$path"; } 2>/dev/null; then
-        _PUB_BURN_PATH="$path"
-        if [ -n "${CORALLINE_TEST_AFTER_CREATE:-}" ]; then
-          { : > "${CORALLINE_TEST_AFTER_CREATE}.$$.ready"; } 2>/dev/null || true
-          while [ ! -e "$CORALLINE_TEST_AFTER_CREATE" ]; do sleep 0.01; done
-        fi
-        break
-      fi
-'@
-    if (-not $bashSource.Contains($bashClock) -or -not $bashSource.Contains($bashBarrierMarker) -or -not $bashSource.Contains($bashDumpMarker) -or -not $bashSource.Contains($bashAfterCreateMarker)) { throw 'Bash state test marker missing' }
-    $stateBashSource = $bashSource.Replace($bashClock, $bashClockHook.TrimEnd()).Replace($bashBarrierMarker, $bashBarrierHook.TrimEnd()).Replace($bashDumpMarker, $bashDumpHook.TrimEnd()).Replace($bashAfterCreateMarker, $bashAfterCreateHook.TrimEnd())
+    if (-not $bashSource.Contains($bashClock) -or -not $bashSource.Contains($bashDumpMarker)) { throw 'Bash state test marker missing' }
+    $stateBashSource = $bashSource.Replace($bashClock, $bashClockHook.TrimEnd()).Replace($bashDumpMarker, $bashDumpHook.TrimEnd())
     Write-Utf8 $script:StateBashScript $stateBashSource
 
     Check 'static source has no production deterministic-clock hook' (-not $source.Contains('CORALLINE_TEST_NOW') -and -not $bashSource.Contains('CORALLINE_TEST_NOW'))
@@ -608,7 +553,7 @@ fi
     $builderBlock = [regex]::Match($source, '(?s)\$SegmentBuilders = \[ordered\]@\{(.*?)\n\}').Groups[1].Value
     $actualRegistry = @([regex]::Matches($builderBlock, '(?m)^    ([A-Za-z0-9]+) =') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
     Check 'closed PowerShell registry equals WIN-02 inventory' (($actualRegistry -join ' ') -eq (($expectedRegistry | Sort-Object) -join ' '))
-    $bashSegments = @([regex]::Matches($bashSource, '(?m)^seg_([A-Za-z0-9_]+)\(\)') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -ne 'len' -and $_ -ne 'limit' } | Sort-Object -Unique)
+    $bashSegments = @([regex]::Matches($bashSource, '(?m)^seg_([A-Za-z0-9_]+)\(\)') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -notmatch '_' -and $_ -ne 'len' -and $_ -ne 'limit' } | Sort-Object -Unique)
     Check 'Bash public registry equals WIN-02 inventory' (($bashSegments -join ' ') -eq (($expectedRegistry | Sort-Object) -join ' '))
 
     $script:BashExe = $env:CORALLINE_TEST_BASH
@@ -1794,26 +1739,26 @@ fi
         [pscustomobject]@{
             Name='unchanged'; Expected='warming'; Pct='10';
             Entries=@(
-                '999500`t010.000`t1015900',
-                '999700`t010.000`t1015900',
-                '999900`t010.000`t1015900'
+                "999500`t010.000`t1015900",
+                "999700`t010.000`t1015900",
+                "999900`t010.000`t1015900"
             )
         },
         [pscustomobject]@{
             Name='idle'; Expected='idle'; Pct='6';
             Entries=@(
-                '999000`t005.000`t1015900',
-                '999100`t006.000`t1015900',
-                '999900`t006.000`t1015900'
+                "999000`t005.000`t1015900",
+                "999100`t006.000`t1015900",
+                "999900`t006.000`t1015900"
             )
         },
         [pscustomobject]@{
             Name='reset-rollover'; Expected='warming'; Pct='2';
             Entries=@(
-                '999500`t005.000`t1010000',
-                '999700`t006.000`t1010000',
-                '999900`t007.000`t1010000',
-                '999950`t002.000`t1015900'
+                "999500`t005.000`t1010000",
+                "999700`t006.000`t1010000",
+                "999900`t007.000`t1010000",
+                "999950`t002.000`t1015900"
             )
         }
     )) {
@@ -1902,6 +1847,46 @@ fi
     $mutableResidue = @(Get-ChildItem -LiteralPath $mutableParent -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like '.burn.tmp.*' -or $_.Name -like '.burn.bak.*' })
     Check 'WIN-02 mutable burn leaves no temp or backup residue' ($mutableResidue.Count -eq 0)
+
+    # A render that is killed never reaches its finally block, so its temp survives
+    # and nothing used to retire it. The next mutating render sweeps what is
+    # unambiguously ours and unambiguously dead: the complete generated shape, a
+    # regular file, older than the store, and older than an hour. The age floor is
+    # what a second burn store sharing this directory relies on, since the name
+    # carries no store identity and a render lives well under a second.
+    $sweepRoot = Join-Path $stateRoot 'tmpsweep'
+    $sweepConfig = New-StateConfig 'win02-tmpsweep' $sweepRoot 'burn' $false
+    $sweepPath = Join-Path $sweepRoot 'burn.tsv'
+    Write-Utf8 $sweepPath (($fixedNow - 100L).ToString($Invariant) + "`t010.000`t1015900`n")
+    $sweepOrphans = @('.burn.tmp.4242.0123456789abcdef0123456789abcdef',
+                      '.burn.bak.4242.fedcba9876543210fedcba9876543210')
+    # Shape keep cases: a user file under the prefix, and a truncated suffix.
+    $sweepKeep = @('.burn.tmp.user-backup', '.burn.tmp.4242.short',
+                   '.burn.other.4242', 'burn.tmp.4242')
+    foreach ($leaf in ($sweepOrphans + $sweepKeep)) { Write-Utf8 (Join-Path $sweepRoot $leaf) 'x' }
+    $sweepStamp = [IO.File]::GetLastWriteTimeUtc($sweepPath)
+    foreach ($leaf in ($sweepOrphans + $sweepKeep)) {
+        [IO.File]::SetLastWriteTimeUtc((Join-Path $sweepRoot $leaf), $sweepStamp.AddHours(-2))
+    }
+    # Correctly shaped and older than the store, but well inside the hour, which is
+    # what a live temporary belonging to another store in this directory looks like.
+    $sweepRecent = Join-Path $sweepRoot '.burn.tmp.4244.99887766554433221100ffeeddccbbaa'
+    Write-Utf8 $sweepRecent 'x'
+    [IO.File]::SetLastWriteTimeUtc($sweepRecent, $sweepStamp.AddMinutes(-5))
+    $sweepLive = Join-Path $sweepRoot '.burn.tmp.4243.00112233445566778899aabbccddeeff'
+    Write-Utf8 $sweepLive 'x'
+    [IO.File]::SetLastWriteTimeUtc($sweepLive, $sweepStamp.AddSeconds(30))
+    $sweepRun = Invoke-Statusline (Json $statePayload) $sweepConfig $stateEnvWrite '' 10000
+    Check-Run 'WIN-02 orphaned temp sweep' $sweepRun
+    foreach ($leaf in $sweepOrphans) {
+        Check ('WIN-02 sweep removes ' + $leaf) (-not [IO.File]::Exists((Join-Path $sweepRoot $leaf)))
+    }
+    foreach ($leaf in $sweepKeep) {
+        Check ('WIN-02 sweep keeps ' + $leaf) ([IO.File]::Exists((Join-Path $sweepRoot $leaf)))
+    }
+    Check 'WIN-02 sweep keeps another store live temp inside the hour' ([IO.File]::Exists($sweepRecent))
+    Check 'WIN-02 sweep keeps a temp newer than the store' ([IO.File]::Exists($sweepLive))
+    Check 'WIN-02 sweep leaves the store readable' ((@([IO.File]::ReadAllLines($sweepPath, $StrictUtf8))).Count -ge 1)
 
     # A NUL byte inside a record must be skipped, not abort the render and not
     # rewrite history. The reader accepts only tab, dot and digits per record.
@@ -2111,9 +2096,10 @@ fi
         # payload's 15 the way a pure high-water would.
         Check ('WIN-02 own reading wins its own window ' + $limitSpec.Name) ([string]$psPct -eq '15000' -and [string]$psReset -eq [string]($fixedNow + 200L) -and $bashState.Contains($prefix + 'Pct=15000'))
 
-        # Without a reading of its own a session draws no gauge: the store retires
-        # nothing, so its winner may be a value no session still reports. Selection
-        # itself is still asserted, through the state dump rather than the bar.
+        # Without a reading of its own the session falls back to the store, which is
+        # the only source that knows the account's open window. An entry is admitted
+        # only while its reset is still ahead, so the borrowed value cannot be a
+        # fossil. Selection is asserted through the state dump and again on the bar.
         $blindPayload = Clone-Object $highPayload
         $blindPayload.rate_limits.($limitSpec.Field).used_percentage = $null
         $blindPayload.rate_limits.($limitSpec.Field).resets_at = $null
@@ -2129,7 +2115,7 @@ fi
         $blindState = [IO.File]::ReadAllText($blindDump, $StrictUtf8) | ConvertFrom-Json
         $blindBash = [IO.File]::ReadAllText($blindBashDump, $StrictUtf8).Trim()
         Check ('WIN-02 store still selects the canonical winner ' + $limitSpec.Name) ([string]$blindState.($prefix + 'Pct') -eq '20000' -and $blindBash.Contains($prefix + 'Pct=20000'))
-        Check ('WIN-02 a blind session draws no gauge ' + $limitSpec.Name) (-not $psBlind.Stdout.Contains($limitSpec.Name + ' '))
+        Check ('WIN-02 a blind session shows the stored window ' + $limitSpec.Name) ($psBlind.Stdout.Contains($limitSpec.Name + ' ') -and $psBlind.Stdout.Contains('20%'))
 
         $highPayload.rate_limits.($limitSpec.Field).used_percentage = '25'
         $writeRun = Invoke-Statusline (Json $highPayload) $highConfig $stateEnvWrite '' 10000
@@ -2177,9 +2163,14 @@ fi
     # A canonical pct is not on its own evidence of an elapsed window. An
     # unparsable reset and a sentinel reset beyond the window ceiling both leave
     # no observed window, so neither runtime may invent a countdown for one.
+    # The elapsed fallback is for a window that JUST closed. Claude Code replays the
+    # last snapshot an idle session received indefinitely, so once the reading is
+    # older than the window ceiling it stops standing in for the current window.
+    # Both runtimes take the bound from the same constant, hence the shared vector.
     foreach ($resetSpec in @(
         [pscustomobject]@{ Name='unparsed reset'; Value='not-an-epoch' },
-        [pscustomobject]@{ Name='sentinel reset'; Value=[string]($fixedNow + 999999L) }
+        [pscustomobject]@{ Name='sentinel reset'; Value=[string]($fixedNow + 999999L) },
+        [pscustomobject]@{ Name='stale elapsed reset'; Value=[string]($fixedNow - 21601L) }
     )) {
         $resetPayload = Clone-Object $elapsedPayload
         $resetPayload.rate_limits.five_hour.resets_at = $resetSpec.Value

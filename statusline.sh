@@ -784,11 +784,48 @@ rl_choose() {  # $1=5|7; this session's window beats the store; a newer stored w
   else _STATE_RL7_VALID=$valid; _STATE_RL7_RST=$rst; _STATE_RL7_PCT=$pct; fi
 }
 
+# A killed render leaves its trim temporary behind: awk writes <base>.<pid>.tmp in
+# full and the mv that would have consumed it never runs. Nothing ever retired
+# those, so one busy host accumulated 1012 of them (38 MB) in three days. Sweep on
+# the mutating path only, and without a fork per file: the name must be exactly
+# <base>.<digits>.tmp, the object a regular non-symlink file, and older than the
+# store it was derived from — a temporary a live render is still writing is never
+# older than the base it is about to replace. Losing that race costs one trim (mv
+# finds no file, the base stays intact), never data. One batched rm, capped so a
+# pathological directory cannot build an unbounded argument list; what is left
+# over is swept by the next render.
+# The glob is eager: bash expands and sorts every match before the loop runs, so
+# the cap bounds deletions and stat calls but not the expansion. That is accepted
+# rather than fixed, because bash has no fork-free lazy directory walk and find is
+# barred from the state path by both the fork budget and a regression test. The
+# cost was measured on the real backlog that motivated this: a clean store is
+# indistinguishable from bare interpreter startup (24 ms either way), and 1020
+# orphans cost 137 ms on the worst render and drain in nine, after which they
+# cannot come back, since 128 per render outruns accumulation by three orders of
+# magnitude (about 48 per hour observed). Raising the cap to drain in one render
+# is worse, not better: 1024 per pass measured 4385 ms, well past the one-second
+# refresh, because the argument list grows with it.
+burn_tmp_sweep() {  # remove trim temporaries orphaned by killed renders
+  local f n c=0
+  set --
+  for f in "$_SB_BASE".*.tmp; do
+    [ -e "$f" ] || continue
+    n=${f#"$_SB_BASE".}; n=${n%.tmp}
+    case "$n" in (''|*[!0-9]*) continue ;; esac
+    [ -f "$f" ] && [ ! -L "$f" ] && [ "$f" -ot "$_SB_BASE" ] || continue
+    set -- "$@" "$f"; c=$(( c + 1 ))
+    [ "$c" -ge 128 ] && break
+  done
+  [ "$c" -gt 0 ] && rm -f "$@" 2>/dev/null
+  return 0
+}
+
 burn_eta_5h() {  # → _B5_* from canonical TSV; $1=allow trim/heal mutation
   local mutate="${1:-0}" src=/dev/null tmp="" write_tmp=0 out="" rc state span delta latest ttr
   _B5_STATE=warming; _B5_ETA=inf; _B5_RATE="0.0000000000"; _B5_TTR=0
   if [ "${_STATE_BURN_SAFE:-0}" = 1 ] && state_path_object "$_SB_BASE" f; then src=$_SB_BASE; fi
   if [ "$mutate" = 1 ] && [ "$src" != /dev/null ]; then
+    burn_tmp_sweep
     tmp="$_SB_BASE.$$.tmp"
     if state_paths_revalidate && state_no_symlink_path "$tmp" && [ "$_SNP" = "$tmp" ] \
        && [ ! -e "$tmp" ] && [ ! -L "$tmp" ]; then write_tmp=1; fi
@@ -929,13 +966,26 @@ burn_eta_7d() {  # → _B7_*; $1=pct_milli $2=reset epoch
 burn_estimate() {  # → _BURN_STATE _BURN_LABEL _BURN_ETA _BURN_RATE _BURN_TTR
   local f5=0 f7=0
   burn_eta_5h "${_STATE_MUTATE:-0}"
-  # The ownership rule covers the projection too, not just the gauge. burn can
-  # bind to the 7d window, so a stored percentage from another session would
-  # otherwise reach the bar as an ETA even while the 7d gauge itself is hidden —
-  # and a payload carrying 5h but no 7d is exactly the case that keeps seg_burn
-  # rendering. Requiring _CUR7_VALID leaves the roll-over catch-up intact, since
-  # rl_choose only lets the store win with a strictly newer reset.
-  if [ "$VL_LIMIT_SYNC" = 1 ] && [ "${_CUR7_VALID:-0}" = 1 ] && [ "${_STATE_RL7_VALID:-0}" = 1 ]; then
+  # The 5h projection needs the same rebinding the 7d one gets: whenever the synced
+  # state is what the gauge draws, the ETA has to be projected from that same window.
+  # Two ways they diverge. With no reading of our own the history can still sit on
+  # the window that just closed, since an expired reset stays plausible to the reader
+  # and its TTR clamps to zero. With a valid reading of our own that rl_choose lets a
+  # NEWER stored window beat, the history holds only our older window, and the
+  # session that published the newer one need not have burn enabled to contribute
+  # samples for it. Both put an active ETA for one window beside a gauge for another,
+  # so gate on the stored state alone, not on whether we have a reading. burn_eta_5h
+  # reports the window it used as NOW + _B5_TTR; falling back to warming when it does
+  # not match is honest, no samples for that window have been observed yet.
+  if [ "$VL_LIMIT_SYNC" = 1 ] && [ "${_STATE_RL5_VALID:-0}" = 1 ] \
+     && [ $(( NOW + _B5_TTR )) -ne "${_STATE_RL5_RST:-0}" ]; then
+    _B5_STATE=warming; _B5_ETA=inf; _B5_RATE="0.0000000000"; _B5_TTR=0
+  fi
+  # The ownership rule covers the projection too, not just the gauge, and it has
+  # to be the SAME rule: burn can bind to the 7d window, so any source seg_limit7d
+  # is willing to display must also be the source the ETA is projected from, or
+  # the bar and the gauge report different windows in one render.
+  if [ "$VL_LIMIT_SYNC" = 1 ] && [ "${_STATE_RL7_VALID:-0}" = 1 ]; then
     burn_eta_7d "$_STATE_RL7_PCT" "$_STATE_RL7_RST"
   elif [ "${_CUR7_VALID:-0}" = 1 ]; then burn_eta_7d "$_CUR7_PCT" "$_CUR7_RST"
   else burn_eta_7d "" ""; fi
@@ -953,7 +1003,11 @@ burn_estimate() {  # → _BURN_STATE _BURN_LABEL _BURN_ETA _BURN_RATE _BURN_TTR
 
 seg_burn() {  # range-to-empty ETA until the binding 5h/7d limit hits 100% at the recent burn rate
   if [ "${_STATE_READY:-0}" = 1 ]; then
-    [ "${_CUR5_VALID:-0}" = 1 ] || [ "${_CUR7_VALID:-0}" = 1 ] || return 0
+    # Same sources the gauges accept: once a synced store can render 5h/7d for a
+    # session that has reported nothing itself, hiding only the projection would
+    # leave a gap between two segments that are describing the same windows.
+    [ "${_CUR5_VALID:-0}" = 1 ] || [ "${_CUR7_VALID:-0}" = 1 ] \
+      || [ "${_STATE_RL5_VALID:-0}" = 1 ] || [ "${_STATE_RL7_VALID:-0}" = 1 ] || return 0
   else
     [ -n "$fh_pct" ] || [ -n "$wd_pct" ] || return 0
   fi
@@ -1253,28 +1307,42 @@ seg_limit() {  # $1=label $2=pct $3=resets_at $4=bg $5=canonical pct_milli(optio
 # window ceiling is the corrupt/sentinel snapshot rejected in #32 and must not
 # render a countdown days or years out. seg_limit shows an elapsed reset as
 # "now", which is what v0.11 displayed here.
-seg_limit_elapsed() {  # $1=canonical pct $2=parsed reset; sets _SLE_OK
+# The fallback is for a window that JUST elapsed, so it is bounded by the same
+# ceiling that validates a future reset. Claude Code keeps replaying the last
+# snapshot an idle session ever received: observed here were sessions still
+# reporting 41% for a window that closed 27 hours earlier and 55% for one that
+# closed three days earlier. Rendering those as the current window is worse than
+# rendering nothing, and past the bound the segment falls through to the store,
+# which by construction only holds windows that are still open.
+seg_limit_elapsed() {  # $1=canonical pct $2=parsed reset $3=max elapsed age; sets _SLE_OK
   _SLE_OK=0
   [ -n "$1" ] || return 0
-  [ "$2" -gt 0 ] && [ "$2" -le "$NOW" ] && _SLE_OK=1
+  [ "$2" -gt 0 ] && [ "$2" -le "$NOW" ] && [ $(( NOW - $2 )) -le "$3" ] && _SLE_OK=1
   return 0
 }
-# A reading from ANOTHER session is never displayed. The store ranks entries by
-# reset then percentage, and nothing ever retires an entry, so the maximum any
-# session recorded for a window stays the maximum until the window rolls: five
-# hours for 5h, a week for 7d. A session with no reading of its own would then
-# show a stranger's number indefinitely, and observed values for one 7d window on
-# one host ranged from 5% to 100%, so those numbers are not even comparable.
-# Requiring _CUR*_VALID keeps the store where it still holds better information —
-# it wins only with a strictly newer reset (rl_choose), which is the roll-over
-# catch-up — and drops only the "I have nothing, borrow a stranger's" path.
-# Both windows use the same rule: 5h merely hides the defect by rolling sooner.
+# Ownership is decided once, in rl_choose: this session's own reading always wins
+# its own window, and the store wins only with a strictly newer reset. Requiring
+# _CUR*_VALID again HERE did not add protection, it removed the store's documented
+# last job — "the sole source whenever this session has no valid reading at all".
+# The payload carries rate_limits only once the session has received an API
+# response, so a freshly started, resumed, or idle session has no reading of its
+# own and blanked both gauges even though the account-level window was known.
+# Borrowing then is safe in a way it was not before #61/#62: rl_latest admits an
+# entry only while its reset is still ahead of NOW, and garbage-collects every
+# entry it outranks, so there is no fossil to inherit. What is still borrowed is
+# the highest percentage recorded for the CURRENT window by any session, which is
+# an over-estimate when sessions disagree; that is the accepted cost of showing
+# the account's window instead of nothing. The store carries no account identity
+# and the payload offers nothing to derive one from, so switching Claude accounts
+# under one OS account can show the previous account's still-open window until the
+# new one's first response lands. That is the same interval in which the gauge used
+# to show nothing at all, and it ends as soon as this session has its own reading.
+# Both windows use the same rule.
 seg_limit5h() {  # 5h rate-limit gauge with reset countdown
   local p="$fh_pct" r="$fh_rst" m=""
   if [ "$VL_LIMIT_SYNC" = 1 ]; then
-    seg_limit_elapsed "${_CUR5_CANON:-}" "${_CUR5_RST:-0}"
-    if [ "${_CUR5_VALID:-0}" = 1 ] && [ "${_STATE_RL5_VALID:-0}" = 1 ]; then
-      m=$_STATE_RL5_PCT; r=$_STATE_RL5_RST
+    seg_limit_elapsed "${_CUR5_CANON:-}" "${_CUR5_RST:-0}" "$RL_MAX_5H"
+    if [ "${_STATE_RL5_VALID:-0}" = 1 ]; then m=$_STATE_RL5_PCT; r=$_STATE_RL5_RST
     elif [ "$_SLE_OK" = 1 ]; then m=$_CUR5_PCT; r=$_CUR5_RST
     else return 0; fi
     printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 ))
@@ -1284,9 +1352,8 @@ seg_limit5h() {  # 5h rate-limit gauge with reset countdown
 seg_limit7d() {  # 7d rate-limit gauge with reset countdown
   local p="$wd_pct" r="$wd_rst" m=""
   if [ "$VL_LIMIT_SYNC" = 1 ]; then
-    seg_limit_elapsed "${_CUR7_CANON:-}" "${_CUR7_RST:-0}"
-    if [ "${_CUR7_VALID:-0}" = 1 ] && [ "${_STATE_RL7_VALID:-0}" = 1 ]; then
-      m=$_STATE_RL7_PCT; r=$_STATE_RL7_RST
+    seg_limit_elapsed "${_CUR7_CANON:-}" "${_CUR7_RST:-0}" "$RL_MAX_7D"
+    if [ "${_STATE_RL7_VALID:-0}" = 1 ]; then m=$_STATE_RL7_PCT; r=$_STATE_RL7_RST
     elif [ "$_SLE_OK" = 1 ]; then m=$_CUR7_PCT; r=$_CUR7_RST
     else return 0; fi
     printf -v p '%d.%03d' $(( m / 1000 )) $(( m % 1000 ))
@@ -1689,7 +1756,12 @@ case "$_SEG_SCAN" in *" git "*|*" stash "*|*" project "*) read_git ;; esac
 _STATE_READY=0; _STATE_BURN_GATE=0; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0
 case "$_SEG_SCAN" in (*" burn "*) _STATE_BURN_GATE=1 ;; esac
 if [ "$VL_LIMIT_SYNC" = 1 ]; then
-  case "$_SEG_SCAN" in (*" limit5h "*) _STATE_RL5_GATE=1 ;; esac
+  # burn takes both gates, not just 7d. It can bind to either window, its projection
+  # is rebound to the synced 5h state in burn_estimate, and its own source gate
+  # accepts that state, so a layout with burn but no limit5h would otherwise leave
+  # _STATE_RL5_VALID permanently 0 and hide the segment for a session that has no
+  # payload reading but does have a usable stored window.
+  case "$_SEG_SCAN" in (*" limit5h "*|*" burn "*) _STATE_RL5_GATE=1 ;; esac
   case "$_SEG_SCAN" in (*" limit7d "*|*" burn "*) _STATE_RL7_GATE=1 ;; esac
 fi
 if [ "$_STATE_BURN_GATE" = 1 ] || [ "$_STATE_RL5_GATE" = 1 ] || [ "$_STATE_RL7_GATE" = 1 ]; then

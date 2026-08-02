@@ -224,10 +224,10 @@ Ask concise questions. If the user says "you decide", choose the defaults.
    worktrees, suggest enabling `project`. If the user runs many concurrent Claude sessions
    and is bothered by `limit5h` / `limit7d` showing different percentages per session,
    mention `VL_LIMIT_SYNC=1`: a session holding a valid but older window follows a stored
-   reading for a newer one (in a `limit-5h.d` / `limit-7d.d` store). Off by default. A
-   reading from another session is never shown as your own, and a session with no reading
-   at all draws no gauge rather than borrowing one, so sync narrows the gap at window
-   boundaries rather than making every session report an identical number.
+   reading for a newer one (in a `limit-5h.d` / `limit-7d.d` store). Off by default. Your
+   own reading always wins your own window; the store is the source a session falls back
+   to when it has no reading of its own, which is every session before its first API
+   response of the run, so the gauge shows the account's open window instead of nothing.
 6. **Subagent panel rows** (optional, needs Claude Code v2.1.205+ for the per-task
    model/context fields): offer to theme only the subagent rows below the prompt — the
    native main-session row remains visible. On Bash-capable installs, if the user says yes, run

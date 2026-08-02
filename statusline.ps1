@@ -1777,6 +1777,45 @@ function ConvertFrom-BurnRecord([string]$Record, [long]$NowValue) {
     return [pscustomobject]@{ Reset=$reset; Sample=$sample; Pct=[int]$pct.Milli; Plausible=$plausible }
 }
 
+# A killed render dies before its finally block, leaving the trim temporary (or the
+# replace backup) behind, and nothing retired those. Sweep on the mutating path
+# only, taking only what is unambiguously ours and unambiguously dead: the complete
+# name Write-BurnState generates, a regular file, and last written before the store
+# it was derived from, since a temporary a live render is still writing is newer
+# than the base it is about to replace. Matching the whole shape rather than the
+# prefix keeps an unrelated file in a shared directory out of it.
+# The name deliberately carries no store identity. Two burn stores configured into
+# one directory share this namespace, so "older than my store" alone would let one
+# delete the other's live temporary and leave its File.Replace to fail. The age
+# floor is what separates them: a render lives well under a second, so nothing a
+# live render owns is an hour old, whatever store it belongs to. Encoding the store
+# name instead would bound nothing, since a long but legal BURN_FILE basename pushes
+# the component past the 255-character NTFS limit and every CreateNew then fails,
+# silently stopping the store from ever trimming again.
+# Enumeration is lazy and bounded on both counts, so neither the scan nor the
+# deletions can stall a render; whatever is left goes on the next one. A directory
+# holding thousands of NON-generated .burn.* names could keep the tail out of
+# reach, which no store this sweep is meant for looks like.
+function Remove-BurnTemporaries([string]$Parent, [string]$Path) {
+    try {
+        if (-not (Test-StateRegularFile $Path)) { return }
+        $baseWrite = [IO.File]::GetLastWriteTimeUtc($Path)
+        $ageFloor = [DateTime]::UtcNow.AddHours(-1)
+        $swept = 0
+        $seen = 0
+        foreach ($name in [IO.Directory]::EnumerateFiles($Parent, '.burn.*')) {
+            $seen++
+            if ($swept -ge 128 -or $seen -gt 4096) { break }
+            $leaf = [IO.Path]::GetFileName($name)
+            if ($leaf -notmatch '^\.burn\.(tmp|bak)\.[0-9]{1,10}\.[0-9a-fA-F]{32}$') { continue }
+            if (-not (Test-StateRegularFile $name)) { continue }
+            $written = [IO.File]::GetLastWriteTimeUtc($name)
+            if ($written -ge $baseWrite -or $written -ge $ageFloor) { continue }
+            try { [IO.File]::Delete($name); $swept++ } catch { }
+        }
+    } catch { }
+}
+
 function Write-BurnState([string]$Path, [object[]]$Rows, [bool]$Mutate) {
     if (-not $Mutate -or [string]::IsNullOrEmpty($Path) -or -not (Test-NoReparseComponents $Path)) { return $false }
     $parent = $null
@@ -1855,6 +1894,14 @@ function Read-BurnState([string]$Path, [long]$NowValue, [int]$Trim, [bool]$Mutat
         return [pscustomobject]@{ Complete=$false; Exists=$false; Raw=0; Rows=@() }
     }
     if (-not (Test-StateRegularFile $Path)) { return [pscustomobject]@{ Complete=$false; Exists=$true; Raw=0; Rows=@() } }
+    # Sweep here, not in Write-BurnState: a rewrite happens only once the store is
+    # over BURN_TRIM or needs healing, and orphans have to be retired on every
+    # mutating render, which is where the Bash runtime sweeps them.
+    if ($Mutate) {
+        $sweepParent = $null
+        try { $sweepParent = [IO.Path]::GetDirectoryName($Path) } catch { $sweepParent = $null }
+        if (-not [string]::IsNullOrEmpty($sweepParent)) { Remove-BurnTemporaries $sweepParent $Path }
+    }
     $rows = New-Object 'System.Collections.Generic.List[object]'
     $byKey = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
     $physical = 0
@@ -2032,6 +2079,11 @@ function Remove-StateCandidates([string]$Root, [object[]]$Candidates, [long]$Max
 # both passed validation and whose reset has since passed. A missing or malformed
 # reset produces neither, so no renderer can claim an elapsed window that was never
 # observed, and a reset beyond the window ceiling stays rejected as in #32.
+# Elapsed is for a window that JUST closed, so the same ceiling bounds it in the
+# past: Claude Code keeps replaying the last snapshot an idle session received, and
+# sessions were observed still reporting a window that had closed 27 and 75 hours
+# earlier. Past the bound the renderer falls through to the store, which only ever
+# holds windows that are still open.
 function Get-CurrentLimit([string]$RawPct, [string]$RawReset, [long]$NowValue, [long]$MaxAhead) {
     $pct = ConvertTo-StatePct $RawPct
     $reset = ConvertTo-StatePayloadEpoch $RawReset 10
@@ -2042,7 +2094,7 @@ function Get-CurrentLimit([string]$RawPct, [string]$RawReset, [long]$NowValue, [
     if ($value -gt $NowValue -and $value -le ($NowValue + $MaxAhead)) {
         return [pscustomobject]@{ Valid=$true; Pct=$milli; Reset=$value; Elapsed=$false; ElapsedPct=0; ElapsedReset=0L }
     }
-    if ($value -gt 0L -and $value -le $NowValue) {
+    if ($value -gt 0L -and $value -le $NowValue -and ($NowValue - $value) -le $MaxAhead) {
         return [pscustomobject]@{ Valid=$false; Pct=0; Reset=0L; Elapsed=$true; ElapsedPct=$milli; ElapsedReset=$value }
     }
     return $none
@@ -2264,13 +2316,32 @@ function Get-CorallineState([bool]$BurnGate, [bool]$Limit5Gate, [bool]$Limit7Gat
     if ($Limit7Gate -and $limit7Snapshot.Complete) { [void](Publish-LimitState $limit7Paths.Root $current7 $limit7Snapshot $limit7Gc 691200L $mutate) }
 
     $five = Get-Burn5Estimate $burnSnapshot $currentBurn $Now $window
-    # The ownership rule covers the projection as well: burn can bind to the 7d
-    # window, so a stored percentage from another session would otherwise reach
-    # the bar as an ETA even while the 7d gauge is hidden.
-    if ($Cfg.VL_LIMIT_SYNC -eq '1' -and $current7.Valid) { $seven = Get-Burn7Estimate $limit7 $Now }
+    # The 5h projection needs the same rebinding the 7d one gets: whenever the synced
+    # state is what the gauge draws, the ETA has to come from that same window. Two
+    # ways they diverge. With no reading of our own the history can still be on the
+    # window that just closed, since an expired reset stays plausible to the reader
+    # and its Ttr clamps to zero. With a valid reading of our own that a NEWER stored
+    # window beats, the history holds only our older window, and the session that
+    # published the newer one need not have burn enabled to contribute samples for
+    # it. Both put an active ETA for one window beside a gauge for another, so gate
+    # on the stored state alone, not on whether we have a reading. The estimate
+    # reports its window as Now + Ttr; warming when it does not match is honest, no
+    # samples for that window have been observed yet.
+    if ($Cfg.VL_LIMIT_SYNC -eq '1' -and $limit5.Valid -and
+        ($Now + [long]$five.Ttr) -ne [long]$limit5.Reset) {
+        $five = [pscustomobject]@{ State='warming'; Eta='inf'; Rate='0.0000000000'; Ttr=0L }
+    }
+    # The ownership rule covers the projection as well, and it has to be the SAME
+    # rule: burn can bind to the 7d window, so any source Add-Limit7Segment is
+    # willing to display must also be the source the ETA is projected from, or the
+    # bar and the gauge report different windows in one render.
+    if ($Cfg.VL_LIMIT_SYNC -eq '1' -and $limit7.Valid) { $seven = Get-Burn7Estimate $limit7 $Now }
     else { $seven = Get-Burn7Estimate $current7 $Now }
     $burn = Get-BurnBinding $five $seven
-    $burn | Add-Member -NotePropertyName Reported -NotePropertyValue ($current5.Valid -or $current7.Valid)
+    # Same sources the gauges accept: once a synced store can render 5h/7d for a
+    # session that has reported nothing itself, hiding only the projection would
+    # leave a gap between two segments that are describing the same windows.
+    $burn | Add-Member -NotePropertyName Reported -NotePropertyValue ($current5.Valid -or $current7.Valid -or $limit5.Valid -or $limit7.Valid)
     return [pscustomobject]@{
         Burn=$burn; Five=$five; Seven=$seven; Limit5=$limit5; Limit7=$limit7
         Current5=$current5; Current7=$current7; BurnSnapshotComplete=$burnSnapshot.Complete
@@ -2677,7 +2748,11 @@ foreach ($base in @($Cfg.BURN_FILE, $Cfg.RL5H_FILE, $Cfg.RL7D_FILE)) {
 }
 
 $BurnStateGate = $ProbeSegmentNames.Contains('burn')
-$Limit5StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and $ProbeSegmentNames.Contains('limit5h')
+# burn takes both gates, not just 7d. It can bind to either window, its projection is
+# rebound to the synced 5h state, and its own source gate accepts that state, so a
+# layout with burn but no limit5h would otherwise leave Limit5 permanently invalid
+# and hide the segment for a session with no payload reading but a usable window.
+$Limit5StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and ($ProbeSegmentNames.Contains('limit5h') -or $BurnStateGate)
 $Limit7StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and ($ProbeSegmentNames.Contains('limit7d') -or $BurnStateGate)
 $State = $null
 if ($BurnStateGate -or $Limit5StateGate -or $Limit7StateGate) {
@@ -2824,14 +2899,22 @@ function Add-LimitSegment([string]$Label, [string]$RawPct, [string]$ResetsAt, [s
 # the pct and the reset to have passed validation and the reset to have actually
 # passed, so neither an unvalidated pct nor an unobserved window reaches the bar.
 # Format-Countdown reports an elapsed reset as "now".
-# A reading from another session is never displayed: the store retires nothing, so
-# its maximum for a window outlives whoever reported it. Requiring Current*.Valid
-# keeps the roll-over catch-up, where the store holds a strictly newer window, and
-# drops only the borrow-a-stranger's-number path. Same rule for both windows.
+# Ownership is decided once, in Select-LimitResult: this session's own reading wins
+# its own window and the store wins only with a strictly newer reset. Requiring
+# Current*.Valid again here added no protection and removed the store's last job,
+# being the sole source when this session has no reading at all. The payload carries
+# rate_limits only after the session has received an API response, so a freshly
+# started, resumed, or idle session blanked both gauges even though the account-level
+# window was known. Borrowing is safe now in a way it was not before: an entry is
+# admitted only while its reset is still ahead of Now and every entry it outranks is
+# garbage-collected, so no fossil is inherited. What is borrowed is the highest
+# percentage any session recorded for the CURRENT window, an over-estimate when
+# sessions disagree, which is the accepted cost of showing the account's window
+# instead of nothing. Same rule for both windows.
 function Add-Limit5Segment {
     if ($Cfg.VL_LIMIT_SYNC -eq '1') {
         if ($null -eq $State) { return }
-        if ($State.Current5.Valid -and $State.Limit5.Valid) {
+        if ($State.Limit5.Valid) {
             Add-LimitSegment '5h' (Format-StatePct $State.Limit5.Pct) ([string]$State.Limit5.Reset) $Cfg.VL_BG_5H $State.Limit5.Pct
         } elseif ($State.Current5.Elapsed) {
             Add-LimitSegment '5h' (Format-StatePct $State.Current5.ElapsedPct) ([string]$State.Current5.ElapsedReset) $Cfg.VL_BG_5H $State.Current5.ElapsedPct
@@ -2844,7 +2927,7 @@ function Add-Limit5Segment {
 function Add-Limit7Segment {
     if ($Cfg.VL_LIMIT_SYNC -eq '1') {
         if ($null -eq $State) { return }
-        if ($State.Current7.Valid -and $State.Limit7.Valid) {
+        if ($State.Limit7.Valid) {
             Add-LimitSegment '7d' (Format-StatePct $State.Limit7.Pct) ([string]$State.Limit7.Reset) $Cfg.VL_BG_7D $State.Limit7.Pct
         } elseif ($State.Current7.Elapsed) {
             Add-LimitSegment '7d' (Format-StatePct $State.Current7.ElapsedPct) ([string]$State.Current7.ElapsedReset) $Cfg.VL_BG_7D $State.Current7.ElapsedPct
