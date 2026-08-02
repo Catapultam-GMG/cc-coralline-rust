@@ -1930,8 +1930,11 @@ fi
     Check-Run 'WIN-02 overlong record does not abort the render' $longRun
     Check 'WIN-02 overlong record leaves the read-only TSV byte exact' ((([IO.File]::ReadAllBytes($longPath)).Length) -eq $longBefore)
 
-    # Beyond the byte ceiling the reader must refuse the file rather than rewrite
-    # a truncated version of it.
+    # Beyond the byte ceiling the reader refuses to compact the file, so it is
+    # never rewritten or truncated. Sampling still appends, exactly as the Bash
+    # runtime does: measured on Windows, three mutable renders grow an oversized
+    # TSV by 87 bytes in both runtimes. The guard here is that the existing bytes
+    # survive untouched, not that the file stops growing.
     $hugeRoot = Join-Path $stateRoot 'hugetsv'
     $hugeConfig = New-StateConfig 'win02-hugetsv' $hugeRoot 'burn' $false
     $hugePath = Join-Path $hugeRoot 'burn.tsv'
@@ -1939,10 +1942,18 @@ fi
     $hugeBuilder = New-Object Text.StringBuilder
     while ($hugeBuilder.Length -le 1048576) { [void]$hugeBuilder.Append($hugeRow) }
     Write-Utf8 $hugePath $hugeBuilder.ToString()
-    $hugeBefore = ([IO.File]::ReadAllBytes($hugePath)).Length
+    $hugeOriginal = [IO.File]::ReadAllBytes($hugePath)
     $hugeRun = Invoke-Statusline (Json $statePayload) $hugeConfig $stateEnvWrite '' 30000
     Check-Run 'WIN-02 oversized TSV does not abort the render' $hugeRun
-    Check 'WIN-02 oversized TSV is refused rather than truncated' ((([IO.File]::ReadAllBytes($hugePath)).Length) -eq $hugeBefore)
+    $hugeAfter = [IO.File]::ReadAllBytes($hugePath)
+    $hugePrefixIntact = $hugeAfter.Length -ge $hugeOriginal.Length
+    if ($hugePrefixIntact) {
+        for ($i = 0; $i -lt $hugeOriginal.Length; $i++) {
+            if ($hugeAfter[$i] -ne $hugeOriginal[$i]) { $hugePrefixIntact = $false; break }
+        }
+    }
+    Check 'WIN-02 oversized TSV is never rewritten or truncated' $hugePrefixIntact
+    Check 'WIN-02 oversized TSV still accepts the appended sample' ($hugeAfter.Length -gt $hugeOriginal.Length)
 
     $overRoot = Join-Path $stateRoot 'overcap'
     $overConfig = New-StateConfig 'win02-overcap' $overRoot 'burn' $false
