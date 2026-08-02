@@ -2168,16 +2168,30 @@ function Get-CorallineState([bool]$BurnGate, [bool]$Limit5Gate, [bool]$Limit7Gat
     if ($Limit5Gate) { $limit5Paths = Get-StatePaths $Cfg.RL5H_FILE }
     if ($Limit7Gate) { $limit7Paths = Get-StatePaths $Cfg.RL7D_FILE }
     # Bash compares all six canonical paths pairwise in state_paths_validate, not
-    # just the three roots. Roots alone miss a base that aliases another store's
-    # root: BURN_FILE=...\limit5.d together with RL5H_FILE=...\limit5.tsv gives
-    # burn.Base equal to limit5.Root. That was harmless while the burn store was a
-    # directory and its base was never written, but the burn base is now an
-    # appended file, so the append would create limit5.d as a regular file and
-    # block the limit store permanently. Measured on Windows before this guard:
+    # just the three roots, and it does so for every configured store regardless
+    # of which segments are enabled. Both parts matter here.
+    #
+    # Roots alone miss a base that aliases another store's root: BURN_FILE=
+    # ...\limit5.d together with RL5H_FILE=...\limit5.tsv gives burn.Base equal to
+    # limit5.Root, because a root is a base with .tsv replaced by .d. That was
+    # harmless while the burn store was a directory and its base was never
+    # written; the burn base is now an appended file, so the append would create
+    # limit5.d as a regular file and block the limit store permanently.
+    #
+    # Gate-filtered paths miss the same alias whenever the other store is dormant,
+    # which is the default: with VL_LIMIT_SYNC=0 the limit paths are never derived,
+    # so their roots never enter the namespace and the append lands anyway. The
+    # damage outlives the setting -- enabling synchronisation later finds a
+    # regular file where the store belongs. So the namespace is built from the
+    # configuration, not from this render's gates.
+    #
+    # Measured on Windows for both shapes, sync enabled and sync disabled:
     # statusline.sh created nothing at all, statusline.ps1 created the file.
     $collision = $false
     $namespace = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($candidate in @($burnPaths, $limit5Paths, $limit7Paths)) {
+    foreach ($configured in @($Cfg.BURN_FILE, $Cfg.RL5H_FILE, $Cfg.RL7D_FILE)) {
+        if ([string]::IsNullOrEmpty([string]$configured)) { continue }
+        $candidate = Get-StatePaths $configured
         if ($null -ne $candidate) {
             [void]$namespace.Add([string]$candidate.Base)
             [void]$namespace.Add([string]$candidate.Root)
