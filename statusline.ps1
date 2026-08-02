@@ -1783,10 +1783,15 @@ function ConvertFrom-BurnRecord([string]$Record, [long]$NowValue) {
 # name Write-BurnState generates, a regular file, and last written before the store
 # it was derived from, since a temporary a live render is still writing is newer
 # than the base it is about to replace. Matching the whole shape rather than the
-# prefix keeps an unrelated file in a shared directory out of it, and the shape is
-# built from the store's own file name, so two burn stores configured into one
-# directory cannot delete each other's live temporaries. That is what the bash
-# runtime gets for free from naming its temporary after the store it replaces.
+# prefix keeps an unrelated file in a shared directory out of it.
+# The name deliberately carries no store identity. Two burn stores configured into
+# one directory share this namespace, so "older than my store" alone would let one
+# delete the other's live temporary and leave its File.Replace to fail. The age
+# floor is what separates them: a render lives well under a second, so nothing a
+# live render owns is an hour old, whatever store it belongs to. Encoding the store
+# name instead would bound nothing, since a long but legal BURN_FILE basename pushes
+# the component past the 255-character NTFS limit and every CreateNew then fails,
+# silently stopping the store from ever trimming again.
 # Enumeration is lazy and bounded on both counts, so neither the scan nor the
 # deletions can stall a render; whatever is left goes on the next one. A directory
 # holding thousands of NON-generated .burn.* names could keep the tail out of
@@ -1794,19 +1799,18 @@ function ConvertFrom-BurnRecord([string]$Record, [long]$NowValue) {
 function Remove-BurnTemporaries([string]$Parent, [string]$Path) {
     try {
         if (-not (Test-StateRegularFile $Path)) { return }
-        $store = [IO.Path]::GetFileName($Path)
-        if ([string]::IsNullOrEmpty($store)) { return }
-        $shape = '^\.' + [regex]::Escape($store) + '\.(tmp|bak)\.[0-9]{1,10}\.[0-9a-fA-F]{32}$'
         $baseWrite = [IO.File]::GetLastWriteTimeUtc($Path)
+        $ageFloor = [DateTime]::UtcNow.AddHours(-1)
         $swept = 0
         $seen = 0
-        foreach ($name in [IO.Directory]::EnumerateFiles($Parent, ('.' + $store + '.*'))) {
+        foreach ($name in [IO.Directory]::EnumerateFiles($Parent, '.burn.*')) {
             $seen++
             if ($swept -ge 128 -or $seen -gt 4096) { break }
             $leaf = [IO.Path]::GetFileName($name)
-            if ($leaf -notmatch $shape) { continue }
+            if ($leaf -notmatch '^\.burn\.(tmp|bak)\.[0-9]{1,10}\.[0-9a-fA-F]{32}$') { continue }
             if (-not (Test-StateRegularFile $name)) { continue }
-            if ([IO.File]::GetLastWriteTimeUtc($name) -ge $baseWrite) { continue }
+            $written = [IO.File]::GetLastWriteTimeUtc($name)
+            if ($written -ge $baseWrite -or $written -ge $ageFloor) { continue }
             try { [IO.File]::Delete($name); $swept++ } catch { }
         }
     } catch { }
@@ -1822,11 +1826,6 @@ function Write-BurnState([string]$Path, [object[]]$Rows, [bool]$Mutate) {
     } catch { return $false }
     if (-not (Test-NoReparseComponents $parent) -or -not [IO.Directory]::Exists($parent)) { return $false }
     if ((Test-StateObjectExists $Path) -and -not (Test-StateRegularFile $Path)) { return $false }
-    # Name the temporary and the backup after the store they replace, so two burn
-    # stores sharing one directory own disjoint namespaces and the sweep can tell
-    # them apart. This mirrors the bash temporary, which is "$_SB_BASE.$$.tmp".
-    $storeLeaf = [IO.Path]::GetFileName($Path)
-    if ([string]::IsNullOrEmpty($storeLeaf)) { return $false }
 
     $builder = New-Object Text.StringBuilder
     foreach ($row in @($Rows)) {
@@ -1841,7 +1840,7 @@ function Write-BurnState([string]$Path, [object[]]$Rows, [bool]$Mutate) {
     $backup = ''
     try {
         for ($attempt = 0; $attempt -lt 8; $attempt++) {
-            $candidate = [IO.Path]::Combine($parent, '.' + $storeLeaf + '.tmp.' + [string]$PID + '.' + [guid]::NewGuid().ToString('N'))
+            $candidate = [IO.Path]::Combine($parent, '.burn.tmp.' + [string]$PID + '.' + [guid]::NewGuid().ToString('N'))
             if ($candidate.Length -gt 4096) { return $false }
             $stream = $null
             try {
@@ -1864,7 +1863,7 @@ function Write-BurnState([string]$Path, [object[]]$Rows, [bool]$Mutate) {
         if (Test-StateObjectExists $Path) {
             if (-not (Test-StateRegularFile $Path)) { return $false }
             for ($attempt = 0; $attempt -lt 8; $attempt++) {
-                $backup = [IO.Path]::Combine($parent, '.' + $storeLeaf + '.bak.' + [string]$PID + '.' + [guid]::NewGuid().ToString('N'))
+                $backup = [IO.Path]::Combine($parent, '.burn.bak.' + [string]$PID + '.' + [guid]::NewGuid().ToString('N'))
                 if ($backup.Length -gt 4096) { $backup = ''; return $false }
                 if (-not (Test-StateObjectExists $backup)) { break }
                 $backup = ''

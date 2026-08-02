@@ -1845,33 +1845,35 @@ fi
     # The rewrite goes through a temp and a backup; neither may survive it.
     $mutableParent = [IO.Path]::GetDirectoryName($mutablePath)
     $mutableResidue = @(Get-ChildItem -LiteralPath $mutableParent -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like ('.' + [IO.Path]::GetFileName($mutablePath) + '.tmp.*') -or
-                       $_.Name -like ('.' + [IO.Path]::GetFileName($mutablePath) + '.bak.*') })
+        Where-Object { $_.Name -like '.burn.tmp.*' -or $_.Name -like '.burn.bak.*' })
     Check 'WIN-02 mutable burn leaves no temp or backup residue' ($mutableResidue.Count -eq 0)
 
     # A render that is killed never reaches its finally block, so its temp survives
     # and nothing used to retire it. The next mutating render sweeps what is
-    # unambiguously ours and unambiguously dead: one of the two prefixes, a regular
-    # file, and written before the store. Anything newer belongs to a live render.
+    # unambiguously ours and unambiguously dead: the complete generated shape, a
+    # regular file, older than the store, and older than an hour. The age floor is
+    # what a second burn store sharing this directory relies on, since the name
+    # carries no store identity and a render lives well under a second.
     $sweepRoot = Join-Path $stateRoot 'tmpsweep'
     $sweepConfig = New-StateConfig 'win02-tmpsweep' $sweepRoot 'burn' $false
     $sweepPath = Join-Path $sweepRoot 'burn.tsv'
     Write-Utf8 $sweepPath (($fixedNow - 100L).ToString($Invariant) + "`t010.000`t1015900`n")
-    # The generated shape is .<store>.<tmp|bak>.<pid>.<32 hex>, so a prefix match
-    # alone would take an unrelated file sharing the directory, and a shape that did
-    # not carry the store name would take a SECOND burn store's live temporary and
-    # break its next replace. Both are keep cases here.
-    $sweepOrphans = @('.burn.tsv.tmp.4242.0123456789abcdef0123456789abcdef',
-                      '.burn.tsv.bak.4242.fedcba9876543210fedcba9876543210')
-    $sweepKeep = @('.burn.tsv.tmp.user-backup', '.burn.tsv.tmp.4242.short',
-                   '.other.tsv.tmp.4242.aabbccddeeff00112233445566778899',
-                   '.burn.other.4242', 'burn.tsv.tmp.4242')
+    $sweepOrphans = @('.burn.tmp.4242.0123456789abcdef0123456789abcdef',
+                      '.burn.bak.4242.fedcba9876543210fedcba9876543210')
+    # Shape keep cases: a user file under the prefix, and a truncated suffix.
+    $sweepKeep = @('.burn.tmp.user-backup', '.burn.tmp.4242.short',
+                   '.burn.other.4242', 'burn.tmp.4242')
     foreach ($leaf in ($sweepOrphans + $sweepKeep)) { Write-Utf8 (Join-Path $sweepRoot $leaf) 'x' }
     $sweepStamp = [IO.File]::GetLastWriteTimeUtc($sweepPath)
     foreach ($leaf in ($sweepOrphans + $sweepKeep)) {
-        [IO.File]::SetLastWriteTimeUtc((Join-Path $sweepRoot $leaf), $sweepStamp.AddSeconds(-30))
+        [IO.File]::SetLastWriteTimeUtc((Join-Path $sweepRoot $leaf), $sweepStamp.AddHours(-2))
     }
-    $sweepLive = Join-Path $sweepRoot '.burn.tsv.tmp.4243.00112233445566778899aabbccddeeff'
+    # Correctly shaped and older than the store, but well inside the hour, which is
+    # what a live temporary belonging to another store in this directory looks like.
+    $sweepRecent = Join-Path $sweepRoot '.burn.tmp.4244.99887766554433221100ffeeddccbbaa'
+    Write-Utf8 $sweepRecent 'x'
+    [IO.File]::SetLastWriteTimeUtc($sweepRecent, $sweepStamp.AddMinutes(-5))
+    $sweepLive = Join-Path $sweepRoot '.burn.tmp.4243.00112233445566778899aabbccddeeff'
     Write-Utf8 $sweepLive 'x'
     [IO.File]::SetLastWriteTimeUtc($sweepLive, $sweepStamp.AddSeconds(30))
     $sweepRun = Invoke-Statusline (Json $statePayload) $sweepConfig $stateEnvWrite '' 10000
@@ -1882,6 +1884,7 @@ fi
     foreach ($leaf in $sweepKeep) {
         Check ('WIN-02 sweep keeps ' + $leaf) ([IO.File]::Exists((Join-Path $sweepRoot $leaf)))
     }
+    Check 'WIN-02 sweep keeps another store live temp inside the hour' ([IO.File]::Exists($sweepRecent))
     Check 'WIN-02 sweep keeps a temp newer than the store' ([IO.File]::Exists($sweepLive))
     Check 'WIN-02 sweep leaves the store readable' ((@([IO.File]::ReadAllLines($sweepPath, $StrictUtf8))).Count -ge 1)
 
