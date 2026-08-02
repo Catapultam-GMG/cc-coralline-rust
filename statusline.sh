@@ -966,6 +966,17 @@ burn_eta_7d() {  # → _B7_*; $1=pct_milli $2=reset epoch
 burn_estimate() {  # → _BURN_STATE _BURN_LABEL _BURN_ETA _BURN_RATE _BURN_TTR
   local f5=0 f7=0
   burn_eta_5h "${_STATE_MUTATE:-0}"
+  # The 5h projection needs the same rebinding the 7d one gets. When only the store
+  # supplies the window, the burn history can still be sitting on the window that
+  # just closed: an expired reset stays plausible to the reader and its TTR clamps
+  # to zero, so an active ETA for the OLD window would render beside a gauge showing
+  # the NEW one. burn_eta_5h reports the window it used as NOW + _B5_TTR, so require
+  # that to be the stored window and fall back to warming when it is not, which is
+  # honest: no samples for the new window have been observed yet.
+  if [ "$VL_LIMIT_SYNC" = 1 ] && [ "${_CUR5_VALID:-0}" != 1 ] && [ "${_STATE_RL5_VALID:-0}" = 1 ] \
+     && [ $(( NOW + _B5_TTR )) -ne "${_STATE_RL5_RST:-0}" ]; then
+    _B5_STATE=warming; _B5_ETA=inf; _B5_RATE="0.0000000000"; _B5_TTR=0
+  fi
   # The ownership rule covers the projection too, not just the gauge, and it has
   # to be the SAME rule: burn can bind to the 7d window, so any source seg_limit7d
   # is willing to display must also be the source the ETA is projected from, or
@@ -1317,7 +1328,12 @@ seg_limit_elapsed() {  # $1=canonical pct $2=parsed reset $3=max elapsed age; se
 # entry it outranks, so there is no fossil to inherit. What is still borrowed is
 # the highest percentage recorded for the CURRENT window by any session, which is
 # an over-estimate when sessions disagree; that is the accepted cost of showing
-# the account's window instead of nothing. Both windows use the same rule.
+# the account's window instead of nothing. The store carries no account identity
+# and the payload offers nothing to derive one from, so switching Claude accounts
+# under one OS account can show the previous account's still-open window until the
+# new one's first response lands. That is the same interval in which the gauge used
+# to show nothing at all, and it ends as soon as this session has its own reading.
+# Both windows use the same rule.
 seg_limit5h() {  # 5h rate-limit gauge with reset countdown
   local p="$fh_pct" r="$fh_rst" m=""
   if [ "$VL_LIMIT_SYNC" = 1 ]; then

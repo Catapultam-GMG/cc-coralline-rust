@@ -1845,7 +1845,8 @@ fi
     # The rewrite goes through a temp and a backup; neither may survive it.
     $mutableParent = [IO.Path]::GetDirectoryName($mutablePath)
     $mutableResidue = @(Get-ChildItem -LiteralPath $mutableParent -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like '.burn.tmp.*' -or $_.Name -like '.burn.bak.*' })
+        Where-Object { $_.Name -like ('.' + [IO.Path]::GetFileName($mutablePath) + '.tmp.*') -or
+                       $_.Name -like ('.' + [IO.Path]::GetFileName($mutablePath) + '.bak.*') })
     Check 'WIN-02 mutable burn leaves no temp or backup residue' ($mutableResidue.Count -eq 0)
 
     # A render that is killed never reaches its finally block, so its temp survives
@@ -1856,18 +1857,21 @@ fi
     $sweepConfig = New-StateConfig 'win02-tmpsweep' $sweepRoot 'burn' $false
     $sweepPath = Join-Path $sweepRoot 'burn.tsv'
     Write-Utf8 $sweepPath (($fixedNow - 100L).ToString($Invariant) + "`t010.000`t1015900`n")
-    # The generated shape is .burn.<tmp|bak>.<pid>.<32 hex>, so a prefix match alone
-    # would take an unrelated .burn.tmp.* file that happens to share the directory.
-    $sweepOrphans = @('.burn.tmp.4242.0123456789abcdef0123456789abcdef',
-                      '.burn.bak.4242.fedcba9876543210fedcba9876543210')
-    $sweepKeep = @('.burn.tmp.user-backup', '.burn.tmp.4242.short',
-                   '.burn.other.4242', 'burn.tmp.4242')
+    # The generated shape is .<store>.<tmp|bak>.<pid>.<32 hex>, so a prefix match
+    # alone would take an unrelated file sharing the directory, and a shape that did
+    # not carry the store name would take a SECOND burn store's live temporary and
+    # break its next replace. Both are keep cases here.
+    $sweepOrphans = @('.burn.tsv.tmp.4242.0123456789abcdef0123456789abcdef',
+                      '.burn.tsv.bak.4242.fedcba9876543210fedcba9876543210')
+    $sweepKeep = @('.burn.tsv.tmp.user-backup', '.burn.tsv.tmp.4242.short',
+                   '.other.tsv.tmp.4242.aabbccddeeff00112233445566778899',
+                   '.burn.other.4242', 'burn.tsv.tmp.4242')
     foreach ($leaf in ($sweepOrphans + $sweepKeep)) { Write-Utf8 (Join-Path $sweepRoot $leaf) 'x' }
     $sweepStamp = [IO.File]::GetLastWriteTimeUtc($sweepPath)
     foreach ($leaf in ($sweepOrphans + $sweepKeep)) {
         [IO.File]::SetLastWriteTimeUtc((Join-Path $sweepRoot $leaf), $sweepStamp.AddSeconds(-30))
     }
-    $sweepLive = Join-Path $sweepRoot '.burn.tmp.4243.00112233445566778899aabbccddeeff'
+    $sweepLive = Join-Path $sweepRoot '.burn.tsv.tmp.4243.00112233445566778899aabbccddeeff'
     Write-Utf8 $sweepLive 'x'
     [IO.File]::SetLastWriteTimeUtc($sweepLive, $sweepStamp.AddSeconds(30))
     $sweepRun = Invoke-Statusline (Json $statePayload) $sweepConfig $stateEnvWrite '' 10000

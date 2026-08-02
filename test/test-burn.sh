@@ -606,6 +606,26 @@ _B7_ARGS=unset; burn_estimate
 eq 'no store leaves the projection on the payload' "$_B7_ARGS" '30000|1345600'
 VL_LIMIT_SYNC=$_VLS_SAVE; _STATE_RL7_VALID=0; _CUR7_VALID=0
 burn_eta_7d() { mk7d "$M7E" "$M7R" "$M7T"; }
+
+# The 5h projection must describe the same window as the gauge. When only the store
+# supplies that window, a burn history still sitting on the one that just closed
+# would put an active ETA for the old window beside a gauge for the new one; the
+# estimator reports its window as NOW + _B5_TTR.
+NOW=1000000; _VLS_SAVE2=$VL_LIMIT_SYNC; VL_LIMIT_SYNC=1
+_CUR5_VALID=0; _STATE_RL5_VALID=1; _STATE_RL5_RST=$(( NOW + 9000 ))
+_CUR7_VALID=0; _STATE_RL7_VALID=0
+M5S=active M5E=4000 M5R=0 M5T=9000 M7E=inf M7R=0 M7T=0
+burn_estimate
+eq 'store-only 5h projection on the stored window survives' "$_BURN_STATE" active
+M5T=0
+burn_estimate
+eq 'store-only 5h projection on a closed window is dropped' "$_B5_STATE" warming
+eq 'dropped 5h projection leaves burn warming' "$_BURN_STATE" warming
+_CUR5_VALID=1
+burn_estimate
+eq 'own 5h reading keeps its projection regardless of the store' "$_BURN_STATE" active
+VL_LIMIT_SYNC=$_VLS_SAVE2; _STATE_RL5_VALID=0; _CUR5_VALID=0
+M5S=active M5E=21600 M5R=0 M5T=15000 M7E=7200 M7R=0 M7T=86400
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _BURN_STATE=active; _BURN_LABEL=5h; _BURN_ETA=1000; _BURN_RATE=0; _BURN_TTR=900
 seg_burn
 case "${SEG_TXT[0]}" in (*'↗ 5h ⇢ 16m'*) ok 'burn renderer uses precomputed estimate' ;; (*) bad 'burn renderer uses precomputed estimate' "${SEG_TXT[0]}" ;; esac
