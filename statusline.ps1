@@ -2167,11 +2167,26 @@ function Get-CorallineState([bool]$BurnGate, [bool]$Limit5Gate, [bool]$Limit7Gat
     if ($BurnGate) { $burnPaths = Get-StatePaths $Cfg.BURN_FILE }
     if ($Limit5Gate) { $limit5Paths = Get-StatePaths $Cfg.RL5H_FILE }
     if ($Limit7Gate) { $limit7Paths = Get-StatePaths $Cfg.RL7D_FILE }
+    # Bash compares all six canonical paths pairwise in state_paths_validate, not
+    # just the three roots. Roots alone miss a base that aliases another store's
+    # root: BURN_FILE=...\limit5.d together with RL5H_FILE=...\limit5.tsv gives
+    # burn.Base equal to limit5.Root. That was harmless while the burn store was a
+    # directory and its base was never written, but the burn base is now an
+    # appended file, so the append would create limit5.d as a regular file and
+    # block the limit store permanently. Measured on Windows before this guard:
+    # statusline.sh created nothing at all, statusline.ps1 created the file.
     $collision = $false
-    $roots = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($candidateRoot in @($burnPaths, $limit5Paths, $limit7Paths)) { if ($null -ne $candidateRoot) { [void]$roots.Add($candidateRoot) } }
-    for ($i=0; $i -lt $roots.Count; $i++) {
-        for ($j=$i+1; $j -lt $roots.Count; $j++) { if ($roots[$i].Root.Equals($roots[$j].Root, [StringComparison]::OrdinalIgnoreCase)) { $collision=$true } }
+    $namespace = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($candidate in @($burnPaths, $limit5Paths, $limit7Paths)) {
+        if ($null -ne $candidate) {
+            [void]$namespace.Add([string]$candidate.Base)
+            [void]$namespace.Add([string]$candidate.Root)
+        }
+    }
+    for ($i=0; $i -lt $namespace.Count; $i++) {
+        for ($j=$i+1; $j -lt $namespace.Count; $j++) {
+            if ($namespace[$i].Equals($namespace[$j], [StringComparison]::OrdinalIgnoreCase)) { $collision = $true }
+        }
     }
     if (-not $collision) {
         if ($BurnGate -and $null -ne $burnPaths) {
