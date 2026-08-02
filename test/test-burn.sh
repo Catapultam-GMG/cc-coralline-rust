@@ -621,9 +621,23 @@ M5T=0
 burn_estimate
 eq 'store-only 5h projection on a closed window is dropped' "$_B5_STATE" warming
 eq 'dropped 5h projection leaves burn warming' "$_BURN_STATE" warming
-_CUR5_VALID=1
+# A valid reading of our own does not exempt the projection. rl_choose lets a
+# strictly newer stored window beat it, and the session that published that window
+# need not run burn at all, so the shared history can hold only the older one.
+_CUR5_VALID=1; _CUR5_RST=$(( NOW + 1000 )); _STATE_RL5_RST=$(( NOW + 1000 ))
+M5T=1000
 burn_estimate
-eq 'own 5h reading keeps its projection regardless of the store' "$_BURN_STATE" active
+eq 'own 5h window matching the store keeps its projection' "$_BURN_STATE" active
+M5T=1000; _STATE_RL5_RST=$(( NOW + 9000 ))
+burn_estimate
+eq 'newer stored window drops a projection still on the older one' "$_B5_STATE" warming
+M5T=9000
+burn_estimate
+eq 'projection rebound to the newer stored window survives' "$_BURN_STATE" active
+_STATE_RL5_VALID=0
+M5T=1000
+burn_estimate
+eq 'no synced state leaves the projection alone' "$_BURN_STATE" active
 VL_LIMIT_SYNC=$_VLS_SAVE2; _STATE_RL5_VALID=0; _CUR5_VALID=0
 M5S=active M5E=21600 M5R=0 M5T=15000 M7E=7200 M7R=0 M7T=86400
 SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _BURN_STATE=active; _BURN_LABEL=5h; _BURN_ETA=1000; _BURN_RATE=0; _BURN_TTR=900

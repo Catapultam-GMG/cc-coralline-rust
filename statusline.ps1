@@ -2316,14 +2316,18 @@ function Get-CorallineState([bool]$BurnGate, [bool]$Limit5Gate, [bool]$Limit7Gat
     if ($Limit7Gate -and $limit7Snapshot.Complete) { [void](Publish-LimitState $limit7Paths.Root $current7 $limit7Snapshot $limit7Gc 691200L $mutate) }
 
     $five = Get-Burn5Estimate $burnSnapshot $currentBurn $Now $window
-    # The 5h projection needs the same rebinding the 7d one gets. When only the store
-    # supplies the window, the burn history can still be on the window that just
-    # closed: an expired reset stays plausible to the reader and its Ttr clamps to
-    # zero, so an active ETA for the OLD window would render beside a gauge showing
-    # the NEW one. The estimate reports its window as Now + Ttr, so require that to
-    # be the stored window and fall back to warming when it is not, which is honest:
-    # no samples for the new window have been observed yet.
-    if ($Cfg.VL_LIMIT_SYNC -eq '1' -and -not $current5.Valid -and $limit5.Valid -and
+    # The 5h projection needs the same rebinding the 7d one gets: whenever the synced
+    # state is what the gauge draws, the ETA has to come from that same window. Two
+    # ways they diverge. With no reading of our own the history can still be on the
+    # window that just closed, since an expired reset stays plausible to the reader
+    # and its Ttr clamps to zero. With a valid reading of our own that a NEWER stored
+    # window beats, the history holds only our older window, and the session that
+    # published the newer one need not have burn enabled to contribute samples for
+    # it. Both put an active ETA for one window beside a gauge for another, so gate
+    # on the stored state alone, not on whether we have a reading. The estimate
+    # reports its window as Now + Ttr; warming when it does not match is honest, no
+    # samples for that window have been observed yet.
+    if ($Cfg.VL_LIMIT_SYNC -eq '1' -and $limit5.Valid -and
         ($Now + [long]$five.Ttr) -ne [long]$limit5.Reset) {
         $five = [pscustomobject]@{ State='warming'; Eta='inf'; Rate='0.0000000000'; Ttr=0L }
     }
@@ -2744,7 +2748,11 @@ foreach ($base in @($Cfg.BURN_FILE, $Cfg.RL5H_FILE, $Cfg.RL7D_FILE)) {
 }
 
 $BurnStateGate = $ProbeSegmentNames.Contains('burn')
-$Limit5StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and $ProbeSegmentNames.Contains('limit5h')
+# burn takes both gates, not just 7d. It can bind to either window, its projection is
+# rebound to the synced 5h state, and its own source gate accepts that state, so a
+# layout with burn but no limit5h would otherwise leave Limit5 permanently invalid
+# and hide the segment for a session with no payload reading but a usable window.
+$Limit5StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and ($ProbeSegmentNames.Contains('limit5h') -or $BurnStateGate)
 $Limit7StateGate = $Cfg.VL_LIMIT_SYNC -eq '1' -and ($ProbeSegmentNames.Contains('limit7d') -or $BurnStateGate)
 $State = $null
 if ($BurnStateGate -or $Limit5StateGate -or $Limit7StateGate) {

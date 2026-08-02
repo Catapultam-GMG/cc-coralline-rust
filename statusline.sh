@@ -966,14 +966,18 @@ burn_eta_7d() {  # → _B7_*; $1=pct_milli $2=reset epoch
 burn_estimate() {  # → _BURN_STATE _BURN_LABEL _BURN_ETA _BURN_RATE _BURN_TTR
   local f5=0 f7=0
   burn_eta_5h "${_STATE_MUTATE:-0}"
-  # The 5h projection needs the same rebinding the 7d one gets. When only the store
-  # supplies the window, the burn history can still be sitting on the window that
-  # just closed: an expired reset stays plausible to the reader and its TTR clamps
-  # to zero, so an active ETA for the OLD window would render beside a gauge showing
-  # the NEW one. burn_eta_5h reports the window it used as NOW + _B5_TTR, so require
-  # that to be the stored window and fall back to warming when it is not, which is
-  # honest: no samples for the new window have been observed yet.
-  if [ "$VL_LIMIT_SYNC" = 1 ] && [ "${_CUR5_VALID:-0}" != 1 ] && [ "${_STATE_RL5_VALID:-0}" = 1 ] \
+  # The 5h projection needs the same rebinding the 7d one gets: whenever the synced
+  # state is what the gauge draws, the ETA has to be projected from that same window.
+  # Two ways they diverge. With no reading of our own the history can still sit on
+  # the window that just closed, since an expired reset stays plausible to the reader
+  # and its TTR clamps to zero. With a valid reading of our own that rl_choose lets a
+  # NEWER stored window beat, the history holds only our older window, and the
+  # session that published the newer one need not have burn enabled to contribute
+  # samples for it. Both put an active ETA for one window beside a gauge for another,
+  # so gate on the stored state alone, not on whether we have a reading. burn_eta_5h
+  # reports the window it used as NOW + _B5_TTR; falling back to warming when it does
+  # not match is honest, no samples for that window have been observed yet.
+  if [ "$VL_LIMIT_SYNC" = 1 ] && [ "${_STATE_RL5_VALID:-0}" = 1 ] \
      && [ $(( NOW + _B5_TTR )) -ne "${_STATE_RL5_RST:-0}" ]; then
     _B5_STATE=warming; _B5_ETA=inf; _B5_RATE="0.0000000000"; _B5_TTR=0
   fi
@@ -1752,7 +1756,12 @@ case "$_SEG_SCAN" in *" git "*|*" stash "*|*" project "*) read_git ;; esac
 _STATE_READY=0; _STATE_BURN_GATE=0; _STATE_RL5_GATE=0; _STATE_RL7_GATE=0
 case "$_SEG_SCAN" in (*" burn "*) _STATE_BURN_GATE=1 ;; esac
 if [ "$VL_LIMIT_SYNC" = 1 ]; then
-  case "$_SEG_SCAN" in (*" limit5h "*) _STATE_RL5_GATE=1 ;; esac
+  # burn takes both gates, not just 7d. It can bind to either window, its projection
+  # is rebound to the synced 5h state in burn_estimate, and its own source gate
+  # accepts that state, so a layout with burn but no limit5h would otherwise leave
+  # _STATE_RL5_VALID permanently 0 and hide the segment for a session that has no
+  # payload reading but does have a usable stored window.
+  case "$_SEG_SCAN" in (*" limit5h "*|*" burn "*) _STATE_RL5_GATE=1 ;; esac
   case "$_SEG_SCAN" in (*" limit7d "*|*" burn "*) _STATE_RL7_GATE=1 ;; esac
 fi
 if [ "$_STATE_BURN_GATE" = 1 ] || [ "$_STATE_RL5_GATE" = 1 ] || [ "$_STATE_RL7_GATE" = 1 ]; then
