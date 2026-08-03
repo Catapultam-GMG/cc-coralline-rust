@@ -101,6 +101,8 @@ $Defaults = [ordered]@{
     VL_PATH_DEPTH = '4'
     VL_NAME_MAX = '0'
     VL_COST_DECIMALS = '2'
+    VL_CTX_ALWAYS_SHOW = '0'
+    VL_COST_ALWAYS_SHOW = '0'
     VL_WARN_PCT = '50'
     VL_HOT_PCT = '75'
     VL_ASCII = '0'
@@ -2864,7 +2866,8 @@ function Add-EffortSegment {
 
 function Add-CtxSegment {
     $pct = 0
-    if (-not (Get-PctValue $ctxPct ([ref]$pct))) { return }
+    $known = Get-PctValue $ctxPct ([ref]$pct)
+    if (-not $known -and $Cfg.VL_CTX_ALWAYS_SHOW -ne '1') { return }
     $bar = New-Bar $pct ([int]$Cfg.VL_BAR_WIDTH)
     $pfg = Get-Fg (Get-PctFg $pct)
     $dfg = Get-Fg $Cfg.VL_FG_DIM
@@ -2977,7 +2980,8 @@ function Add-BurnSegment {
 
 function Add-CostSegment {
     $value = 0.0
-    if (-not (Try-BoundedDouble $cost 0 1000000000 ([ref]$value)) -or $value -eq 0) { return }
+    $parsed = Try-BoundedDouble $cost 0 1000000000 ([ref]$value)
+    if (($value -eq 0 -or -not $parsed) -and $Cfg.VL_COST_ALWAYS_SHOW -ne '1') { return }
     $format = '$' + $value.ToString('F' + $Cfg.VL_COST_DECIMALS, $Invariant)
     $fg = Get-Fg $Cfg.VL_FG_TEXT
     Push-Segment $Cfg.VL_BG_COST "${fg} $format "
