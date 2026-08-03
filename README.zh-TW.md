@@ -553,6 +553,9 @@ Bash renderer 以單次 `jq` 呼叫取出所有欄位，原生 PowerShell render
 兩者每次 render 最多呼叫一次 `git status --porcelain=v2 --branch`，都不會為每個欄位
 個別啟動子程序。
 
+這些數字是怎麼量出來的，以及過程中產生過錯誤數字的那些陷阱，都寫在
+[BENCHMARK.zh-TW.md](./BENCHMARK.zh-TW.md)。
+
 ## 致敬與致謝
 
 coralline 的視覺語言——膠囊化的區段、powerline 轉場、git 的 `⇡⇣` 符號、
