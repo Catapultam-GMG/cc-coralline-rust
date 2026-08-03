@@ -26,7 +26,7 @@ Claude Code 每秒重跑一次狀態列，所以單次 render 的成本是產品
 
 ## 環境控制
 
-- **關掉正在跑的狀態列。** 那就是受測程式本身，而且每個開著的 session 每秒都在跑。備份 `~/.claude/settings.json`、記下 SHA-256、移除 `statusLine` 與 `subagentStatusLine`、跑完還原、驗證雜湊相符。**把還原綁在跟量測同一條指令的尾端**，這樣中途出事也不會讓使用者的狀態列一直空著。
+- **關掉正在跑的狀態列。** 那就是受測程式本身，而且每個開著的 session 每秒都在跑。備份 `~/.claude/settings.json`、記下 SHA-256、移除 `statusLine` 與 `subagentStatusLine`、跑完還原、驗證雜湊相符。**把還原放進 `EXIT` 與訊號 trap**，不要只是排在量測指令後面：收到 `SIGINT`、或在 `set -e` 下失敗時，只排在後面的東西不會執行。雜湊驗證也要從同一條清理路徑做。
 - **剝掉繼承來的設定。** 子行程環境裡的 `REMORA_*` 和 `CORALLINE_*` 全部 unset。先前有一批量測就是因為繼承了這些而整批作廢。
 - **絕對不要讓量測指向真實 store。** 每個 arm 給自己的 state 目錄。一個設定檔壞掉的 arm 會退回預設值，然後直接讀寫 `~/.claude/coralline/`。
 - **記錄量測前後的機器負載。** 在 load average 20 量到的結果，跟在 3 量到的不能並列，即使相對關係仍然成立。
@@ -35,11 +35,13 @@ Claude Code 每秒重跑一次狀態列，所以單次 render 的成本是產品
 
 每個 arm 拿到內容相同的 state 目錄，同時包含兩種形狀的歷史，這樣一份 fixture 對每個世代都公平：
 
-- `burn-5h.tsv`，放滿 `BURN_TRIM` 列，讓 trim 和 heal 真的被執行到，而不是被跳過。
-- `burn-5h.d/`，放 N 個 marker 目錄，命名為 `b_<reset:12>_<sample:12>_<pct>_<counter>`，只有 v0.12 世代會走它。少了這個，那個世代等於在最佳情況下被量，回歸幅度會看起來小一個數量級。
+- `burn-5h.tsv`，放滿 `BURN_TRIM` 列，讓下一次可寫入的 render 跨過 trim 門檻。格式正確的列不會觸發 heal：兩個 renderer 都只在遇到不合理的記錄時才升起 healing 旗標，所以要量 heal 就得刻意放一列壞掉的記錄，並在結果裡註明用的是哪一種 fixture。
+- `burn-5h.d/`，放 N 個**空的一般檔案**，命名為 `b_<reset:12>_<sample:12>_<pct>_<counter>`，只有 v0.12 世代會讀它。必須是檔案：那個世代只有在 `[ -f ]`、`[ ! -L ]`、`[ ! -s ]` 同時成立時才接受一個 marker，所以目錄會被枚舉之後丟掉，你量到的是目錄走訪而不是 marker 處理。這件事弄錯的話，1400 個 marker 下 v0.12 會被量成 386 毫秒而不是 1670 毫秒，而且 #58 看起來只改善 13%，實際上是 68%，因為 #58 優化的那段程式碼根本沒被執行到。
 - `limit-5h.d/` 與 `limit-7d.d/`，各放一個 `<reset:10>_<pct:7.3>` entry。
 
 **要變動 marker 數量**（350／1400／4000），才看得出成本是否隨歷史成長。單一 fixture 大小分不出「比較慢」和「用越久越慢」，而後者才是真正要處理的缺陷。
+
+**每一輪開始前，每個 arm 都要從不可變的模板重置。** 超過 `BURN_TRIM` 之後，v0.12 世代會把多出來的部分當成 retention candidate，每次 render 刪掉 128 個，所以 4000 個的 store 會掉到 3872、3744、3616。不重置的話，後面幾輪量的是比你在結果裡寫的還小的 fixture。
 
 設 `CORALLINE_NO_SAMPLE=1` 可以單獨量讀取路徑。它跟可寫入版本的差就是寫入路徑，而強化措施的成本通常集中在那裡。
 
@@ -63,7 +65,7 @@ Claude Code 每秒重跑一次狀態列，所以單次 render 的成本是產品
 
 **不要用多層引號的內嵌字串透過 SSH 下 Windows 指令。** `ssh` 加上 `powershell -Command` 的多層引號會把參數改壞，而且錯誤看起來像程式本身的問題。寫成 `.ps1`、`scp` 過去、用 `-File` 執行。
 
-**設定檔要用 LF 換行。** `coralline.conf` 帶 CRLF 會讓兩個 runtime 都拒絕它宣告的路徑。
+**Bash arm 的設定檔要用 LF 換行。** `while IFS= read -r line` 會把歸位字元留在值的尾巴，所以 CRLF 的 `coralline.conf` 宣告的每一條路徑都是無效的。PowerShell renderer 不受影響：它在解析賦值之前會先用 `` `r`n|`n|`r `` 分行。
 
 ## 下結論之前
 
@@ -75,4 +77,4 @@ Claude Code 每秒重跑一次狀態列，所以單次 render 的成本是產品
 
 ## 重現 v0.13.0 的數字
 
-Arm：`v0.11.0`、`v0.12.0`、#58 的 merge、以及受測版本，各以 `git show <ref>:statusline.sh` 取出。Cohort 為 n = 1、5、12、16，每個 cohort 25 輪配對、arm 輪替，在 macOS Bash 3.2.57 與 5.3.15 上、關閉現有狀態列的情況下執行。Windows 數字採同樣設計，在原生 x64 PowerShell 5.1 上進行，帶一個位元相同的控制組，並在同一次執行中量出直譯器地板。
+Arm 一律釘在 commit 上，這樣分支往前走之後實驗仍然可重現：`56fa44b`（v0.11.0）、`780df84`（v0.12.0）、`4bdd69e`（#58 的 merge）、`a597ac2`（v0.13.0）。各以 `git show <commit>:statusline.sh` 取出。Cohort 為 n = 1、5、12、16，每個 cohort 25 輪配對、arm 輪替，在 macOS Bash 3.2.57 與 5.3.15 上、關閉現有狀態列的情況下執行。Windows 數字採同樣設計，在原生 x64 PowerShell 5.1 上進行，帶一個位元相同的控制組，並在同一次執行中量出直譯器地板。

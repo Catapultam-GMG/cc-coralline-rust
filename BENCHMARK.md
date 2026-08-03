@@ -26,7 +26,7 @@ Always measure the **interpreter floor**: how long a bare `bash`/`powershell.exe
 
 ## Environment control
 
-- **Disable the live statuslines.** They are the same program under test, running once per second in every open session. Back up `~/.claude/settings.json`, record its SHA-256, remove `statusLine` and `subagentStatusLine`, run, restore, and verify the hash matches. Tie the restore to the same command as the run so an interruption cannot leave the user without a statusline.
+- **Disable the live statuslines.** They are the same program under test, running once per second in every open session. Back up `~/.claude/settings.json`, record its SHA-256, remove `statusLine` and `subagentStatusLine`, run, restore, and verify the hash matches. Put the restore in an `EXIT` and signal trap rather than merely sequencing it after the run: a `SIGINT`, or a failure under `set -e`, skips anything that is only placed later in the command. Verify the hash from that same cleanup path.
 - **Strip inherited configuration.** Unset every `REMORA_*` and `CORALLINE_*` variable in the child environment. An earlier benchmark inherited them and had to be discarded entirely.
 - **Never point a benchmark at the live store.** Give each arm its own state directory. A misconfigured arm that falls back to defaults will read and write `~/.claude/coralline/`.
 - **Record the host load** before and after. A result taken at load average 20 is not comparable to one taken at load average 3, even if the relative comparison survives.
@@ -35,11 +35,13 @@ Always measure the **interpreter floor**: how long a bare `bash`/`powershell.exe
 
 Each arm gets an identical state directory containing both shapes of history, so one fixture is fair to every generation:
 
-- `burn-5h.tsv` with `BURN_TRIM` rows, so trimming and healing are exercised rather than skipped.
-- `burn-5h.d/` with N marker directories named `b_<reset:12>_<sample:12>_<pct>_<counter>`, which only the v0.12 generation walks. Without it, that generation is measured in its best case and the regression looks an order of magnitude smaller than it is.
+- `burn-5h.tsv` with `BURN_TRIM` rows, so the next mutating render crosses the trim threshold. Well-formed rows do not exercise healing: both renderers raise the healing flag only on an implausible record, so add one deliberately malformed row when healing is part of the claim, and say which fixture you used.
+- `burn-5h.d/` with N **empty regular files** named `b_<reset:12>_<sample:12>_<pct>_<counter>`, which only the v0.12 generation reads. They have to be files. That generation accepts a marker only when `[ -f ]` and `[ ! -L ]` and `[ ! -s ]` all hold, so directories are enumerated and then discarded, and you measure directory traversal instead of marker processing. Getting this wrong put v0.12 at 386 ms instead of 1670 ms on a 1400-marker store, and made #58 look like a 13% improvement when it is 68%, because the code #58 optimises never ran.
 - `limit-5h.d/` and `limit-7d.d/` each with one `<reset:10>_<pct:7.3>` entry.
 
 Vary the marker count (350 / 1400 / 4000) to expose cost that scales with history. A single fixture size cannot distinguish "slower" from "slower the longer you use it", and the second is the defect that matters.
+
+**Reset every arm from an immutable template before each round.** Above `BURN_TRIM` the v0.12 generation treats the excess as retention candidates and removes 128 per render, so a 4000-marker store falls to 3872, then 3744, then 3616. Without a reset the later rounds measure a smaller fixture than the one named in the result.
 
 Set `CORALLINE_NO_SAMPLE=1` to measure the read path alone. The difference against a mutating run is the write path, which is where hardening costs concentrate.
 
@@ -63,7 +65,7 @@ Each of these produced a wrong number that looked reasonable.
 
 **Do not build Windows commands as inline quoted strings over SSH.** Multi-level quoting through `ssh` + `powershell -Command` mangles arguments in ways that look like program errors. Write a `.ps1`, `scp` it, and run it with `-File`.
 
-**Write config files with LF endings.** CRLF in a `coralline.conf` makes both runtimes reject the paths it declares.
+**Write config files with LF endings for the Bash arms.** `while IFS= read -r line` leaves the carriage return attached to the value, so every path a CRLF `coralline.conf` declares is invalid. The PowerShell renderer is not affected: it splits on `` `r`n|`n|`r `` before decoding assignments.
 
 ## Before concluding
 
@@ -75,4 +77,4 @@ Attribute before you publish. A single number telling you "this version is slowe
 
 ## Reproducing the v0.13.0 numbers
 
-Arms: `v0.11.0`, `v0.12.0`, the merge of #58, and the release under test, each extracted with `git show <ref>:statusline.sh`. Cohorts n = 1, 5, 12, 16. 25 paired rounds per cohort, arms rotated, on macOS Bash 3.2.57 and 5.3.15 with the live statuslines disabled. Windows figures use the same design on native x64 PowerShell 5.1 with a byte-identical control arm and the interpreter floor measured in the same run.
+Arms, pinned to commits so the experiment survives the branch advancing: `56fa44b` (v0.11.0), `780df84` (v0.12.0), `4bdd69e` (the #58 merge), and `a597ac2` (v0.13.0). Extract each with `git show <commit>:statusline.sh`. Cohorts n = 1, 5, 12, 16. 25 paired rounds per cohort, arms rotated, on macOS Bash 3.2.57 and 5.3.15 with the live statuslines disabled. Windows figures use the same design on native x64 PowerShell 5.1 with a byte-identical control arm and the interpreter floor measured in the same run.
