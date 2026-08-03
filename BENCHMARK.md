@@ -35,15 +35,53 @@ Always measure the **interpreter floor**: how long a bare `bash`/`powershell.exe
 
 Each arm gets an identical state directory containing both shapes of history, so one fixture is fair to every generation:
 
-- `burn-5h.tsv` with `BURN_TRIM` rows, so the next mutating render crosses the trim threshold. Well-formed rows do not exercise healing: both renderers raise the healing flag only on an implausible record, so add one deliberately malformed row when healing is part of the claim, and say which fixture you used.
+- `burn-5h.tsv` with `BURN_TRIM` rows in the schema every renderer expects, tab separated: sample epoch, percentage, reset epoch. The order differs from the marker names below, which start with the reset. A row that does not parse contributes no observation, so a mistyped schema still crosses the physical row threshold while measuring a rewrite of empty history.
+- Healing is not exercised by that row set. A row that fails to parse is skipped silently; the flag is raised only by a row that parses and is then implausible, meaning `sample > now + 300`, or `reset < sample`, or `reset > now + 21600`. Add one such row, for instance a well-formed row whose reset is `now + 99999`, when healing is part of the claim, and say so in the result.
 - `burn-5h.d/` with N **empty regular files** named `b_<reset:12>_<sample:12>_<pct>_<counter>`, which only the v0.12 generation reads. They have to be files. That generation accepts a marker only when `[ -f ]` and `[ ! -L ]` and `[ ! -s ]` all hold, so directories are enumerated and then discarded, and you measure directory traversal instead of marker processing. Getting this wrong put v0.12 at 386 ms instead of 1670 ms on a 1400-marker store, and made #58 look like a 13% improvement when it is 68%, because the code #58 optimises never ran.
-- `limit-5h.d/` and `limit-7d.d/` each with one `<reset:10>_<pct:7.3>` entry.
+- `limit-5h.d/` and `limit-7d.d/` each with one **empty directory** named `<reset:10>_<pct:7.3>`. These are directories, not files: the validators require `-d`, not a symlink, and empty. The two stores take opposite shapes, and a fixture that gets them the same way round is read by some arms and ignored by others.
 
 Vary the marker count (350 / 1400 / 4000) to expose cost that scales with history. A single fixture size cannot distinguish "slower" from "slower the longer you use it", and the second is the defect that matters.
 
 **Reset every arm from an immutable template before each round.** Above `BURN_TRIM` the v0.12 generation treats the excess as retention candidates and removes 128 per render, so a 4000-marker store falls to 3872, then 3744, then 3616. Without a reset the later rounds measure a smaller fixture than the one named in the result.
 
 Set `CORALLINE_NO_SAMPLE=1` to measure the read path alone. The difference against a mutating run is the write path, which is where hardening costs concentrate.
+
+## Generating the fixture
+
+Nothing above runs unless each arm is handed a config that turns the state path on. The default segment list contains no `burn`, `VL_LIMIT_SYNC` defaults to `0`, and an arm launched without `CORALLINE_CONFIG` loads the user's live config, which is also how a benchmark ends up reading and writing the real store.
+
+Per arm, written with LF endings:
+
+```
+VL_SEGMENTS='dir git model ctx limit5h limit7d burn cost clock'
+VL_LIMIT_SYNC=1
+BURN_FILE='<state>/burn-5h.tsv'
+RL5H_FILE='<state>/limit-5h.tsv'
+RL7D_FILE='<state>/limit-7d.tsv'
+```
+
+The state directory it points at:
+
+```bash
+now=$(date +%s); r5=$((now + 9000)); r7=$((now + 400000))
+mkdir -p "$state/burn-5h.d"
+
+# TSV rows: sample, percentage, reset
+awk -v n="$now" -v r="$r5" 'BEGIN{ for (i = 1500; i >= 1; i--) printf "%d\t037.000\t%d\n", n - i, r }' \
+  > "$state/burn-5h.tsv"
+
+# markers: empty regular files
+i=0; while [ "$i" -lt "$markers" ]; do
+  printf -v nm 'b_%012d_%012d_%03d.%03d_%04d' "$r5" $((now - markers + i)) 37 0 0
+  : > "$state/burn-5h.d/$nm"; i=$((i + 1))
+done
+
+# limit records: empty directories
+mkdir -p "$state/limit-5h.d/$(printf '%010d_%07.3f' "$r5" 37)" \
+         "$state/limit-7d.d/$(printf '%010d_%07.3f' "$r7" 64)"
+```
+
+The payload matters as much as the fixture, because it decides whether the mutation being measured happens at all. It needs a `rate_limits.five_hour` percentage and a `resets_at` inside `(now, now + 21600]`, generated at run time. `test/sample-input.json` cannot be used: its 2030 sentinel resets are rejected by every arm, so nothing is appended, the trim threshold is never crossed, and only the v0.12 arm still does marker work.
 
 ## Harness pitfalls
 
@@ -77,4 +115,4 @@ Attribute before you publish. A single number telling you "this version is slowe
 
 ## Reproducing the v0.13.0 numbers
 
-Arms, pinned to commits so the experiment survives the branch advancing: `56fa44b` (v0.11.0), `780df84` (v0.12.0), `4bdd69e` (the #58 merge), and `a597ac2` (v0.13.0). Extract each with `git show <commit>:statusline.sh`. Cohorts n = 1, 5, 12, 16. 25 paired rounds per cohort, arms rotated, on macOS Bash 3.2.57 and 5.3.15 with the live statuslines disabled. Windows figures use the same design on native x64 PowerShell 5.1 with a byte-identical control arm and the interpreter floor measured in the same run.
+Arms, pinned to commits so the experiment survives the branch advancing: `56fa44b` (v0.11.0), `780df84` (v0.12.0), `4bdd69e` (the #58 merge), and `a597ac2` (v0.13.0). Extract each with `git show <commit>:statusline.sh`, give each one the config and state directory from *Generating the fixture*, and generate the payload at run time rather than reusing a stored one. Cohorts n = 1, 5, 12, 16. 25 paired rounds per cohort, arms rotated, on macOS Bash 3.2.57 and 5.3.15 with the live statuslines disabled. Windows figures use the same design on native x64 PowerShell 5.1 with a byte-identical control arm and the interpreter floor measured in the same run.

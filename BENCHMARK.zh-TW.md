@@ -35,15 +35,53 @@ Claude Code 每秒重跑一次狀態列，所以單次 render 的成本是產品
 
 每個 arm 拿到內容相同的 state 目錄，同時包含兩種形狀的歷史，這樣一份 fixture 對每個世代都公平：
 
-- `burn-5h.tsv`，放滿 `BURN_TRIM` 列，讓下一次可寫入的 render 跨過 trim 門檻。格式正確的列不會觸發 heal：兩個 renderer 都只在遇到不合理的記錄時才升起 healing 旗標，所以要量 heal 就得刻意放一列壞掉的記錄，並在結果裡註明用的是哪一種 fixture。
+- `burn-5h.tsv`，放滿 `BURN_TRIM` 列，欄位順序是每個 renderer 都預期的三欄，以 tab 分隔：sample epoch、百分比、reset epoch。注意這個順序和下面 marker 檔名相反，marker 是 reset 在前。無法解析的列不會產生任何 observation，所以欄位寫錯時仍然會跨過實體列數門檻，但量到的是「重寫一份空歷史」。
+- 這組列不會觸發 heal。解析失敗的列會被靜默跳過；只有「解析成功但不合理」的列才會升起 healing 旗標，也就是 `sample > now + 300`、`reset < sample`、或 `reset > now + 21600`。要量 heal 就加一列這種記錄，例如一列格式正確但 reset 是 `now + 99999` 的列，並在結果裡註明。
 - `burn-5h.d/`，放 N 個**空的一般檔案**，命名為 `b_<reset:12>_<sample:12>_<pct>_<counter>`，只有 v0.12 世代會讀它。必須是檔案：那個世代只有在 `[ -f ]`、`[ ! -L ]`、`[ ! -s ]` 同時成立時才接受一個 marker，所以目錄會被枚舉之後丟掉，你量到的是目錄走訪而不是 marker 處理。這件事弄錯的話，1400 個 marker 下 v0.12 會被量成 386 毫秒而不是 1670 毫秒，而且 #58 看起來只改善 13%，實際上是 68%，因為 #58 優化的那段程式碼根本沒被執行到。
-- `limit-5h.d/` 與 `limit-7d.d/`，各放一個 `<reset:10>_<pct:7.3>` entry。
+- `limit-5h.d/` 與 `limit-7d.d/`，各放一個**空目錄**，命名為 `<reset:10>_<pct:7.3>`。這兩個是目錄不是檔案：驗證要求 `-d`、非 symlink、且為空。兩種 store 的形狀正好相反，弄成同一種的話會變成有些 arm 讀得到、有些 arm 直接忽略。
 
 **要變動 marker 數量**（350／1400／4000），才看得出成本是否隨歷史成長。單一 fixture 大小分不出「比較慢」和「用越久越慢」，而後者才是真正要處理的缺陷。
 
 **每一輪開始前，每個 arm 都要從不可變的模板重置。** 超過 `BURN_TRIM` 之後，v0.12 世代會把多出來的部分當成 retention candidate，每次 render 刪掉 128 個，所以 4000 個的 store 會掉到 3872、3744、3616。不重置的話，後面幾輪量的是比你在結果裡寫的還小的 fixture。
 
 設 `CORALLINE_NO_SAMPLE=1` 可以單獨量讀取路徑。它跟可寫入版本的差就是寫入路徑，而強化措施的成本通常集中在那裡。
+
+## 產生 fixture
+
+上面所有東西，在沒有給每個 arm 一份「打開 state 路徑」的設定之前都不會執行。預設的 segment 清單裡沒有 `burn`，`VL_LIMIT_SYNC` 預設是 `0`，而沒帶 `CORALLINE_CONFIG` 啟動的 arm 會載入使用者的真實設定，這也正是量測最後會去讀寫真實 store 的原因。
+
+每個 arm 一份，用 LF 換行：
+
+```
+VL_SEGMENTS='dir git model ctx limit5h limit7d burn cost clock'
+VL_LIMIT_SYNC=1
+BURN_FILE='<state>/burn-5h.tsv'
+RL5H_FILE='<state>/limit-5h.tsv'
+RL7D_FILE='<state>/limit-7d.tsv'
+```
+
+它指向的 state 目錄：
+
+```bash
+now=$(date +%s); r5=$((now + 9000)); r7=$((now + 400000))
+mkdir -p "$state/burn-5h.d"
+
+# TSV 三欄：sample、百分比、reset
+awk -v n="$now" -v r="$r5" 'BEGIN{ for (i = 1500; i >= 1; i--) printf "%d\t037.000\t%d\n", n - i, r }' \
+  > "$state/burn-5h.tsv"
+
+# marker：空的一般檔案
+i=0; while [ "$i" -lt "$markers" ]; do
+  printf -v nm 'b_%012d_%012d_%03d.%03d_%04d' "$r5" $((now - markers + i)) 37 0 0
+  : > "$state/burn-5h.d/$nm"; i=$((i + 1))
+done
+
+# limit 記錄：空目錄
+mkdir -p "$state/limit-5h.d/$(printf '%010d_%07.3f' "$r5" 37)" \
+         "$state/limit-7d.d/$(printf '%010d_%07.3f' "$r7" 64)"
+```
+
+payload 和 fixture 一樣重要，因為它決定了「要量的那個 mutation」到底會不會發生。它需要有 `rate_limits.five_hour` 的百分比，以及一個落在 `(now, now + 21600]` 之內、在執行當下產生的 `resets_at`。不能用 `test/sample-input.json`：它那些 2030 年的 sentinel reset 會被每個 arm 拒絕，於是什麼都不會被追加、trim 門檻永遠不會被跨過，只剩 v0.12 那個 arm 還在做 marker 的工作。
 
 ## 量測台的陷阱
 
@@ -77,4 +115,4 @@ Claude Code 每秒重跑一次狀態列，所以單次 render 的成本是產品
 
 ## 重現 v0.13.0 的數字
 
-Arm 一律釘在 commit 上，這樣分支往前走之後實驗仍然可重現：`56fa44b`（v0.11.0）、`780df84`（v0.12.0）、`4bdd69e`（#58 的 merge）、`a597ac2`（v0.13.0）。各以 `git show <commit>:statusline.sh` 取出。Cohort 為 n = 1、5、12、16，每個 cohort 25 輪配對、arm 輪替，在 macOS Bash 3.2.57 與 5.3.15 上、關閉現有狀態列的情況下執行。Windows 數字採同樣設計，在原生 x64 PowerShell 5.1 上進行，帶一個位元相同的控制組，並在同一次執行中量出直譯器地板。
+Arm 一律釘在 commit 上，這樣分支往前走之後實驗仍然可重現：`56fa44b`（v0.11.0）、`780df84`（v0.12.0）、`4bdd69e`（#58 的 merge）、`a597ac2`（v0.13.0）。各以 `git show <commit>:statusline.sh` 取出，每個 arm 都套用〈產生 fixture〉那節的設定與 state 目錄，payload 在執行當下產生，不要沿用存起來的舊檔。Cohort 為 n = 1、5、12、16，每個 cohort 25 輪配對、arm 輪替，在 macOS Bash 3.2.57 與 5.3.15 上、關閉現有狀態列的情況下執行。Windows 數字採同樣設計，在原生 x64 PowerShell 5.1 上進行，帶一個位元相同的控制組，並在同一次執行中量出直譯器地板。
