@@ -614,6 +614,9 @@ events. The Bash renderer extracts every field with one `jq` call; the native Po
 renderer parses in-process. Both use at most one `git status --porcelain=v2 --branch` call per
 render, and neither launches per-field subprocesses.
 
+How those numbers are produced, and the measurement traps that produced wrong ones along the
+way, is written down in [BENCHMARK.md](./BENCHMARK.md).
+
 ## Support coralline
 
 coralline makes no network or API calls and uses zero tokens at runtime. The
