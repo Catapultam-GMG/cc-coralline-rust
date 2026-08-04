@@ -2398,7 +2398,7 @@ function Get-JsonMember($Object, [string]$Name) {
     try {
         $property = $Object.PSObject.Properties[$Name]
         if ($null -eq $property) { return $null }
-        return $property.Value
+        return ,$property.Value
     } catch { return $null }
 }
 
@@ -2424,12 +2424,40 @@ function To-InvariantString($Value) {
     return ''
 }
 
-try { $J = $rawInput | ConvertFrom-Json -ErrorAction Stop } catch { $J = $null }
+$JsonParsed = $false
+try {
+    if ($rawInput -cnotmatch '\A[ \t\r\n]*\{') { throw 'non-object JSON root' }
+    $J = $rawInput | ConvertFrom-Json -ErrorAction Stop
+    $JsonParsed = ($J -is [pscustomobject] -or $J -is [System.Collections.IDictionary])
+    if (-not $JsonParsed) { $J = $null }
+} catch { $J = $null }
 
 $cwd = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('workspace', 'current_dir')))
 if ([string]::IsNullOrEmpty($cwd)) { $cwd = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('cwd'))) }
 $model = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('model', 'display_name')))
-$ctxPct = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('context_window', 'used_percentage')))
+$ctxParent = Get-JsonMember $J 'context_window'
+$ctxNode = $null
+$ctxEmpty = $false
+if ($null -eq $ctxParent) {
+    $ctxPct = ''
+    $ctxEmpty = $true
+} elseif ($ctxParent -is [pscustomobject] -or $ctxParent -is [System.Collections.IDictionary]) {
+    $ctxNode = Get-JsonMember $ctxParent 'used_percentage'
+    if ($null -eq $ctxNode) {
+        $ctxPct = ''
+        $ctxEmpty = $true
+    } elseif ($ctxNode -is [string]) {
+        $ctxRaw = [string]$ctxNode
+        $ctxPct = Remove-ControlChars $ctxRaw
+        $ctxEmpty = $ctxRaw.Length -eq 0
+    } elseif ($ctxNode -is [bool] -or $ctxNode -is [System.Array] -or $ctxNode -is [System.Collections.IDictionary] -or $ctxNode -is [pscustomobject]) {
+        $ctxPct = ''
+    } else {
+        $ctxPct = Remove-ControlChars (To-InvariantString $ctxNode)
+    }
+} else {
+    $ctxPct = ''
+}
 $tokIn = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('context_window', 'total_input_tokens')))
 $tokOut = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('context_window', 'total_output_tokens')))
 $tokCr = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('context_window', 'current_usage', 'cache_read_input_tokens')))
@@ -2438,7 +2466,33 @@ $fhPct = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('rate_limits
 $fhRst = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('rate_limits', 'five_hour', 'resets_at')))
 $wdPct = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('rate_limits', 'seven_day', 'used_percentage')))
 $wdRst = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('rate_limits', 'seven_day', 'resets_at')))
-$cost = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('cost', 'total_cost_usd')))
+$costParent = Get-JsonMember $J 'cost'
+$costNode = $null
+$costKind = 'missing'
+$costRaw = ''
+$cost = ''
+if ($null -eq $costParent) {
+    $costKind = 'missing'
+} elseif ($costParent -is [pscustomobject] -or $costParent -is [System.Collections.IDictionary]) {
+    $costNode = Get-JsonMember $costParent 'total_cost_usd'
+    if ($null -eq $costNode) {
+        $costKind = 'missing'
+    } elseif ($costNode -is [string]) {
+        $costRaw = [string]$costNode
+        $cost = Remove-ControlChars $costRaw
+        if ($costRaw.Length -gt 0) { $costKind = 'scalar' }
+    } elseif ($costNode -is [bool] -or $costNode -is [System.Array] -or $costNode -is [System.Collections.IDictionary] -or $costNode -is [pscustomobject]) {
+        $costKind = 'invalid'
+    } elseif ($costNode -is [System.IFormattable]) {
+        $costKind = 'scalar'
+        $costRaw = To-InvariantString $costNode
+        $cost = $costRaw
+    } else {
+        $costKind = 'invalid'
+    }
+} else {
+    $costKind = 'invalid'
+}
 $linesAdd = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('cost', 'total_lines_added')))
 $linesDel = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('cost', 'total_lines_removed')))
 $outStyle = Remove-ControlChars (To-InvariantString (Get-JsonPath $J @('output_style', 'name')))
@@ -2867,7 +2921,7 @@ function Add-EffortSegment {
 function Add-CtxSegment {
     $pct = 0
     $known = Get-PctValue $ctxPct ([ref]$pct)
-    if (-not $known -and $Cfg.VL_CTX_ALWAYS_SHOW -ne '1') { return }
+    if (-not $known -and ($Cfg.VL_CTX_ALWAYS_SHOW -ne '1' -or -not $JsonParsed -or -not $ctxEmpty)) { return }
     $bar = New-Bar $pct ([int]$Cfg.VL_BAR_WIDTH)
     $pfg = Get-Fg (Get-PctFg $pct)
     $dfg = Get-Fg $Cfg.VL_FG_DIM
@@ -2980,8 +3034,51 @@ function Add-BurnSegment {
 
 function Add-CostSegment {
     $value = 0.0
-    $parsed = Try-BoundedDouble $cost 0 1000000000 ([ref]$value)
-    if (($value -eq 0 -or -not $parsed) -and $Cfg.VL_COST_ALWAYS_SHOW -ne '1') { return }
+    if ($costKind -eq 'missing') {
+        if (-not $JsonParsed -or $Cfg.VL_COST_ALWAYS_SHOW -ne '1') { return }
+    } elseif ($costKind -eq 'scalar') {
+        $raw = [string]$costRaw
+        if ($raw.Length -gt 128 -or $raw -cnotmatch '\A *[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)? *\z') { return }
+        $trimmed = $raw.Trim(' ')
+        $eIndex = $trimmed.IndexOf('e')
+        $upperIndex = $trimmed.IndexOf('E')
+        if ($eIndex -lt 0 -or ($upperIndex -ge 0 -and $upperIndex -lt $eIndex)) { $eIndex = $upperIndex }
+        $significand = $trimmed
+        if ($eIndex -ge 0) { $significand = $trimmed.Substring(0, $eIndex) }
+        $lexicalNonZero = $significand -match '[1-9]'
+        if ($trimmed[0] -eq '-' -and $lexicalNonZero) { return }
+        $explicitExponent = 0
+        if ($eIndex -ge 0) {
+            $expText = $trimmed.Substring($eIndex + 1)
+            $expNegative = $expText[0] -eq '-'
+            if ($expText[0] -eq '+' -or $expNegative) { $expText = $expText.Substring(1) }
+            $expText = $expText.TrimStart('0')
+            if ([string]::IsNullOrEmpty($expText)) { $expText = '0' }
+            if ($expText.Length -gt 3) { return }
+            $expMagnitude = [int]$expText
+            if ($expMagnitude -gt 308) { return }
+            $explicitExponent = $expMagnitude
+            if ($expNegative) { $explicitExponent = -$explicitExponent }
+        }
+        if ($lexicalNonZero) {
+            $unsignedSignificand = $significand
+            if ($unsignedSignificand[0] -eq '+' -or $unsignedSignificand[0] -eq '-') { $unsignedSignificand = $unsignedSignificand.Substring(1) }
+            $dotIndex = $unsignedSignificand.IndexOf('.')
+            $integerDigits = $unsignedSignificand.Length
+            if ($dotIndex -ge 0) { $integerDigits = $dotIndex }
+            $digits = $unsignedSignificand.Replace('.', '')
+            $firstNonZero = $digits.IndexOfAny([char[]]'123456789')
+            $adjustedExponent = $explicitExponent + $integerDigits - $firstNonZero - 1
+            if ($adjustedExponent -lt -323 -or $adjustedExponent -gt 9) { return }
+            if ($adjustedExponent -eq 9 -and $digits.Substring($firstNonZero) -cnotmatch '\A10*\z') { return }
+        }
+        if (-not (Try-BoundedDouble $raw 0 1000000000 ([ref]$value))) { return }
+        if ($value -eq 0.0) {
+            if ($lexicalNonZero) { return }
+            $value = 0.0
+            if ($Cfg.VL_COST_ALWAYS_SHOW -ne '1') { return }
+        }
+    } else { return }
     $format = '$' + $value.ToString('F' + $Cfg.VL_COST_DECIMALS, $Invariant)
     $fg = Get-Fg $Cfg.VL_FG_TEXT
     Push-Segment $Cfg.VL_BG_COST "${fg} $format "

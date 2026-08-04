@@ -582,6 +582,24 @@ esac
     $repoLeaf = [System.IO.Path]::GetFileName($gitRoot)
     $basePayload = New-Payload $cwd
 
+    $compatPayload = Json $basePayload
+    $compatCases = @(
+        [pscustomobject]@{ Name='flags absent'; Lines=@('VL_SEGMENTS=ctx\ cost','VL_CLOCK=off','VL_NOCOLOR=1','VL_COST_DECIMALS=3') },
+        [pscustomobject]@{ Name='flags explicit zero'; Lines=@('VL_SEGMENTS=ctx\ cost','VL_CLOCK=off','VL_NOCOLOR=1','VL_COST_DECIMALS=3','VL_CTX_ALWAYS_SHOW=0','VL_COST_ALWAYS_SHOW=0') }
+    )
+    $compatPs = @{}
+    $compatBash = @{}
+    foreach ($compat in $compatCases) {
+        $config = New-Config ('ctx-cost-compat-' + ($compat.Name -replace ' ', '-')) $compat.Lines
+        $compatPs[$compat.Name] = Invoke-Statusline $compatPayload $config @{} '' 5000
+        $compatBash[$compat.Name] = Invoke-BashStatusline $compatPayload $config @{}
+        Check-Run ('candidate PowerShell ' + $compat.Name) ($compatPs[$compat.Name])
+        Check-Run ('candidate Bash ' + $compat.Name) ($compatBash[$compat.Name])
+        Check-Exact ('candidate ctx/cost differential ' + $compat.Name) ($compatPs[$compat.Name]) ($compatBash[$compat.Name])
+    }
+    Check-Exact 'PowerShell absent and explicit-zero flags are byte exact' ($compatPs['flags absent']) ($compatPs['flags explicit zero'])
+    Check-Exact 'Bash absent and explicit-zero flags are byte exact' ($compatBash['flags absent']) ($compatBash['flags explicit zero'])
+
     $gitParityConfig = New-Config 'git-edge-parity' @('VL_SEGMENTS=git\ project','VL_CLOCK=off')
     $unbornRoot = Join-Path $TempRoot 'empty-repo'
     [void][System.IO.Directory]::CreateDirectory($unbornRoot)
@@ -1439,6 +1457,160 @@ fi
     $tokenRun = Invoke-Statusline (Json $missingTokens) $tokenConfig @{} '' 5000
     Check-Run 'missing token values' $tokenRun
     Check 'missing token values render zero' ((Plain $tokenRun.Stdout).Contains((Glyph 0x2191) + '0 ' + (Glyph 0x2193) + '0 cr:0 cw:0'))
+
+    $ctxCostOffConfig = New-Config 'ctx-cost-matrix-off' @('VL_SEGMENTS=ctx\ cost','VL_CLOCK=off','VL_NOCOLOR=1','VL_COST_DECIMALS=3')
+    $ctxCostOnConfig = New-Config 'ctx-cost-matrix-on' @('VL_SEGMENTS=ctx\ cost','VL_CLOCK=off','VL_NOCOLOR=1','VL_COST_DECIMALS=3','VL_CTX_ALWAYS_SHOW=1','VL_COST_ALWAYS_SHOW=1')
+    $ctxCostMatrix = @(
+        [pscustomobject]@{ Name='missing'; Raw='{}'; OffCtx=$false; OffCost=$false; OnCtx=$true; OnCost=$true },
+        [pscustomobject]@{ Name='null parents'; Raw='{"context_window":null,"cost":null}'; OffCtx=$false; OffCost=$false; OnCtx=$true; OnCost=$true },
+        [pscustomobject]@{ Name='null leaves'; Raw='{"context_window":{"used_percentage":null},"cost":{"total_cost_usd":null}}'; OffCtx=$false; OffCost=$false; OnCtx=$true; OnCost=$true },
+        [pscustomobject]@{ Name='empty'; Raw='{"context_window":{"used_percentage":""},"cost":{"total_cost_usd":""}}'; OffCtx=$false; OffCost=$false; OnCtx=$true; OnCost=$true },
+        [pscustomobject]@{ Name='zero'; Raw='{"context_window":{"used_percentage":0,"total_input_tokens":0,"total_output_tokens":0,"current_usage":{"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"cost":{"total_cost_usd":0}}'; OffCtx=$true; OffCost=$false; OnCtx=$true; OnCost=$true }
+    )
+    foreach ($case in $ctxCostMatrix) {
+        $offPs = Invoke-Statusline $case.Raw $ctxCostOffConfig @{} '' 5000
+        $offBash = Invoke-BashStatusline $case.Raw $ctxCostOffConfig @{}
+        $onPs = Invoke-Statusline $case.Raw $ctxCostOnConfig @{} '' 5000
+        $onBash = Invoke-BashStatusline $case.Raw $ctxCostOnConfig @{}
+        Check-Run ('PowerShell ctx/cost matrix off ' + $case.Name) $offPs
+        Check-Run ('Bash ctx/cost matrix off ' + $case.Name) $offBash
+        Check-Run ('PowerShell ctx/cost matrix on ' + $case.Name) $onPs
+        Check-Run ('Bash ctx/cost matrix on ' + $case.Name) $onBash
+        Check-Exact ('ctx/cost matrix off differential ' + $case.Name) $offPs $offBash
+        Check-Exact ('ctx/cost matrix on differential ' + $case.Name) $onPs $onBash
+        $offText = Plain $offPs.Stdout
+        $onText = Plain $onPs.Stdout
+        Check ('ctx/cost matrix off ctx semantics ' + $case.Name) (($offText.Contains('0%') -and $offText.Contains((Glyph 0x2191) + '0 ' + (Glyph 0x2193) + '0 cr:0 cw:0')) -eq $case.OffCtx)
+        Check ('ctx/cost matrix off cost semantics ' + $case.Name) (($offText.Contains('$0.000')) -eq $case.OffCost)
+        Check ('ctx/cost matrix on ctx semantics ' + $case.Name) (($onText.Contains('0%') -and $onText.Contains((Glyph 0x2191) + '0 ' + (Glyph 0x2193) + '0 cr:0 cw:0')) -eq $case.OnCtx)
+        Check ('ctx/cost matrix on cost semantics ' + $case.Name) (($onText.Contains('$0.000')) -eq $case.OnCost)
+    }
+
+    $invalidParentMatrix = @(
+        [pscustomobject]@{ Name='context parent bool'; Raw='{"context_window":false}'; Ctx=$false; Cost=$true },
+        [pscustomobject]@{ Name='context parent array'; Raw='{"context_window":[]}'; Ctx=$false; Cost=$true },
+        [pscustomobject]@{ Name='context leaf bool'; Raw='{"context_window":{"used_percentage":false}}'; Ctx=$false; Cost=$true },
+        [pscustomobject]@{ Name='context leaf array'; Raw='{"context_window":{"used_percentage":[1]}}'; Ctx=$false; Cost=$true },
+        [pscustomobject]@{ Name='context leaf object'; Raw='{"context_window":{"used_percentage":{}}}'; Ctx=$false; Cost=$true },
+        [pscustomobject]@{ Name='context leaf float text'; Raw='{"context_window":{"used_percentage":"not-a-percent"}}'; Ctx=$true; Cost=$true },
+        [pscustomobject]@{ Name='cost parent bool'; Raw='{"cost":false}'; Ctx=$true; Cost=$false },
+        [pscustomobject]@{ Name='cost parent array'; Raw='{"cost":[]}'; Ctx=$true; Cost=$false }
+    )
+    foreach ($case in $invalidParentMatrix) {
+        $ps = Invoke-Statusline $case.Raw $ctxCostOnConfig @{} '' 5000
+        $bash = Invoke-BashStatusline $case.Raw $ctxCostOnConfig @{}
+        Check-Run ('PowerShell invalid parent ' + $case.Name) $ps
+        Check-Run ('Bash invalid parent ' + $case.Name) $bash
+        Check-Exact ('invalid parent differential ' + $case.Name) $ps $bash
+        $text = Plain $ps.Stdout
+        Check ('invalid parent ctx semantics ' + $case.Name) (($text.Contains('0%') -and $text.Contains((Glyph 0x2191) + '0 ' + (Glyph 0x2193) + '0 cr:0 cw:0')) -eq $case.Ctx)
+        Check ('invalid parent cost semantics ' + $case.Name) (($text.Contains('$0.000')) -eq $case.Cost)
+        if ($case.Name -eq 'context leaf float text') {
+            Check 'non-empty invalid ctx scalar keeps ordinary 0% parsing' ($text.Contains('0%'))
+        }
+    }
+
+    foreach ($case in @(
+        [pscustomobject]@{ Name='false'; Raw='false' },
+        [pscustomobject]@{ Name='array'; Raw='[]' },
+        [pscustomobject]@{ Name='single-object array'; Raw='[{}]' },
+        [pscustomobject]@{ Name='string'; Raw='"root"' }
+    )) {
+        $ps = Invoke-Statusline $case.Raw $ctxCostOnConfig @{} '' 5000
+        $bash = Invoke-BashStatusline $case.Raw $ctxCostOnConfig @{}
+        Check-Run ('PowerShell non-object root ' + $case.Name) $ps
+        Check-Run ('Bash non-object root ' + $case.Name) $bash
+        Check-Exact ('non-object root differential ' + $case.Name) $ps $bash
+        Check ('non-object root stays silent ' + $case.Name) ($ps.StdoutBytes.Length -eq 0)
+    }
+
+    $malformedCtxCost = '{"context_window":'
+    $malformedOnPs = Invoke-Statusline $malformedCtxCost $ctxCostOnConfig @{} '' 5000
+    $malformedOnBash = Invoke-BashStatusline $malformedCtxCost $ctxCostOnConfig @{}
+    Check-Run 'malformed whole JSON PowerShell always-show' $malformedOnPs
+    Check-Run 'malformed whole JSON Bash always-show' $malformedOnBash
+    Check-Exact 'malformed whole JSON differential is byte exact' $malformedOnPs $malformedOnBash
+    Check 'malformed whole JSON never always-shows' ($malformedOnPs.StdoutBytes.Length -eq 0)
+
+    $costOffConfig = New-Config 'cost-validation-off' @('VL_SEGMENTS=cost','VL_CLOCK=off','VL_NOCOLOR=1','VL_COST_DECIMALS=3')
+    $costOnConfig = New-Config 'cost-validation-on' @('VL_SEGMENTS=cost','VL_CLOCK=off','VL_NOCOLOR=1','VL_COST_DECIMALS=3','VL_COST_ALWAYS_SHOW=1')
+    $validCostCases = @(
+        [pscustomobject]@{ Name='spaced integer'; Literal='" 1 "'; Expected='$1.000'; Zero=$false },
+        [pscustomobject]@{ Name='explicit plus'; Literal='"+1"'; Expected='$1.000'; Zero=$false },
+        [pscustomobject]@{ Name='leading decimal'; Literal='".5"'; Expected='$0.500'; Zero=$false },
+        [pscustomobject]@{ Name='trailing decimal'; Literal='"1."'; Expected='$1.000'; Zero=$false },
+        [pscustomobject]@{ Name='leading zero integer'; Literal='"01"'; Expected='$1.000'; Zero=$false },
+        [pscustomobject]@{ Name='positive exponent'; Literal='"1e+2"'; Expected='$100.000'; Zero=$false },
+        [pscustomobject]@{ Name='exact maximum'; Literal='"1000000000"'; Expected='$1000000000.000'; Zero=$false },
+        [pscustomobject]@{ Name='exponent-equivalent maximum'; Literal='"0.1e10"'; Expected='$1000000000.000'; Zero=$false },
+        [pscustomobject]@{ Name='minimum normalized exponent'; Literal='"0.000000000000001e-308"'; Expected='$0.000'; Zero=$false },
+        [pscustomobject]@{ Name='string negative zero'; Literal='"-0"'; Zero=$true },
+        [pscustomobject]@{ Name='string negative decimal zero'; Literal='"-0.0"'; Zero=$true },
+        [pscustomobject]@{ Name='string negative exponent zero'; Literal='"-0e10"'; Zero=$true },
+        [pscustomobject]@{ Name='number negative zero'; Literal='-0'; Zero=$true },
+        [pscustomobject]@{ Name='number negative decimal zero'; Literal='-0.0'; Zero=$true },
+        [pscustomobject]@{ Name='number negative exponent zero'; Literal='-0e10'; Zero=$true },
+        [pscustomobject]@{ Name='large exponent zero'; Literal='"0e308"'; Zero=$true },
+        [pscustomobject]@{ Name='128-character zero'; Literal=('"' + (('0' * 128) -join '') + '"'); Zero=$true }
+    )
+    foreach ($case in $validCostCases) {
+        $raw = '{"cost":{"total_cost_usd":' + $case.Literal + '}}'
+        $offPs = Invoke-Statusline $raw $costOffConfig @{} '' 5000
+        $offBash = Invoke-BashStatusline $raw $costOffConfig @{}
+        $onPs = Invoke-Statusline $raw $costOnConfig @{} '' 5000
+        $onBash = Invoke-BashStatusline $raw $costOnConfig @{}
+        Check-Run ('PowerShell valid cost ' + $case.Name) $offPs
+        Check-Run ('Bash valid cost ' + $case.Name) $offBash
+        Check-Run ('PowerShell valid cost always-show ' + $case.Name) $onPs
+        Check-Run ('Bash valid cost always-show ' + $case.Name) $onBash
+        Check-Exact ('valid cost differential ' + $case.Name) $offPs $offBash
+        Check-Exact ('valid cost always-show differential ' + $case.Name) $onPs $onBash
+        if ($case.Zero) {
+            Check ('valid zero off suppresses ' + $case.Name) ($offPs.StdoutBytes.Length -eq 0)
+            Check ('valid zero on formats positive zero ' + $case.Name) ((Plain $onPs.Stdout).Contains('$0.000'))
+        } else {
+            Check ('valid nonzero off formats expected value ' + $case.Name) ((Plain $offPs.Stdout).Contains($case.Expected))
+            Check ('valid nonzero on formats expected value ' + $case.Name) ((Plain $onPs.Stdout).Contains($case.Expected))
+        }
+    }
+
+    $invalidCostLiterals = @(
+        [pscustomobject]@{ Name='bool'; Literal='false' },
+        [pscustomobject]@{ Name='array'; Literal='[]' },
+        [pscustomobject]@{ Name='object'; Literal='{}' },
+        [pscustomobject]@{ Name='whitespace'; Literal='" "' },
+        [pscustomobject]@{ Name='negative'; Literal='-1' },
+        [pscustomobject]@{ Name='negative-underflow'; Literal='"-0.00000000000000000001e-308"' },
+        [pscustomobject]@{ Name='positive-underflow'; Literal='"0.00000000000000000001e-308"' },
+        [pscustomobject]@{ Name='nan'; Literal='"NaN"' },
+        [pscustomobject]@{ Name='infinity'; Literal='"Infinity"' },
+        [pscustomobject]@{ Name='exponent-overflow-string'; Literal='"1e999"' },
+        [pscustomobject]@{ Name='exponent-overflow-number'; Literal='1e999' },
+        [pscustomobject]@{ Name='fraction-above-range'; Literal='"1000000000.000000001"' },
+        [pscustomobject]@{ Name='exponent-fraction-above-range'; Literal='"0.10000000001e10"' },
+        [pscustomobject]@{ Name='range'; Literal='1000000001' },
+        [pscustomobject]@{ Name='hex'; Literal='"0x10"' },
+        [pscustomobject]@{ Name='partial'; Literal='"1x"' },
+        [pscustomobject]@{ Name='spaced'; Literal='"1 2"' },
+        [pscustomobject]@{ Name='exponent-cap'; Literal='"0e309"' },
+        [pscustomobject]@{ Name='negative-exponent-cap'; Literal='"1e-323"' },
+        [pscustomobject]@{ Name='length-over'; Literal=('"' + (('0' * 129) -join '') + '"') }
+    )
+    foreach ($case in $invalidCostLiterals) {
+        $raw = '{"cost":{"total_cost_usd":' + $case.Literal + '}}'
+        $offPs = Invoke-Statusline $raw $costOffConfig @{} '' 5000
+        $offBash = Invoke-BashStatusline $raw $costOffConfig @{}
+        $onPs = Invoke-Statusline $raw $costOnConfig @{} '' 5000
+        $onBash = Invoke-BashStatusline $raw $costOnConfig @{}
+        Check-Run ('PowerShell invalid cost ' + $case.Name) $offPs
+        Check-Run ('Bash invalid cost ' + $case.Name) $offBash
+        Check-Run ('PowerShell invalid cost always-show ' + $case.Name) $onPs
+        Check-Run ('Bash invalid cost always-show ' + $case.Name) $onBash
+        Check-Exact ('invalid cost differential ' + $case.Name) $offPs $offBash
+        Check-Exact ('invalid cost always-show differential ' + $case.Name) $onPs $onBash
+        Check ('invalid cost off is silent ' + $case.Name) ($offPs.StdoutBytes.Length -eq 0)
+        Check ('invalid cost always-show is silent ' + $case.Name) ($onPs.StdoutBytes.Length -eq 0)
+    }
 
     $largeTokens = Clone-Object $basePayload
     $largeTokens.context_window.total_input_tokens = '9999999999999999'

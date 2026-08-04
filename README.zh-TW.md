@@ -392,6 +392,8 @@ bootstrap 會驗證兩者、在下載 `install.ps1` 前解析可變 Ref，再把
 | `VL_PATH_DEPTH` | `4` | 路徑超過此深度即摺疊 |
 | `VL_NAME_MAX` | `0` | `project` / `git` 名稱超過此字數即以 `…` 截斷（`0` = 關閉） |
 | `VL_COST_DECIMALS` | `2` | 費用顯示的小數位數 |
+| `VL_CTX_ALWAYS_SHOW` | `0` | 設為 `1` 時，頂層為物件的 JSON 中缺少、`null` 或精確空字串的 context 值會顯示 0% 量表與零 token 數；JSON 格式錯誤或頂層非物件時不會觸發，非空 context 值仍沿用一般百分比處理 |
+| `VL_COST_ALWAYS_SHOW` | `0` | 設為 `1` 時，頂層為物件的 JSON 中缺少、`null` 或精確空字串的費用會顯示 `$0.00`；無效型別與數值仍隱藏 |
 | `VL_WARN_PCT` / `VL_HOT_PCT` | `50` / `75` | 量表變色門檻 |
 | `VL_ASCII` | `0` | 設為 `1` 停用 Nerd Font 字符 |
 | `VL_RUNTIME_PROBE` | `0` | `node` / `python`：設為 `1` 時，若無 pin 檔則改用 `PATH` 上的 `node` / `python3` 偵測（每次繪製會 fork） |

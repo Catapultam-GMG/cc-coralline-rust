@@ -57,6 +57,8 @@ VL_CLOCK_SECONDS=1
 VL_PATH_DEPTH=4                 # collapse paths deeper than this
 VL_NAME_MAX=0                   # max chars for project/git names before … truncation (0 = off)
 VL_COST_DECIMALS=2
+VL_CTX_ALWAYS_SHOW=0            # 1 = show an empty valid context window as 0%
+VL_COST_ALWAYS_SHOW=0            # 1 = show a missing valid cost as $0.00
 VL_WARN_PCT=50                  # percentage thresholds for bar colors
 VL_HOT_PCT=75
 VL_ASCII=0                      # 1 = no Nerd Font glyphs (plain colored blocks)
@@ -1268,9 +1270,14 @@ seg_model() {  # active Claude model
 }
 
 seg_ctx() {  # context-window gauge with input/output/cache token counts
-  [ -n "$ctx_pct" ] || return 0
+  if [ -z "$ctx_pct" ]; then
+    [ "$VL_CTX_ALWAYS_SHOW" = 1 ] && [ "${_JSON_OK:-0}" = 1 ] \
+      && [ "${_CTX_EMPTY:-0}" = 1 ] || return 0
+  fi
   local ci fgc fgd ti to tcr tcw
-  printf -v ci '%.0f' "$ctx_pct" 2>/dev/null || ci=0
+  if [ -n "$ctx_pct" ]; then printf -v ci '%.0f' "$ctx_pct" 2>/dev/null || ci=0
+  else ci=0
+  fi
   make_bar "$ci"; pct_fg "$ci"
   fg "$_PFG";       fgc="$_FG"
   fg "$VL_FG_DIM";  fgd="$_FG"
@@ -1362,9 +1369,74 @@ seg_limit7d() {  # 7d rate-limit gauge with reset countdown
 }
 
 seg_cost() {  # session cost in USD
-  [ -n "$cost" ] && [ "$cost" != "0" ] || return 0
-  local fmt
-  printf -v fmt "\$%.${VL_COST_DECIMALS}f" "$cost" 2>/dev/null || fmt="\$$cost"
+  local raw="${cost:-}" trimmed significand lexical_nonzero unsigned digits integer_part leading_zeroes significant exp_text exp_sign exp_value adjusted_exp fixed integer integer_len fraction parsed fmt LC_ALL=C
+  case "${_COST_KIND:-invalid}" in
+    missing)
+      [ "$VL_COST_ALWAYS_SHOW" = 1 ] && [ "${_JSON_OK:-0}" = 1 ] || return 0
+      raw=0
+      ;;
+    scalar) ;;
+    (*) return 0 ;;
+  esac
+
+  if [ "${_COST_KIND:-invalid}" = scalar ]; then
+    [ "${#raw}" -le 128 ] || return 0
+    [[ "$raw" =~ ^\ *[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?\ *$ ]] || return 0
+    trimmed="${raw#"${raw%%[! ]*}"}"
+    trimmed="${trimmed%"${trimmed##*[! ]}"}"
+    raw="$trimmed"
+    significand="${trimmed%%[eE]*}"
+    case "$significand" in (*[1-9]*) lexical_nonzero=1 ;; (*) lexical_nonzero=0 ;; esac
+    case "$trimmed" in (-*) [ "$lexical_nonzero" = 1 ] && return 0 ;; esac
+    case "$trimmed" in *[eE]*) exp_text="${trimmed##*[eE]}" ;; *) exp_text=0 ;; esac
+    case "$exp_text" in
+      (-*) exp_sign=-1; exp_text="${exp_text:1}" ;;
+      (+*) exp_sign=1; exp_text="${exp_text:1}" ;;
+      (*) exp_sign=1 ;;
+    esac
+    exp_text="${exp_text#"${exp_text%%[!0]*}"}"
+    [ -n "$exp_text" ] || exp_text=0
+    [ "${#exp_text}" -le 3 ] || return 0
+    [ "$exp_text" -le 308 ] 2>/dev/null || return 0
+    exp_value=$exp_text
+    [ "$exp_sign" = -1 ] && exp_value=$(( -exp_value ))
+    if [ "$lexical_nonzero" = 1 ]; then
+      unsigned="${significand#[-+]}"
+      case "$unsigned" in (*.*) integer_part="${unsigned%%.*}" ;; (*) integer_part="$unsigned" ;; esac
+      digits="${unsigned/./}"
+      leading_zeroes="${digits%%[1-9]*}"
+      adjusted_exp=$(( exp_value + ${#integer_part} - ${#leading_zeroes} - 1 ))
+      [ "$adjusted_exp" -ge -323 ] || return 0
+      [ "$adjusted_exp" -le 9 ] || return 0
+      if [ "$adjusted_exp" = 9 ]; then
+        significant="${digits:${#leading_zeroes}}"
+        [[ "$significant" =~ ^10*$ ]] || return 0
+      fi
+    fi
+    parsed=""
+    LC_ALL=C printf -v parsed '%.17g' "$raw" 2>/dev/null || :
+    case "$parsed" in (*inf*|*nan*|'') return 0 ;; esac
+    case "$parsed" in (-0) raw=0; parsed=0 ;; (-*) return 0 ;; esac
+    [ "$parsed" = 0 ] && [ "$lexical_nonzero" = 1 ] && return 0
+    fixed=""
+    LC_ALL=C printf -v fixed '%.17f' "$raw" 2>/dev/null || :
+    case "$fixed" in (*inf*|*nan*|'') return 0 ;; esac
+    integer="${fixed%%.*}"
+    integer="${integer#"${integer%%[!0]*}"}"
+    [ -n "$integer" ] || integer=0
+    integer_len=${#integer}
+    [ "$integer_len" -le 10 ] || return 0
+    [ "$integer_len" -ne 10 ] || { [ "$integer" \> 1000000000 ] && return 0; }
+    if [ "$integer" = 1000000000 ]; then
+      fraction="${fixed#*.}"
+      case "$fraction" in *[1-9]*) return 0 ;; esac
+    fi
+    [ "$parsed" = 0 ] && { [ "$VL_COST_ALWAYS_SHOW" = 1 ] && [ "${_JSON_OK:-0}" = 1 ] || return 0; raw=0; }
+  fi
+
+  fmt=""
+  LC_ALL=C printf -v fmt "\$%.${VL_COST_DECIMALS}f" "$raw" 2>/dev/null || :
+  [ -n "$fmt" ] || return 0
   fg "$VL_FG_TEXT"
   push "$VL_BG_COST" "${_FG} ${fmt} "
 }
@@ -1720,30 +1792,60 @@ fi
 # ── Parse JSON (single jq call) ──────────────────────────────────────────────
 # Fields are joined with \x1f (unit separator): unlike tab, a non-whitespace
 # IFS preserves empty fields instead of collapsing consecutive delimiters.
-IFS=$'\037' read -r cwd model ctx_pct tok_in tok_out tok_cr tok_cw \
-                 fh_pct fh_rst wd_pct wd_rst cost \
-                 lines_add lines_del out_style dur_ms effort <<JSON
-$(printf '%s' "$input" | jq -r '
+_JSON_OK=0; _CTX_EMPTY=0; _COST_KIND=invalid; _JSON_FIELDS=""
+if _JSON_FIELDS=$(printf '%s' "$input" | jq -r '
   def scrub: tostring | gsub("[\\x00-\\x1f\\x7f\u0080-\u009f]"; "");
+  def member($obj; $name):
+    if ($obj|type) == "object" and ($obj|has($name)) then $obj[$name] else null end;
+  def ctx_value:
+    member(member(.; "context_window"); "used_percentage") as $value |
+    if ($value|type) == "number" or ($value|type) == "string" then $value else null end;
+  def ctx_empty:
+    (member(.; "context_window")) as $ctx |
+    if $ctx == null then true
+    elif ($ctx|type) != "object" then false
+    elif (($ctx|has("used_percentage")) == false) then true
+    else (($ctx.used_percentage == null) or (($ctx.used_percentage|type) == "string" and $ctx.used_percentage == "")) end;
+  def cost_value:
+    member(member(.; "cost"); "total_cost_usd");
+  if type != "object" then error("non-object root") else
   [
-    (.workspace.current_dir // .cwd // ""),
-    (.model.display_name // ""),
-    (.context_window.used_percentage // "" | tostring),
-    (.context_window.total_input_tokens // 0),
-    (.context_window.total_output_tokens // 0),
-    (.context_window.current_usage.cache_read_input_tokens // 0),
-    (.context_window.current_usage.cache_creation_input_tokens // 0),
-    (.rate_limits.five_hour.used_percentage // "" | tostring),
-    (.rate_limits.five_hour.resets_at // "" | tostring),
-    (.rate_limits.seven_day.used_percentage // "" | tostring),
-    (.rate_limits.seven_day.resets_at // "" | tostring),
-    (.cost.total_cost_usd // "" | tostring),
-    (.cost.total_lines_added // 0),
-    (.cost.total_lines_removed // 0),
-    (.output_style.name // ""),
-    (.cost.total_duration_ms // 0),
-    (.effort.level // "")
-  ] | map(scrub) | join("")' 2>/dev/null)
+    (member(member(.; "workspace"); "current_dir") // member(.; "cwd") // ""),
+    (member(member(.; "model"); "display_name") // ""),
+    (ctx_value | if (. == null) or (. == false) then "" else tostring end),
+    (ctx_empty | if . then "1" else "0" end),
+    (member(member(.; "context_window"); "total_input_tokens") // 0),
+    (member(member(.; "context_window"); "total_output_tokens") // 0),
+    (member(member(member(.; "context_window"); "current_usage"); "cache_read_input_tokens") // 0),
+    (member(member(member(.; "context_window"); "current_usage"); "cache_creation_input_tokens") // 0),
+    (member(member(member(.; "rate_limits"); "five_hour"); "used_percentage") // "" | tostring),
+    (member(member(member(.; "rate_limits"); "five_hour"); "resets_at") // "" | tostring),
+    (member(member(member(.; "rate_limits"); "seven_day"); "used_percentage") // "" | tostring),
+    (member(member(member(.; "rate_limits"); "seven_day"); "resets_at") // "" | tostring),
+    (cost_value | if (. == null) or (. == false) then "" else tostring end),
+    ((member(.; "cost")) as $cost |
+      if $cost == null then "missing"
+      elif ($cost|type) != "object" then "invalid"
+      elif (($cost|has("total_cost_usd")) == false) then "missing"
+      else (member($cost; "total_cost_usd")) as $v |
+        if ($v == null) or (($v|type) == "string" and $v == "") then "missing"
+        elif (($v|type) == "string" and (($v|scrub) != $v)) then "invalid"
+        elif (($v|type) == "string") or (($v|type) == "number") then "scalar"
+        else "invalid" end
+      end),
+    (member(member(.; "cost"); "total_lines_added") // 0),
+    (member(member(.; "cost"); "total_lines_removed") // 0),
+    (member(member(.; "output_style"); "name") // ""),
+    (member(member(.; "cost"); "total_duration_ms") // 0),
+    (member(member(.; "effort"); "level") // "")
+  ] | map(scrub) | join("\u001f")
+  end' 2>/dev/null); then
+  _JSON_OK=1
+fi
+IFS=$'\037' read -r cwd model ctx_pct _CTX_EMPTY tok_in tok_out tok_cr tok_cw \
+                 fh_pct fh_rst wd_pct wd_rst cost _COST_KIND \
+                 lines_add lines_del out_style dur_ms effort <<JSON
+$_JSON_FIELDS
 JSON
 
 _SEG_SCAN=" $VL_SEGMENTS $VL_SEGMENTS2 $VL_SEGMENTS3 "
