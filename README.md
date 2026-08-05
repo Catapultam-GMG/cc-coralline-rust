@@ -415,6 +415,8 @@ Everything lives in `~/.claude/coralline.conf` (plain bash, sourced by the scrip
 | `VL_PATH_DEPTH` | `4` | collapse paths deeper than this |
 | `VL_NAME_MAX` | `0` | max chars for the `project` / `git` names before `…` truncation (`0` = off) |
 | `VL_COST_DECIMALS` | `2` | decimal places for the cost segment |
+| `VL_CTX_ALWAYS_SHOW` | `0` | `1` = show an object JSON payload's missing, `null`, or exact-empty context value as a 0% gauge with zero token counts; malformed or non-object payloads do not trigger it, and non-empty context values keep normal percentage handling |
+| `VL_COST_ALWAYS_SHOW` | `0` | `1` = show an object JSON payload's missing, `null`, or exact-empty cost as `$0.00`; invalid types and values stay hidden |
 | `VL_WARN_PCT` / `VL_HOT_PCT` | `50` / `75` | gauge color thresholds |
 | `VL_ASCII` | `0` | `1` disables Nerd Font glyphs |
 | `VL_RUNTIME_PROBE` | `0` | `node` / `python`: `1` = also detect via `node` / `python3` on `PATH` when no pin file (forks per render) |
