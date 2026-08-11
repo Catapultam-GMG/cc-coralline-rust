@@ -1,364 +1,776 @@
 #!/usr/bin/env bash
-# Unit tests for the burn-rate segment helpers. Each function is pulled live
-# from statusline.sh so the tests can never drift from the implementation.
-#   bash test/test-burn.sh
+# Mutable Bash burn / limit state regressions. Helpers are extracted live from
+# statusline.sh so validation, estimators, and trust-boundary checks cannot drift.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 SCRIPT="$HERE/../statusline.sh"
-TMPD=$(mktemp -d)
-trap 'rm -rf "$TMPD"' EXIT
+case "$(uname -s)" in Darwin) TEST_TMP=/private/tmp ;; *) TEST_TMP=${TMPDIR:-/tmp} ;; esac
+TMPD=$(mktemp -d "$TEST_TMP/coralline-burn.XXXXXX")
+trap 'rm -rf "$TMPD"' EXIT HUP INT TERM
 fail=0
-ok()   { printf 'ok    %s\n' "$1"; }
-bad()  { printf 'FAIL  %s — %s\n' "$1" "$2"; fail=1; }
-eq()   { [ "$2" = "$3" ] && ok "$1" || bad "$1" "want=$3 got=$2"; }
+pass=0
+ok() { printf 'ok    %s\n' "$1"; pass=$((pass + 1)); }
+bad() { printf 'FAIL  %s — %s\n' "$1" "$2"; fail=$((fail + 1)); }
+eq() { [ "$2" = "$3" ] && ok "$1" || bad "$1" "want=$3 got=$2"; }
+true_case() { local name="$1"; shift; if "$@"; then ok "$name"; else bad "$name" "condition failed"; fi; }
+file_bytes() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else printf '0\n'; fi; }
+entry_count() {
+  _COUNT=0
+  [ -d "$1" ] || return 0
+  for _CE in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -e "$_CE" ] || [ -L "$_CE" ] || continue
+    _COUNT=$(( _COUNT + 1 ))
+  done
+}
+snapshot_tree() {
+  local path="$1" archive="$2" parent base
+  parent=${path%/*}; base=${path##*/}; [ -n "$parent" ] || parent=/
+  (cd "$parent" && COPYFILE_DISABLE=1 LC_ALL=C tar -cf "$archive" "$base") 2>/dev/null
+}
+old_mtimes() { find "$1" -exec touch -t 202001010000 {} + 2>/dev/null; }
 
-# Pull the helpers under test out of the real script.
-eval "$(sed -n '/^to_epoch() {/,/^}/p'     "$SCRIPT")"
-eval "$(sed -n '/^fmt_eta() {/,/^}/p'       "$SCRIPT")"
-eval "$(sed -n '/^burn_sample() {/,/^}/p'   "$SCRIPT")"
+# Pull production implementations. Every extracted function closes at column 0.
+eval "$(sed -n '/^iso_epoch() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^to_epoch() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^fmt_eta() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^state_pct() {/,/^seg_burn() {/p' "$SCRIPT" | sed '$d')"
+eval "$(sed -n '/^fg() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^push() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^seg_burn() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^make_bar() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^pct_fg() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^fmt_countdown() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^seg_limit() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^seg_limit_elapsed() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^seg_limit5h() {/,/^}/p' "$SCRIPT")"
+eval "$(sed -n '/^seg_limit7d() {/,/^}/p' "$SCRIPT")"
 
-# Per-window sentinel ceilings the samplers reference (mirrors statusline.sh; #32).
-RL_MAX_5H=$(( 6 * 3600 )); RL_MAX_7D=$(( 8 * 86400 ))
-
-# fmt_eta
-fmt_eta 0;       eq "fmt_eta 0m"     "$_ETA" "0m"
-fmt_eta 2820;    eq "fmt_eta 47m"    "$_ETA" "47m"
-fmt_eta 7080;    eq "fmt_eta 1h58m"  "$_ETA" "1h58m"
-fmt_eta 127800;  eq "fmt_eta 1d11h"  "$_ETA" "1d11h"
-
-# burn_sample appends one row with the reset converted to epoch
-BURN_FILE="$TMPD/burn.tsv"
-burn_sample 1781794590 6 1781811000
-eq "sample row" "$(cat "$BURN_FILE")" "$(printf '1781794590\t6\t1781811000')"
-
-# empty pct → no-op (file unchanged)
-burn_sample 1781794600 "" 1781811000
-eq "sample empty-pct no-op" "$(wc -l < "$BURN_FILE" | tr -d ' ')" "1"
-
-# missing parent dir → created on demand, sample still written (issue #17 bug)
-BURN_FILE="$TMPD/nodir/burn.tsv"
-burn_sample 1781794590 6 1781811000
-eq "sample creates missing dir" "$(cat "$BURN_FILE" 2>/dev/null)" "$(printf '1781794590\t6\t1781811000')"
-
-eval "$(sed -n '/^burn_eta_5h() {/,/^}/p' "$SCRIPT")"
+RL_MAX_5H=21600
+RL_MAX_7D=691200
 CORALLINE_BURN_WINDOW=600
 BURN_TRIM=1500
+VL_LIMIT_SYNC=0
+CORALLINE_NO_SAMPLE=0
+BASH_BIN=${BASH:-bash}
 
-# rl_sample / rl_latest: directory-as-set high-water store (cross-session limit sync).
-# Entry = <reset:%010d>_<pct:%07.3f> dir; read = max; gc = drop below-max. So pct
-# reads back fixed-width (e.g. 034.000), which display (%.0f) and burn (awk +0) parse.
-eval "$(sed -n '/^rl_dir() {/,/^}/p'    "$SCRIPT")"
-eval "$(sed -n '/^rl_sample() {/,/^}/p' "$SCRIPT")"
-eval "$(sed -n '/^rl_latest() {/,/^}/p' "$SCRIPT")"
-RLF="$TMPD/limit.tsv"
-# mixed windows: current window = latest reset (2000), its max pct = 34. pct 51
-# belongs to an OLDER window (reset 1500) and must not win.
-rl_sample "$RLF" 10 1000; rl_sample "$RLF" 34 2000; rl_sample "$RLF" 31 2000
-rl_sample "$RLF" 9 2000;  rl_sample "$RLF" 51 1500
-rl_latest "$RLF"
-eq "rl_latest pct" "$_LL_PCT" "034.000"
-eq "rl_latest rst" "$_LL_RST" "2000"
-# same-window cache-lag: highest pct wins regardless of insertion order
-rm -rf "$TMPD/limit.d"
-rl_sample "$RLF" 40 2000; rl_sample "$RLF" 44 2000; rl_sample "$RLF" 41 2000
-rl_latest "$RLF"; eq "rl_latest same-window max" "$_LL_PCT" "044.000"
-# fractional pct preserved (not quantized to an integer)
-rm -rf "$TMPD/limit.d"
-rl_sample "$RLF" 41.2 2000
-rl_latest "$RLF"; eq "rl_latest float pct" "$_LL_PCT" "041.200"
-# missing store → empty (caller falls back to the session's own snapshot)
-rl_latest "$TMPD/none.tsv"; eq "rl_latest missing" "$_LL_PCT" ""
-# a brand-new window (later reset, lower pct) supersedes the old high-water
-rm -rf "$TMPD/limit.d"
-rl_sample "$RLF" 80 2000; rl_sample "$RLF" 3 9000
-rl_latest "$RLF"; eq "rl_latest new window pct" "$_LL_PCT" "003.000"
-eq "rl_latest new window rst" "$_LL_RST" "9000"
-# leading-zero reset must decode as decimal, not octal (10# guard)
-rm -rf "$TMPD/limit.d"
-rl_sample "$RLF" 5 8; rl_latest "$RLF"; eq "rl_latest octal-safe rst" "$_LL_RST" "8"
-# gc keeps only the current-window high-water entry after a read
-rm -rf "$TMPD/limit.d"
-rl_sample "$RLF" 50 2000; rl_sample "$RLF" 48 2000; rl_sample "$RLF" 47 2000
-rl_latest "$RLF"
-eq "rl_latest gc keeps one" "$(ls -1 "$TMPD/limit.d" | wc -l | tr -d ' ')" "1"
-rl_latest "$RLF"; eq "rl_latest gc keeps max" "$_LL_PCT" "050.000"
-# migration: a legacy flat-file store is removed when the dir-set is first created
-rm -rf "$TMPD/limit.d"; printf 'x' > "$TMPD/limit.tsv"
-rl_sample "$RLF" 12 2000
-eq "rl legacy flat-file removed" "$([ -e "$TMPD/limit.tsv" ] && echo present || echo gone)" "gone"
-eq "rl dir-set created"          "$([ -d "$TMPD/limit.d" ]  && echo yes || echo no)" "yes"
+# Strict payload canonicalization. Oversized input is rejected before regex or arithmetic.
+pct_case() {
+  if state_pct "$2"; then eq "$1 milli" "$_SP_MILLI" "$3"; eq "$1 canonical" "$_SP_CANON" "$4"
+  else bad "$1" "unexpected rejection"; fi
+}
+pct_reject() { if state_pct "$2"; then bad "$1" "accepted as $_SP_CANON"; else ok "$1"; fi; }
+pct_case 'pct zero' '0' 0 '000.000'
+pct_case 'pct integer' '41' 41000 '041.000'
+pct_case 'pct midpoint even' '1.2345' 1234 '001.234'
+pct_case 'pct midpoint odd' '1.2355' 1236 '001.236'
+pct_case 'pct carry to 100' '99.9995' 100000 '100.000'
+for _BAD_PCT in -0 00 01 +1 ' 1' '1 ' 100.000001 101 1,2 1e2 NaN Infinity 1.1234567 .5 12345678901; do
+  pct_reject "pct rejects $_BAD_PCT" "$_BAD_PCT"
+done
+printf -v _LONG_PCT '%5000s' ''; _LONG_PCT=${_LONG_PCT// /9}
+pct_reject 'pct rejects oversized printable value' "$_LONG_PCT"
 
-# sentinel guard (#32): a far-future reset (e.g. sample-input.json's year-2030
-# preview value) must be dropped when NOW is known, so a preview render can never
-# win the high-water and prune the real window. NOW is set for these cases only.
-RLS="$TMPD/limit-sentinel.tsv"; NOW=1781794590
-rl_sample "$RLS" 30 1781811000 "$RL_MAX_5H"           # real ~4.5h window: kept
-rl_sample "$RLS" 99 1893490200 "$RL_MAX_5H"           # 2030 sentinel: dropped
-rl_latest "$RLS" "$RL_MAX_5H"
-eq "rl_sample drops sentinel pct" "$_LL_PCT" "030.000"
-eq "rl_sample drops sentinel rst" "$_LL_RST" "1781811000"
-# per-window ceiling: a 5h reset days out is corrupt (a 5h window resets within
-# hours), but the same offset is valid for the 7d window. The ceiling is the caller's.
-RLW="$TMPD/limit-window.tsv"; twodays=$(( NOW + 2*86400 ))
-rl_sample "$RLW" 20 "$twodays" "$RL_MAX_5H"           # 2d out under 5h ceiling: dropped
-rl_latest "$RLW" "$RL_MAX_5H"; eq "rl 5h ceiling drops 2d reset" "$_LL_PCT" ""
-rl_sample "$RLW" 20 "$twodays" "$RL_MAX_7D"           # 2d out under 7d ceiling: kept
-rl_latest "$RLW" "$RL_MAX_7D"; eq "rl 7d ceiling keeps 2d reset" "$_LL_PCT" "020.000"
-# read-side heal: a store poisoned BEFORE this fix already holds the sentinel entry.
-# On read rl_latest must ignore it for the high-water AND rmdir it, so the next real
-# render recovers instead of staying pinned.
-RLH="$TMPD/limit-heal.tsv"; rl_dir "$RLH"; mkdir -p "$_RLD"
-mkdir "$_RLD/1781811000_030.000" "$_RLD/1893490200_099.000"   # real entry + 2030 sentinel
-rl_latest "$RLH" "$RL_MAX_5H"
-eq "rl_latest heals poisoned pct"  "$_LL_PCT" "030.000"
-eq "rl_latest heals poisoned rst"  "$_LL_RST" "1781811000"
-eq "rl_latest prunes sentinel dir" "$([ -d "$_RLD/1893490200_099.000" ] && echo present || echo gone)" "gone"
-# burn_sample applies the 5h bound, keyed off its own now ($1)
-BURN_FILE="$TMPD/burn-sentinel.tsv"
-burn_sample 1781794590 50 1781811000                  # real window: appended
-burn_sample 1781794590 99 1893490200                  # 2030 sentinel: dropped
-eq "burn_sample drops sentinel" "$([ -f "$BURN_FILE" ] && wc -l < "$BURN_FILE" | tr -d ' ' || echo 0)" "1"
-NOW=""
+state_epoch 0 12; eq 'epoch zero' "$_SE_PAD" '000000000000'
+state_epoch 253402300799 12; eq 'epoch max' "$_SE_VALUE" '253402300799'
+state_epoch 9999999999 10; eq 'limit epoch max' "$_SE_PAD" '9999999999'
+for _BAD_EP in -0 +1 01 1.0 253402300800 10000000000 9999999999999; do
+  if state_epoch "$_BAD_EP" 10; then bad "epoch rejects $_BAD_EP" "accepted $_SE_PAD"; else ok "epoch rejects $_BAD_EP"; fi
+done
+state_payload_epoch '2026-07-31T12:34:56Z' 10 && ok 'canonical ISO epoch accepted' || bad 'canonical ISO epoch accepted' rejected
+for _BAD_ISO in '2026-07-31 12:34:56Z' '2026-07-31T12:34:56+00:00' '2026-07-31T12:34:56.1234567Z'; do
+  if state_payload_epoch "$_BAD_ISO" 10; then bad "ISO rejects $_BAD_ISO" accepted; else ok "ISO rejects $_BAD_ISO"; fi
+done
 
-# helper: write a fixture and run the estimator at a given "now"
-run5h() { BURN_FILE="$TMPD/b5.tsv"; printf '%b' "$1" > "$BURN_FILE"; NOW="$2"; burn_eta_5h; }
+state_round_even 5 2; eq 'round-even 2.5 to even' "$_RE" 2
+state_round_even 7 2; eq 'round-even 3.5 to even' "$_RE" 4
+state_rate10 10000000000 3; eq 'rate non-divisible' "$_RATE10" '0.3333333333'
+state_rate10 19999999999 2; eq 'rate rounding carry' "$_RATE10" '1.0000000000'
 
-# active: 6→7 at +60s, 7→8 at +300s; now=+360s; reset 4h25m out.
-# crossings in window: (60,7),(300,8) → rate=(8-7)/(300-60)=1/240 %/s
-# now pct=8 → ETA=(100-8)/(1/240)=22080s=6h08m
-run5h "1000000\t6\t1015900\n1000060\t7\t1015900\n1000300\t8\t1015900\n1000360\t8\t1015900\n" 1000360
-eq "5h active state" "$_B5_STATE" "active"
-eq "5h active eta"   "$_B5_ETA"   "22080"
-eq "5h ttr"          "$_B5_TTR"   "15540"
+# Lexical path normalization and strict limit basename parsing stay fork-free.
+_PWD_SAVE=$PWD
+cd "$TMPD"
+state_store_path relative.tsv; eq 'relative store root' "$_SS_ROOT" "$TMPD/relative.d"
+state_store_path C:/tmp/state.tsv; eq 'native drive store root' "$_SS_ROOT" '/c/tmp/state.d'
+state_store_path 'C:\tmp\state.tsv'; eq 'backslash drive store root' "$_SS_ROOT" '/c/tmp/state.d'
+cd "$_PWD_SAVE"
+state_limit_name '0001015900_041.200'; eq 'limit name reset' "$_SLN_RST" 1015900; eq 'limit name pct' "$_SLN_PCT" 41200
+for _BAD_NAME in '1015900_041.200' '0001015900_41.200' '0001015900_101.000' '0001015900_041.200x' '1+1_041.200' 'x[$(touch${IFS}pwn)]_041.200'; do
+  if state_limit_name "$_BAD_NAME" 2>/dev/null; then bad "limit name rejects $_BAD_NAME" accepted; else ok "limit name rejects $_BAD_NAME"; fi
+done
 
-# read-side heal: a burn file poisoned before this fix holds a far-future reset row.
-# burn_eta_5h must ignore it (fit the real window, not stay warming) and purge it,
-# so the same active fit lands and the sentinel row is gone from the file.
-run5h "1000000\t6\t1015900\n1000060\t7\t1015900\n1000300\t8\t1015900\n1000360\t8\t1015900\n9999000\t41\t99999999\n" 1000360
-eq "burn read ignores sentinel state" "$_B5_STATE" "active"
-eq "burn read ignores sentinel eta"   "$_B5_ETA"   "22080"
-eq "burn read purges sentinel" "$(grep -c 99999999 "$TMPD/b5.tsv" | tr -d ' ')" "0"
+true_case 'same-path exact' state_same_path "$TMPD/missing" "$TMPD/missing"
+mkdir -p "$TMPD/same-object"
+true_case 'same-path filesystem identity' state_same_path "$TMPD/same-object" "$TMPD/same-object/."
+_NCM_WAS=0; shopt -q nocasematch && _NCM_WAS=1
+shopt -u nocasematch
+state_same_path "$TMPD/Missing" "$TMPD/missing" >/dev/null 2>&1 || true
+if shopt -q nocasematch; then bad 'same-path restores disabled nocasematch' 'left enabled'; else ok 'same-path restores disabled nocasematch'; fi
+shopt -s nocasematch
+state_same_path "$TMPD/Missing" "$TMPD/missing" >/dev/null 2>&1 || true
+if shopt -q nocasematch; then ok 'same-path preserves enabled nocasematch'; else bad 'same-path preserves enabled nocasematch' 'left disabled'; fi
+[ "$_NCM_WAS" = 1 ] || shopt -u nocasematch
 
-# idle: only crossing is older than the 600s window (at +0s); now=+1200s
-run5h "1000000\t6\t1015900\n1000010\t7\t1015900\n1001200\t7\t1015900\n" 1001200
-eq "5h idle state" "$_B5_STATE" "idle"
-eq "5h idle eta"   "$_B5_ETA"   "inf"
+unit_gate() {  # $1=root $2=now $3=5h pct $4=5h reset $5=7d pct $6=7d reset $7=read-only
+  local root="$1"
+  NOW="$2"; fh_pct="$3"; fh_rst="$4"; wd_pct="$5"; wd_rst="$6"; CORALLINE_NO_SAMPLE="$7"
+  BURN_FILE="$root/burn.tsv"; RL5H_FILE="$root/limit5.tsv"; RL7D_FILE="$root/limit7.tsv"
+  _STATE_BURN_GATE=1; _STATE_RL5_GATE=1; _STATE_RL7_GATE=1
+  VL_LIMIT_SYNC=1; CORALLINE_BURN_WINDOW=600; BURN_TRIM=1500
+  state_gate
+}
 
-# warming: a single crossing, in window
-run5h "1000000\t6\t1015900\n1000060\t7\t1015900\n" 1000100
-eq "5h warming state" "$_B5_STATE" "warming"
-eq "5h warming eta"   "$_B5_ETA"   "inf"
+# Canonical TSV writes remain readable by the native PowerShell legacy parser.
+CASE="$TMPD/sample"; mkdir -p "$CASE"
+unit_gate "$CASE" 1000000 41.2 1015900 30 1345600 0
+burn_sample "$_CUR_BURN_SAMP" "$_CUR_BURN_TSV" "$_CUR_BURN_RST"
+IFS= read -r _ROW < "$CASE/burn.tsv"
+eq 'burn sample canonical TSV row' "$_ROW" $'1000000\t41.200\t1015900'
+eq 'burn sample appended once' "$_BURN_APPENDED" 1
 
-# reset: pct drops mid-file → pre-drop discarded, then only one crossing → warming
-run5h "1000000\t80\t1004000\n1000060\t81\t1004000\n1000120\t1\t1019000\n1000180\t2\t1019000\n" 1000200
-eq "5h reset→warming" "$_B5_STATE" "warming"
+run5h() {  # $1=fixture $2=now $3=mutate
+  local root="$TMPD/run5h" trim="$BURN_TRIM"
+  rm -rf "$root"; mkdir -p "$root"
+  unit_gate "$root" "$2" '' '' '' '' 1
+  BURN_TRIM=$trim
+  printf '%b' "$1" > "$BURN_FILE"
+  _CUR_BURN_VALID=0
+  burn_eta_5h "$3"
+}
 
-# empty file → warming/inf
-run5h "" 1000000
-eq "5h empty state" "$_B5_STATE" "warming"
-eq "5h empty eta"   "$_B5_ETA"   "inf"
+# Released 5h estimator behavior: active, warming, idle, reset isolation, fractions, jitter.
+run5h '1000000\t6\t1015900\n1000060\t7\t1015900\n1000300\t8\t1015900\n1000360\t8\t1015900\n' 1000360 0
+eq '5h active state' "$_B5_STATE" active
+eq '5h active eta' "$_B5_ETA" 22080
+eq '5h active rate' "$_B5_RATE" '0.0041666667'
+eq '5h active ttr' "$_B5_TTR" 15540
 
-# cross-window isolation: a shared file where an idle session's stale snapshots
-# (50,51 / older reset 1010000) are interleaved with the current window
-# (6,7,8 / later reset 1015900). The estimate must use ONLY the current window —
-# pre-fix the mixed series mis-fit; now it fits the real 6→7→8 slope.
-# crossings (current window): (1000120,7),(1000300,8) → rate=1/180 %/s
-# now pct=8 → ETA=(100-8)*180=16560s
-run5h "1000000\t6\t1015900\n1000060\t50\t1010000\n1000120\t7\t1015900\n1000180\t51\t1010000\n1000300\t8\t1015900\n1000360\t8\t1015900\n" 1000360
-eq "5h cross-window state" "$_B5_STATE" "active"
-eq "5h cross-window eta"   "$_B5_ETA"   "16560"
-eq "5h cross-window ttr"   "$_B5_TTR"   "15540"
+run5h '1000000\t6.125\t1015900\n1000060\t7.125\t1015900\n1000300\t8.125\t1015900\n1000360\t8.125\t1015900\n' 1000360 0
+eq '5h fractional pct exact eta' "$_B5_ETA" 22050
 
-# same-window jitter: concurrent sessions' caches disagree by a point or two, so
-# pct dips mid-window (13→12) though usage only ever rises. A decrease used to
-# reset `start` to the tail and fit the slope over the last 1-2 samples (1s apart)
-# → bogus ~1m ETA. Now the fit is anchored at the window start and spans the
-# first→last crossing: (1000150,11)→(1000400,16) = 5%/250s, lp=16 → ETA=84/0.02=4200.
-run5h "1000050\t10\t1015900\n1000150\t11\t1015900\n1000380\t13\t1015900\n1000398\t12\t1015900\n1000399\t14\t1015900\n1000400\t16\t1015900\n" 1000400
-eq "5h jitter state" "$_B5_STATE" "active"
-eq "5h jitter eta"   "$_B5_ETA"   "4200"
-eq "5h jitter ttr"   "$_B5_TTR"   "15500"
+run5h '1000000\t6\t1015900\n1000060\t6.500\t1015900\n1000060\t7\t1015900\n1000300\t8\t1015900\n1000360\t8\t1015900\n' 1000360 0
+eq 'same-second maximum keeps slope' "$_B5_ETA" 22080
 
-# min-span guard: a tiny late burst (two crossings 2s apart, nothing earlier in
-# window) is too short to trust → warming, not a wild fast ETA.
-run5h "1000000\t9\t1015900\n1000398\t10\t1015900\n1000400\t11\t1015900\n" 1000400
-eq "5h short-span guard" "$_B5_STATE" "warming"
+run5h '1000000\t6\t1015900\n1000300\t8\t1015900\n1000060\t7\t1015900\n1000360\t8\t1015900\n' 1000360 0
+eq 'out-of-order appends sort before slope' "$_B5_ETA" 22080
 
-# but a genuine fast burn that spans more than the guard (win/10=60s) must show,
-# not be hidden as warming: 1→5→9→10 over 90s. fc=(1000010,5) lc=(1000100,10),
-# span=90s ≥ 60s → rate=5/90, lp=10 → ETA=90/(5/90)=1620.
-run5h "1000000\t1\t1015900\n1000010\t5\t1015900\n1000070\t9\t1015900\n1000100\t10\t1015900\n" 1000100
-eq "5h fast-burn shows state" "$_B5_STATE" "active"
-eq "5h fast-burn shows eta"   "$_B5_ETA"   "1620"
+run5h '1000000\t6\t1015900\n1000060\t50\t1010000\n1000120\t7\t1015900\n1000180\t51\t1010000\n1000300\t8\t1015900\n1000360\t8\t1015900\n' 1000360 0
+eq 'latest reset isolates old windows' "$_B5_ETA" 16560
 
-# trim: 5 rows, trim=3 → file keeps last 3
+run5h '1000050\t10\t1015900\n1000150\t11\t1015900\n1000380\t13\t1015900\n1000398\t12\t1015900\n1000399\t14\t1015900\n1000400\t16\t1015900\n' 1000400 0
+eq 'cache-lag jitter stays bounded' "$_B5_ETA" 4200
+
+run5h '1000000\t6\t1015900\n1000010\t7\t1015900\n1001200\t7\t1015900\n' 1001200 0
+eq '5h idle state' "$_B5_STATE" idle
+run5h '1000000\t6\t1015900\n1000060\t7\t1015900\n' 1000100 0
+eq '5h warming state' "$_B5_STATE" warming
+run5h '1000000\t80\t1004000\n1000060\t81\t1004000\n1000120\t1\t1019000\n1000180\t2\t1019000\n' 1000200 0
+eq '5h reset rollover warms' "$_B5_STATE" warming
+
+# Sentinel healing and physical-row trim occur only when mutation is allowed.
+run5h '1000000\t6\t1015900\n1000060\t7\t1015900\n1000300\t8\t1015900\n9999000\t99\t99999999\n' 1000360 1
+eq 'burn sentinel ignored for estimate' "$_B5_ETA" 22080
+if grep -q 99999999 "$BURN_FILE"; then bad 'burn sentinel healed on mutable read' present; else ok 'burn sentinel healed on mutable read'; fi
+
 BURN_TRIM=3
-run5h "1\t6\t9\n2\t6\t9\n3\t7\t9\n4\t7\t9\n5\t8\t9\n" 6
-eq "5h trim rowcount" "$(wc -l < "$TMPD/b5.tsv" | tr -d ' ')" "3"
-eq "5h trim first-kept" "$(head -1 "$TMPD/b5.tsv" | cut -f1)" "3"
-# trim on PHYSICAL rows: 6 same-second rows (only 2 distinct seconds) with trim=3
-# must still trim — a distinct-second cap would never fire and the file would grow.
+run5h '1\t6\t9\n2\t6\t9\n3\t7\t9\n4\t7\t9\n5\t8\t9\n' 6 1
+eq '5h trim physical rowcount' "$(wc -l < "$BURN_FILE" | tr -d ' ')" 3
+IFS=$'\t' read -r _FIRST _ _ < "$BURN_FILE"; eq '5h trim first kept' "$_FIRST" 3
 BURN_TRIM=3
-run5h "1\t6\t9\n1\t6\t9\n1\t6\t9\n2\t7\t9\n2\t7\t9\n2\t7\t9\n" 3
-eq "5h trim same-second rows" "$(wc -l < "$TMPD/b5.tsv" | tr -d ' ')" "2"
+run5h '1\t6\t9\n1\t6.100\t9\n1\t6.200\t9\n2\t7\t9\n2\t7.100\t9\n2\t7.200\t9\n' 3 1
+eq 'resize burst collapses same-second rows' "$(wc -l < "$BURN_FILE" | tr -d ' ')" 2
+
+CASE="$TMPD/stale-tmp"; mkdir -p "$CASE"
+unit_gate "$CASE" 6 '' '' '' '' 1
+printf '1\t6\t9\n2\t7\t9\n3\t8\t9\n4\t9\t9\n' > "$BURN_FILE"
+printf 'stale-canary\n' > "$BURN_FILE.$$.tmp"
+cp "$BURN_FILE" "$CASE/before"; _CUR_BURN_VALID=0; BURN_TRIM=3; burn_eta_5h 1
+if cmp -s "$BURN_FILE" "$CASE/before"; then ok 'pre-existing temp never replaces history'; else bad 'pre-existing temp never replaces history' changed; fi
+eq 'pre-existing temp remains untouched' "$(LC_ALL=C tr -d '\n' < "$BURN_FILE.$$.tmp")" stale-canary
 BURN_TRIM=1500
 
-eval "$(sed -n '/^burn_eta_7d() {/,/^}/p' "$SCRIPT")"
+# Stateless 7d estimator keeps exact rational semantics.
+NOW=1000000
+burn_eta_7d 30000 1345600
+eq '7d exact eta' "$_B7_ETA" 604800
+eq '7d exact rate' "$_B7_RATE" '0.0001157407'
+eq '7d ttr' "$_B7_TTR" 345600
+burn_eta_7d 0 1345600; eq '7d zero pct is infinite' "$_B7_ETA" inf
 
-# 7d: used 30%, window opened 3 days ago (elapsed=259200s), reset 4 days out.
-# rate=30/259200 %/s; ETA=(100-30)/rate=70*259200/30=604800s=7d00h
-WS=$(( 1000000 - 259200 )); R7=$(( WS + 604800 ))
-wd_pct=30; wd_rst=$R7; NOW=1000000; burn_eta_7d
-eq "7d eta"  "$_B7_ETA" "604800"
-eq "7d ttr"  "$_B7_TTR" "345600"
+# Compact limit directory high-water: reset first, pct second, malformed entries ignored.
+CASE="$TMPD/highwater"; mkdir -p "$CASE"
+unit_gate "$CASE" 1000000 15 1015900 30 1345600 0
+mkdir -p "$_SL5_ROOT/0001015800_090.000" "$_SL5_ROOT/0001015900_010.000" "$_SL5_ROOT/0001015900_020.000"
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0
+eq 'limit high-water pct' "$_LL_PCT" '020.000'
+eq 'limit high-water reset' "$_LL_RST" 1015900
+# Own window, own reading. The store used to win on a higher pct for the same
+# reset, which pinned the recorded maximum for the rest of the window whenever the
+# percentage legitimately dropped (upstream reset, plan upgrade).
+rl_choose 5; eq 'own reading beats a higher stored pct' "$_STATE_RL5_PCT" 15000
+eq 'own reading keeps its own reset' "$_STATE_RL5_RST" 1015900
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 1
+entry_count "$_SL5_ROOT"; eq 'limit mutable GC keeps winner' "$_COUNT" 1
 
-# 7d unused → inf
-wd_pct=0; wd_rst=$R7; NOW=1000000; burn_eta_7d
-eq "7d unused eta" "$_B7_ETA" "inf"
+# A drop inside one window is followed, and the store still wins when it holds a
+# newer window than this session has caught up to.
+rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/0001015900_090.000"
+_CUR5_VALID=1; _CUR5_RST=1015900; _CUR5_PCT=5000
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0; rl_choose 5
+eq 'pct drop inside one window is followed' "$_STATE_RL5_PCT" 5000
 
-# 7d not reported → inf
-wd_pct=""; wd_rst=""; NOW=1000000; burn_eta_7d
-eq "7d empty eta" "$_B7_ETA" "inf"
+rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/0001016900_007.000"
+_CUR5_VALID=1; _CUR5_RST=1015900; _CUR5_PCT=90000
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0; rl_choose 5
+eq 'newer stored window beats an older own reading' "$_STATE_RL5_PCT" 7000
+eq 'newer stored window carries its reset' "$_STATE_RL5_RST" 1016900
 
-eval "$(sed -n '/^fg() {/,/^}/p'            "$SCRIPT")"
-eval "$(sed -n '/^push() {/,/^}/p'          "$SCRIPT")"
-eval "$(sed -n '/^burn_estimate() {/,/^}/p' "$SCRIPT")"
-eval "$(sed -n '/^seg_burn() {/,/^}/p'      "$SCRIPT")"
-VL_BURN_GLYPH="↗"; VL_BG_BURN=""; VL_BG_5H=237; VL_LAYOUT="fixed"
-VL_FG_OK=114; VL_FG_WARN=179; VL_FG_HOT=167; VL_FG_DIM=245
-VL_NOCOLOR=0   # fg()/push() reference it (statusline default); set under `set -u`
-VL_LIMIT_SYNC=0   # burn_estimate branches on it (statusline default); set under `set -u`
-fh_pct=8 wd_pct=0
+rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/0001015900_042.000"
+_CUR5_VALID=0; _CUR5_RST=0; _CUR5_PCT=0
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0; rl_choose 5
+eq 'store is the sole source without an own reading' "$_STATE_RL5_PCT" 42000
+_CUR5_VALID=1; _CUR5_RST=1015900; _CUR5_PCT=15000
 
-# stub the two estimators so binding logic is tested in isolation
-mk5h() { _B5_STATE="$1"; _B5_ETA="$2"; _B5_RATE="$3"; _B5_TTR="$4"; }
-mk7d() {                 _B7_ETA="$1"; _B7_RATE="$2"; _B7_TTR="$3"; }
-burn_eta_5h() { mk5h "$M5S" "$M5E" "$M5R" "$M5T"; }
-burn_eta_7d() { mk7d "$M7E" "$M7R" "$M7T"; }
+rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/0001015900_041.200"
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0; eq 'limit fractional pct preserved' "$_LL_PCT" '041.200'
 
-# 5h roomy (eta 6h), 7d binding (eta 2h) → label 7d
-M5S=active M5E=21600 M5R=0 M5T=15000  M7E=7200 M7R=0 M7T=86400
-burn_estimate
-eq "binding label 7d"  "$_BURN_LABEL" "7d"
-eq "binding eta 7d"    "$_BURN_ETA"   "7200"
+rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/0001015800_090.000"
+_CUR5_VALID=1; _CUR5_RST=1015900; _CUR5_PCT=3000
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0; rl_choose 5
+eq 'newer reset supersedes old high pct' "$_STATE_RL5_PCT" 3000
 
-# 5h binding (eta 1h) vs 7d (eta 10h) → label 5h
-M5S=active M5E=3600 M5R=0 M5T=9000  M7E=36000 M7R=0 M7T=200000
-burn_estimate
-eq "binding label 5h"  "$_BURN_LABEL" "5h"
+rm -rf "$_SL5_ROOT"; mkdir -p "$_SL5_ROOT/9999999999_099.000" "$_SL5_ROOT/0001015900_030.000"
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0
+eq 'limit sentinel ignored read-only' "$_LL_PCT" '030.000'
+true_case 'limit sentinel preserved read-only' test -d "$_SL5_ROOT/9999999999_099.000"
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 1
+true_case 'limit sentinel healed when mutable' test ! -e "$_SL5_ROOT/9999999999_099.000"
 
-# 5h idle + 7d unused → idle, no label
-M5S=idle M5E=inf M5R=0 M5T=0  M7E=inf M7R=0 M7T=0
-burn_estimate
-eq "binding idle"      "$_BURN_STATE" "idle"
-eq "binding idle nolabel" "$_BURN_LABEL" ""
+# Runtime helpers.
+if ! command -v jq >/dev/null 2>&1; then
+  bad 'jq prerequisite' missing
+  printf 'SUMMARY pass=%s fail=%s\n' "$pass" "$fail"
+  exit 1
+fi
+make_payload() {  # $1=path $2=p5 $3=r5 $4=p7 $5=r7
+  jq -n --arg p5 "$2" --arg r5 "$3" --arg p7 "$4" --arg r7 "$5" \
+    '{workspace:{current_dir:"/tmp"},rate_limits:{five_hour:{used_percentage:$p5,resets_at:$r5},seven_day:{used_percentage:$p7,resets_at:$r7}}}' > "$1"
+}
+write_config() {  # $1=path $2=root $3=segments $4=sync $5=trim(optional)
+  {
+    printf 'VL_SEGMENTS=%q\n' "$3"
+    printf '%s\n' 'VL_CLOCK=off' 'VL_STYLE=lean' 'VL_NOCOLOR=1' 'VL_BURN_GLYPH=B'
+    printf 'VL_LIMIT_SYNC=%q\n' "$4"
+    printf 'BURN_FILE=%q\n' "$2/burn.tsv"
+    printf 'RL5H_FILE=%q\n' "$2/limit5.tsv"
+    printf 'RL7D_FILE=%q\n' "$2/limit7.tsv"
+    [ -z "${5:-}" ] || printf 'BURN_TRIM=%q\n' "$5"
+  } > "$1"
+}
+write_paths_config() {  # $1=path $2=segments $3=sync $4=burn $5=rl5 $6=rl7 $7=trim(optional)
+  {
+    printf 'VL_SEGMENTS=%q\n' "$2"
+    printf '%s\n' 'VL_CLOCK=off' 'VL_STYLE=lean' 'VL_NOCOLOR=1' 'VL_BURN_GLYPH=B'
+    printf 'VL_LIMIT_SYNC=%q\n' "$3"
+    printf 'BURN_FILE=%q\n' "$4"
+    printf 'RL5H_FILE=%q\n' "$5"
+    printf 'RL7D_FILE=%q\n' "$6"
+    [ -z "${7:-}" ] || printf 'BURN_TRIM=%q\n' "$7"
+  } > "$1"
+}
+run_runtime() {  # $1=shell/runtime $2=config $3=input $4=stdout $5=stderr $6=no-sample
+  if [ "$6" = 1 ]; then
+    CORALLINE_CONFIG="$2" CORALLINE_NO_SAMPLE=1 "$1" "$SCRIPT" < "$3" > "$4" 2> "$5"
+  else
+    CORALLINE_CONFIG="$2" CORALLINE_NO_SAMPLE=0 "$1" "$SCRIPT" < "$3" > "$4" 2> "$5"
+  fi
+}
+run_runtime_cwd() {  # $1=cwd, remaining args match run_runtime
+  local cwd="$1"; shift
+  (cd "$cwd" && run_runtime "$@")
+}
 
-# render: all-good ✓ is window-absolute — 7d binding with eta 24d15h > the 7d window
-# (you couldn't empty even a full window at this pace) → bright-green ✓, no number.
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
-M5S=active M5E=inf M5R=0 M5T=0  M7E=2127600 M7R=0 M7T=3600
-burn_estimate
-seg_burn
-case "${SEG_TXT[0]}" in *"↗ ✓"*) ok "render all-good 7d check" ;; *) bad "render all-good 7d check" "got=${SEG_TXT[0]}" ;; esac
-case "${SEG_TXT[0]}" in *"⇢"*) bad "all-good drops countdown" "got=${SEG_TXT[0]}" ;; *) ok "all-good drops countdown" ;; esac
-case "${SEG_TXT[0]}" in *$'\033[38;5;114m'*) ok "all-good OK colour" ;; *) bad "all-good OK colour" "no OK fg in ${SEG_TXT[0]}" ;; esac
+# Strict no-sample: oversized/dirty TSV, orphan tmp, immutable burn.d, limit GC
+# candidates, and every mtime remain byte-for-byte unchanged. A mutable clone
+# computes the same visible result while performing its allowed maintenance.
+CASE="$TMPD/no-sample"; STATE="$CASE/state"; MUT="$CASE/mutable"; mkdir -p "$STATE/burn.d" "$STATE/limit5.d" "$STATE/limit7.d"
+_now=$(date +%s); _r5=$((_now + 15930)); _r7=$((_now + 345630))
+_i=0; while [ "$_i" -lt 1502 ]; do printf '%s\t8\t%s\n' $((_now - 1501 + _i)) "$_r5" >> "$STATE/burn.tsv"; _i=$((_i + 1)); done
+printf '%s\t99\t9999999999\n' "$_now" >> "$STATE/burn.tsv"
+printf 'orphan-canary' > "$STATE/burn.tsv.123.tmp"
+printf 'immutable-canary' > "$STATE/burn.d/b_000000000001_000000000001_001.000_0000"
+mkdir -p "$STATE/limit5.d/$(printf '%010d_020.000' "$_r5")" "$STATE/limit5.d/9999999999_099.000" "$STATE/limit5.d/not-state"
+mkdir -p "$STATE/limit7.d/$(printf '%010d_030.000' "$_r7")" "$STATE/limit7.d/9999999999_099.000" "$STATE/limit7.d/not-state"
+cp -R "$STATE" "$MUT"
+old_mtimes "$STATE"
+write_config "$CASE/read.conf" "$STATE" 'burn limit5h limit7d' 1
+write_config "$CASE/mut.conf" "$MUT" 'burn limit5h limit7d' 1
+make_payload "$CASE/input" 8 "$_r5" 30 "$_r7"
+snapshot_tree "$STATE" "$CASE/before.tar"
+run_runtime "$BASH_BIN" "$CASE/read.conf" "$CASE/input" "$CASE/read.out" "$CASE/read.err" 1; _RC=$?
+snapshot_tree "$STATE" "$CASE/after.tar"
+run_runtime "$BASH_BIN" "$CASE/mut.conf" "$CASE/input" "$CASE/mut.out" "$CASE/mut.err" 0; _MRC=$?
+eq 'no-sample runtime exits zero' "$_RC" 0
+eq 'mutable reference exits zero' "$_MRC" 0
+if cmp -s "$CASE/before.tar" "$CASE/after.tar"; then ok 'no-sample full tree contents and mtimes unchanged'; else bad 'no-sample full tree contents and mtimes unchanged' changed; fi
+if cmp -s "$CASE/read.out" "$CASE/mut.out"; then ok 'no-sample output matches mutable reference'; else bad 'no-sample output matches mutable reference' differs; fi
+eq 'no-sample stderr empty' "$(file_bytes "$CASE/read.err")" 0
 
-# the window is per-label: 5h binding with eta 20000s (> the 5h/18000s window) → ✓ too
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
-M5S=active M5E=20000 M5R=0 M5T=600  M7E=inf M7R=0 M7T=0
-burn_estimate
-seg_burn
-case "${SEG_TXT[0]}" in *"↗ ✓"*) ok "render all-good 5h check" ;; *) bad "render all-good 5h check" "got=${SEG_TXT[0]}" ;; esac
+CASE="$TMPD/no-sample-missing"; mkdir -p "$CASE/parent"
+write_config "$CASE/conf" "$CASE/parent/state" 'burn limit5h limit7d' 1
+make_payload "$CASE/input" 8 "$_r5" 30 "$_r7"
+old_mtimes "$CASE/parent"; snapshot_tree "$CASE/parent" "$CASE/before.tar"
+run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 1
+snapshot_tree "$CASE/parent" "$CASE/after.tar"
+if cmp -s "$CASE/before.tar" "$CASE/after.tar"; then ok 'no-sample absent roots and parent mtime unchanged'; else bad 'no-sample absent roots and parent mtime unchanged' changed; fi
 
-# regression: eta 4h50m is *under* the 5h window, so it must NOT collapse to ✓ — it
-# shows the number, coloured green here (comfortable vs reset: eta 17400 > 1.25·ttr 7200).
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
-M5S=active M5E=17400 M5R=0 M5T=7200  M7E=inf M7R=0 M7T=0
-burn_estimate
-seg_burn
-case "${SEG_TXT[0]}" in *"↗ 5h ⇢ 4h50m"*) ok "render green number" ;; *) bad "render green number" "got=${SEG_TXT[0]}" ;; esac
-case "${SEG_TXT[0]}" in *"✓"*) bad "under-window keeps number" "got=${SEG_TXT[0]}" ;; *) ok "under-window keeps number" ;; esac
-case "${SEG_TXT[0]}" in *$'\033[38;5;114m'*) ok "green number OK colour" ;; *) bad "green number OK colour" "no OK fg in ${SEG_TXT[0]}" ;; esac
+# Malformed, over-width, scientific, negative, >100, and oversized payload values
+# never create state. The next valid render recovers immediately.
+_invalid_pct=(-1 1e2 101 100.000001 0001 .5 12345678901 "$_LONG_PCT")
+_idx=0
+for _VALUE in "${_invalid_pct[@]}"; do
+  CASE="$TMPD/invalid-pct-$_idx"; mkdir -p "$CASE"
+  write_config "$CASE/conf" "$CASE/state" 'burn limit5h' 1
+  _now=$(date +%s); _r5=$((_now + 15930)); make_payload "$CASE/bad.json" "$_VALUE" "$_r5" '' ''
+  run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/bad.json" "$CASE/bad.out" "$CASE/bad.err" 0
+  true_case "invalid pct $_idx creates no state" test ! -e "$CASE/state"
+  eq "invalid pct $_idx stderr empty" "$(file_bytes "$CASE/bad.err")" 0
+  make_payload "$CASE/good.json" 41.2 "$_r5" '' ''
+  run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/good.json" "$CASE/good.out" "$CASE/good.err" 0
+  true_case "invalid pct $_idx recovers next render" test -s "$CASE/state/burn.tsv"
+  _idx=$((_idx + 1))
+done
+_invalid_rst=(-1 1e2 01 10000000000 9999999999999 '2026-07-31T12:34:56+00:00')
+_idx=0
+for _VALUE in "${_invalid_rst[@]}"; do
+  CASE="$TMPD/invalid-rst-$_idx"; mkdir -p "$CASE"
+  write_config "$CASE/conf" "$CASE/state" 'burn limit5h' 1
+  make_payload "$CASE/bad.json" 41.2 "$_VALUE" '' ''
+  run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/bad.json" "$CASE/bad.out" "$CASE/bad.err" 0
+  true_case "invalid reset $_idx creates no state" test ! -e "$CASE/state"
+  _now=$(date +%s); _r5=$((_now + 15930)); make_payload "$CASE/good.json" 41.2 "$_r5" '' ''
+  run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/good.json" "$CASE/good.out" "$CASE/good.err" 0
+  true_case "invalid reset $_idx recovers next render" test -s "$CASE/state/burn.tsv"
+  _idx=$((_idx + 1))
+done
 
-# render: active 5h binding, eta 5m ≤ ttr 10m → you empty before reset → HOT colour,
-# and the actionable countdown number is kept.
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
-M5S=active M5E=300 M5R=0 M5T=600  M7E=inf M7R=0 M7T=0
-burn_estimate
-seg_burn
-case "${SEG_TXT[0]}" in *$'\033[38;5;167m'*) ok "render HOT colour" ;; *) bad "render HOT colour" "no HOT fg in ${SEG_TXT[0]}" ;; esac
-case "${SEG_TXT[0]}" in *"⇢ "*) ok "HOT keeps countdown" ;; *) bad "HOT keeps countdown" "got=${SEG_TXT[0]}" ;; esac
+# Path collision, relative alias, conservative case alias, symlink base/ancestor,
+# and symlink limit-root canaries all fail soft without mutation.
+_now=$(date +%s); _r5=$((_now + 15930)); _r7=$((_now + 345630))
+CASE="$TMPD/path-exact"; mkdir -p "$CASE"; printf 'exact-canary' > "$CASE/shared.tsv"
+write_paths_config "$CASE/conf" 'burn limit5h' 1 "$CASE/shared.tsv" "$CASE/shared.tsv" "$CASE/limit7.tsv"
+make_payload "$CASE/input" 41.2 "$_r5" 30 "$_r7"
+cp "$CASE/shared.tsv" "$CASE/before"; run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 0
+if cmp -s "$CASE/shared.tsv" "$CASE/before"; then ok 'exact path collision preserves canary'; else bad 'exact path collision preserves canary' changed; fi
 
-# render: idle → dim all-good ✓ (not burning), no dash placeholder
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
-M5S=idle M5E=inf M5R=0 M5T=0  M7E=inf M7R=0 M7T=0
-burn_estimate
-seg_burn
-case "${SEG_TXT[0]}" in *"↗ ✓"*) ok "render idle check" ;; *) bad "render idle check" "got=${SEG_TXT[0]}" ;; esac
-case "${SEG_TXT[0]}" in *$'\033[38;5;245m'*) ok "render idle dim" ;; *) bad "render idle dim" "no DIM fg in ${SEG_TXT[0]}" ;; esac
+CASE="$TMPD/path-relative"; mkdir -p "$CASE/a"; printf 'relative-canary' > "$CASE/shared.tsv"
+write_paths_config "$CASE/conf" 'burn limit5h' 1 "$CASE/a/../shared.tsv" "$CASE/shared.tsv" "$CASE/limit7.tsv"
+make_payload "$CASE/input" 41.2 "$_r5" 30 "$_r7"
+cp "$CASE/shared.tsv" "$CASE/before"; run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 0
+if cmp -s "$CASE/shared.tsv" "$CASE/before"; then ok 'relative alias collision preserves canary'; else bad 'relative alias collision preserves canary' changed; fi
 
-# render: active 5h binding, eta 1000s, ttr 900s → ratio 0.9 ∈ [0.8,1) → WARN colour,
-# and the countdown number is kept (only the green band collapses to ✓).
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
-M5S=active M5E=1000 M5R=0 M5T=900  M7E=inf M7R=0 M7T=0
-burn_estimate
-seg_burn
-case "${SEG_TXT[0]}" in *$'\033[38;5;179m'*) ok "render WARN colour" ;; *) bad "render WARN colour" "no WARN fg in ${SEG_TXT[0]}" ;; esac
-case "${SEG_TXT[0]}" in *"⇢ "*) ok "WARN keeps countdown" ;; *) bad "WARN keeps countdown" "got=${SEG_TXT[0]}" ;; esac
+CASE="$TMPD/path-case"; mkdir -p "$CASE/State"; printf 'case-canary' > "$CASE/State/burn.tsv"
+write_paths_config "$CASE/conf" 'burn limit5h' 1 "$CASE/State/burn.tsv" "$CASE/state/burn.tsv" "$CASE/limit7.tsv"
+make_payload "$CASE/input" 41.2 "$_r5" 30 "$_r7"
+cp "$CASE/State/burn.tsv" "$CASE/before"; run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 0
+case "${OSTYPE:-}" in
+  (darwin*|mingw*|msys*)
+    if cmp -s "$CASE/State/burn.tsv" "$CASE/before"; then ok 'case alias collision preserves canary'; else bad 'case alias collision preserves canary' changed; fi
+    ;;
+  (*)
+    if cmp -s "$CASE/State/burn.tsv" "$CASE/before"; then bad 'case-sensitive distinct paths remain usable' unchanged; else ok 'case-sensitive distinct paths remain usable'; fi
+    ;;
+esac
 
-# render: warming (cold start, no data) → dim ↗ … — a distinct "no data yet" mark,
-# NOT the ✓ that idle/all-good use, so a fresh install doesn't look healthy-green.
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
-M5S=warming M5E=inf M5R=0 M5T=0  M7E=inf M7R=0 M7T=0
-burn_estimate
-seg_burn
-case "${SEG_TXT[0]}" in *"↗ …"*) ok "render warming check" ;; *) bad "render warming check" "got=${SEG_TXT[0]}" ;; esac
-case "${SEG_TXT[0]}" in *"✓"*) bad "warming is not ✓" "got=${SEG_TXT[0]}" ;; *) ok "warming is not ✓" ;; esac
-case "${SEG_TXT[0]}" in *$'\033[38;5;245m'*) ok "render warming dim" ;; *) bad "render warming dim" "no DIM fg in ${SEG_TXT[0]}" ;; esac
+CASE="$TMPD/path-link"; mkdir -p "$CASE/target"; printf 'ancestor-canary' > "$CASE/target/canary"
+if ln -s "$CASE/target" "$CASE/link" 2>/dev/null; then
+  write_paths_config "$CASE/conf" 'burn limit5h' 1 "$CASE/link/burn.tsv" "$CASE/limit5.tsv" "$CASE/limit7.tsv"
+  make_payload "$CASE/input" 41.2 "$_r5" 30 "$_r7"
+  run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 0
+  eq 'symlink ancestor canary unchanged' "$(LC_ALL=C tr -d '\n' < "$CASE/target/canary")" ancestor-canary
+  true_case 'symlink ancestor receives no state' test ! -e "$CASE/target/burn.tsv"
+else ok 'symlink ancestor fixture unavailable'; fi
 
-# contract: seg_burn renders a PRECOMPUTED estimate and must NOT recompute. The
-# stubs say warming, but the precomputed _BURN_* says active/5h — seg_burn has to
-# honour the globals (burn_estimate is hoisted to run once per render, upstream of
-# seg_burn, so float and visible passes share one computation).
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
-M5S=warming M5E=inf M5R=0 M5T=0  M7E=inf M7R=0 M7T=0
-_BURN_STATE=active _BURN_LABEL=5h _BURN_ETA=1000 _BURN_RATE=0 _BURN_TTR=900
-seg_burn
-case "${SEG_TXT[0]}" in *"↗ 5h ⇢ "*) ok "seg_burn renders precomputed estimate" ;; *) bad "seg_burn renders precomputed estimate" "got=${SEG_TXT[0]}" ;; esac
+CASE="$TMPD/path-file-link"; mkdir -p "$CASE"; printf 'file-canary' > "$CASE/target.tsv"
+if ln -s "$CASE/target.tsv" "$CASE/burn.tsv" 2>/dev/null; then
+  write_paths_config "$CASE/conf" burn 0 "$CASE/burn.tsv" "$CASE/limit5.tsv" "$CASE/limit7.tsv"
+  make_payload "$CASE/input" 41.2 "$_r5" 30 "$_r7"
+  run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 0
+  eq 'symlink file target unchanged' "$(LC_ALL=C tr -d '\n' < "$CASE/target.tsv")" file-canary
+else ok 'symlink file fixture unavailable'; fi
 
-# tie-break: equal ETAs (5000s) → 5h wins via -le comparison
-M5S=active M5E=5000 M5R=0 M5T=9000  M7E=5000 M7R=0 M7T=9000
-burn_estimate
-eq "tie→5h"            "$_BURN_LABEL" "5h"
+CASE="$TMPD/path-limit-link"; mkdir -p "$CASE/target"; printf 'limit-canary' > "$CASE/target/canary"
+if ln -s "$CASE/target" "$CASE/limit5.d" 2>/dev/null; then
+  write_config "$CASE/conf" "$CASE" 'limit5h' 1
+  make_payload "$CASE/input" 41.2 "$_r5" 30 "$_r7"
+  run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 0
+  eq 'symlink limit target unchanged' "$(LC_ALL=C tr -d '\n' < "$CASE/target/canary")" limit-canary
+else ok 'symlink limit fixture unavailable'; fi
 
-# guard: neither limit reported → segment renders nothing
-SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
-fh_pct="" wd_pct=""
-seg_burn
-eq "neither-reported renders nothing" "${#SEG_TXT[@]}" "0"
+# Existing immutable burn.d and unrelated temp canaries are never touched.
+CASE="$TMPD/coexist"; mkdir -p "$CASE/state/burn.d"; printf 'immutable' > "$CASE/state/burn.d/canary"
+write_config "$CASE/conf" "$CASE/state" burn 0 3
+make_payload "$CASE/input" 41.2 "$_r5" 30 "$_r7"
+snapshot_tree "$CASE/state/burn.d" "$CASE/before.tar"
+run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 0
+snapshot_tree "$CASE/state/burn.d" "$CASE/after.tar"
+if cmp -s "$CASE/before.tar" "$CASE/after.tar"; then ok 'immutable burn.d stays untouched'; else bad 'immutable burn.d stays untouched' changed; fi
+printf 'tmp-canary' > "$CASE/state/burn.tsv.keep.tmp"
+_i=0; while [ "$_i" -lt 8 ]; do run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out.$_i" "$CASE/err.$_i" 0; _i=$((_i + 1)); done
+eq 'unrelated temp canary preserved' "$(LC_ALL=C tr -d '\n' < "$CASE/state/burn.tsv.keep.tmp")" tmp-canary
+[ "$(wc -l < "$CASE/state/burn.tsv" | tr -d ' ')" -le 3 ] && ok 'repeated render TSV remains trimmed' || bad 'repeated render TSV remains trimmed' "rows=$(wc -l < "$CASE/state/burn.tsv")"
 
-# ── integration: the sampler runs iff `burn` is in the segment list (issue #17) ─
-# Drives the whole statusline.sh so the top-level gate is exercised end to end.
-if command -v jq >/dev/null 2>&1; then
-  gate_run() {  # $1=VL_SEGMENTS → "written" if a sample landed, else "absent"
-    local conf="$TMPD/conf.sh" bf="$TMPD/gate/burn.tsv" in="$TMPD/gate-input.json" soon
-    rm -rf "$TMPD/gate"
-    printf 'VL_SEGMENTS=%q\n' "$1" > "$conf"
-    # Give the fixture a plausible near-future reset (raw epoch; to_epoch accepts
-    # it) so the sentinel guard (#32) doesn't correctly drop the sample and mask
-    # the gate under test. The bundled sample-input.json keeps its 2030 sentinel.
-    soon=$(( $(date +%s) + 10800 ))
-    jq --arg r "$soon" \
-       '.rate_limits.five_hour.resets_at=$r | .rate_limits.seven_day.resets_at=$r' \
-       "$HERE/sample-input.json" > "$in"
-    CORALLINE_CONFIG="$conf" CORALLINE_BURN_FILE="$bf" \
-      bash "$SCRIPT" < "$in" >/dev/null 2>&1
-    [ -f "$bf" ] && echo written || echo absent
-  }
-  eq "gate: burn listed → samples"    "$(gate_run 'dir burn clock')" "written"
-  eq "gate: burn absent → no samples" "$(gate_run 'dir clock')"      "absent"
+# Malformed arithmetic/metacharacter basenames and nonempty canonical-looking
+# directories never displace the valid winner, emit stderr, or trigger side effects.
+CASE="$TMPD/arithmetic"; mkdir -p "$CASE/state/limit5.d"
+_now=$(date +%s); _winner=$((_now + 200)); _later=$((_now + 300))
+printf -v _WINNER '%010d_020.000' "$_winner"; printf -v _NONEMPTY '%010d_099.000' "$_later"
+mkdir -p "$CASE/state/limit5.d/$_WINNER" "$CASE/state/limit5.d/$_NONEMPTY"
+printf 'child' > "$CASE/state/limit5.d/$_NONEMPTY/canary"
+_META1='x[$(touch${IFS}ARITH_PWN)]_099.000'
+_META2='1+1_099.000'
+_META3='0000000001_099.000]||touch${IFS}ARITH_PWN||x['
+mkdir -p "$CASE/state/limit5.d/$_META1" "$CASE/state/limit5.d/$_META2" "$CASE/state/limit5.d/$_META3"
+write_config "$CASE/conf" "$CASE/state" limit5h 1
+make_payload "$CASE/input" 15 "$_winner" '' ''
+run_runtime_cwd "$CASE" "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 0; _RC=$?
+eq 'malformed basename runtime exits zero' "$_RC" 0
+eq 'malformed basename stderr empty' "$(file_bytes "$CASE/err")" 0
+true_case 'arithmetic basename creates no side effect' test ! -e "$CASE/ARITH_PWN"
+true_case 'metachar basename one preserved' test -d "$CASE/state/limit5.d/$_META1"
+true_case 'metachar basename two preserved' test -d "$CASE/state/limit5.d/$_META2"
+true_case 'metachar basename three preserved' test -d "$CASE/state/limit5.d/$_META3"
+true_case 'nonempty canonical-looking entry preserved' test -f "$CASE/state/limit5.d/$_NONEMPTY/canary"
+if LC_ALL=C grep -q '15%' "$CASE/out"; then ok 'own reading wins its own window'; else bad 'own reading wins its own window' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/out")"; fi
+if LC_ALL=C grep -q '99%' "$CASE/out"; then bad 'malformed names never reach the bar' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/out")"; else ok 'malformed names never reach the bar'; fi
+# Without a reading of its own the session falls back to the store, which is the
+# only source that knows the account's open window. rl_latest admits an entry only
+# while its reset is still ahead, so the borrowed value cannot be a fossil, and the
+# malformed neighbours must still never reach the bar.
+make_payload "$CASE/blank" '' '' '' ''
+run_runtime_cwd "$CASE" "$BASH_BIN" "$CASE/conf" "$CASE/blank" "$CASE/blank.out" "$CASE/blank.err" 0
+if LC_ALL=C grep -q '20%' "$CASE/blank.out"; then ok 'no own reading falls back to the store'; else bad 'no own reading falls back to the store' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/blank.out")"; fi
+if LC_ALL=C grep -q '99%' "$CASE/blank.out"; then bad 'store fallback never shows a malformed entry' "output=$(LC_ALL=C tr '\n' ' ' < "$CASE/blank.out")"; else ok 'store fallback never shows a malformed entry'; fi
+eq 'no own reading keeps stderr empty' "$(file_bytes "$CASE/blank.err")" 0
+unit_gate "$CASE/state" "$_now" 15 "$_winner" 30 "$_later" 1
+rl_latest "$_SL5_BASE" "$RL_MAX_5H" 0
+eq 'malformed names do not displace canonical winner' "$_LL_PCT" '020.000'
+eq 'malformed names do not displace canonical reset' "$_LL_RST" "$_winner"
+
+# No immutable-controller tools remain on the state path. Wrappers would fail the
+# render if find or od were invoked.
+CASE="$TMPD/trace"; mkdir -p "$CASE/bin" "$CASE/state"; : > "$CASE/trace.log"
+for _TOOL in find od; do
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'printf "%s\n" "$0" >> "$CORALLINE_TRACE"'
+    printf '%s\n' 'exit 97'
+  } > "$CASE/bin/$_TOOL"
+  chmod +x "$CASE/bin/$_TOOL"
+done
+write_config "$CASE/conf" "$CASE/state" 'burn limit5h limit7d' 1
+make_payload "$CASE/input" 41.2 "$_r5" 30 "$_r7"
+CORALLINE_TRACE="$CASE/trace.log" PATH="$CASE/bin:$PATH" run_runtime "$BASH_BIN" "$CASE/conf" "$CASE/input" "$CASE/out" "$CASE/err" 0; _RC=$?
+eq 'state trace exits zero without find or od' "$_RC" 0
+eq 'state trace has no find or od calls' "$(file_bytes "$CASE/trace.log")" 0
+eq 'state trace stderr empty' "$(file_bytes "$CASE/err")" 0
+if grep -Eq 'state_scan|state_prepare|find -P|od -An' "$SCRIPT"; then bad 'immutable controller symbols removed' present; else ok 'immutable controller symbols removed'; fi
+
+# State-disabled and subagent paths perform no state work.
+CASE="$TMPD/gates"; mkdir -p "$CASE"
+write_config "$CASE/disabled.conf" "$CASE/disabled-state" dir 1
+make_payload "$CASE/input" 41.2 "$_r5" 30 "$_r7"
+run_runtime "$BASH_BIN" "$CASE/disabled.conf" "$CASE/input" "$CASE/disabled.out" "$CASE/disabled.err" 0
+true_case 'state-disabled runtime creates no state' test ! -e "$CASE/disabled-state"
+printf '%s\n' '{"columns":80,"tasks":[]}' > "$CASE/subagent.json"
+CORALLINE_CONFIG="$CASE/disabled.conf" "$BASH_BIN" "$SCRIPT" --subagent < "$CASE/subagent.json" > "$CASE/subagent.out" 2> "$CASE/subagent.err"
+true_case 'subagent runtime creates no state' test ! -e "$CASE/disabled-state"
+
+# Full-runtime concurrent correctness checker. Each worker performs two renders;
+# every exit/stdout/stderr is accounted for against one fixed no-clock oracle.
+run_concurrency() {  # $1=runtime $2=workers $3=tag
+  local runtime="$1" workers="$2" tag="$3" root i j rc path
+  local pids=()
+  root="$TMPD/concurrency-$tag-$workers"
+  rm -rf "$root"; mkdir -p "$root/state/burn.d" "$root/results"
+  printf 'immutable-concurrency-canary' > "$root/state/burn.d/canary"
+  write_config "$root/conf" "$root/state" burn 0
+  local now reset
+  now=$(date +%s); reset=$((now + 15930)); make_payload "$root/input" 10 "$reset" 0 "$((now + 345630))"
+  printf '\033[0m B … \033[0m\n' > "$root/oracle"
+  for ((i=0; i<workers; i++)); do
+    (
+      for j in 1 2; do
+        path="$root/results/$i.$j"
+        CORALLINE_CONFIG="$root/conf" CORALLINE_NO_SAMPLE=0 "$runtime" "$SCRIPT" < "$root/input" > "$path.out" 2> "$path.err"
+        rc=$?
+        printf '%s\n' "$rc" > "$path.rc"
+      done
+    ) &
+    pids[${#pids[@]}]=$!
+  done
+  for i in "${pids[@]}"; do wait "$i" 2>/dev/null || true; done
+
+  _CC_EXPECTED=$(( workers * 2 )); _CC_RCFILES=0; _CC_SUCCESS=0; _CC_NONZERO=0
+  _CC_NONEMPTY=0; _CC_MATCH=0; _CC_STDERR_EMPTY=0
+  for ((i=0; i<workers; i++)); do
+    for j in 1 2; do
+      path="$root/results/$i.$j"
+      if [ -f "$path.rc" ]; then
+        _CC_RCFILES=$(( _CC_RCFILES + 1 )); IFS= read -r rc < "$path.rc"
+        if [ "$rc" = 0 ]; then _CC_SUCCESS=$(( _CC_SUCCESS + 1 )); else _CC_NONZERO=$(( _CC_NONZERO + 1 )); fi
+      fi
+      [ -s "$path.out" ] && _CC_NONEMPTY=$(( _CC_NONEMPTY + 1 ))
+      cmp -s "$path.out" "$root/oracle" && _CC_MATCH=$(( _CC_MATCH + 1 ))
+      [ ! -s "$path.err" ] && _CC_STDERR_EMPTY=$(( _CC_STDERR_EMPTY + 1 ))
+    done
+  done
+  if [ -f "$root/state/burn.tsv" ]; then _CC_ROWS=$(wc -l < "$root/state/burn.tsv" | tr -d ' '); else _CC_ROWS=0; fi
+  _CC_IMMUTABLE=0
+  [ "$(LC_ALL=C tr -d '\n' < "$root/state/burn.d/canary")" = immutable-concurrency-canary ] && _CC_IMMUTABLE=1
+  [ "$_CC_RCFILES" -eq "$_CC_EXPECTED" ] && [ "$_CC_SUCCESS" -eq "$_CC_EXPECTED" ] \
+    && [ "$_CC_NONEMPTY" -eq "$_CC_EXPECTED" ] && [ "$_CC_MATCH" -eq "$_CC_EXPECTED" ] \
+    && [ "$_CC_STDERR_EMPTY" -eq "$_CC_EXPECTED" ] && [ "$_CC_ROWS" -eq "$_CC_EXPECTED" ] \
+    && [ "$_CC_IMMUTABLE" -eq 1 ]
+}
+
+CASE="$TMPD/fake-runtime"; mkdir -p "$CASE"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 7' > "$CASE/fail.sh"; chmod +x "$CASE/fail.sh"
+if run_concurrency "$CASE/fail.sh" 2 fake; then
+  bad 'concurrency checker rejects nonzero runtime' 'false pass'
 else
-  ok "gate integration (skipped: no jq)"
+  eq 'fake runtime nonzero exits counted' "$_CC_NONZERO" 4
+  ok 'concurrency checker rejects nonzero runtime'
 fi
 
-[ "$fail" -eq 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }
+for _N in 5 12 16; do
+  if run_concurrency "$BASH_BIN" "$_N" "bash-${BASH_VERSINFO[0]}"; then
+    eq "concurrency n=$_N successes" "$_CC_SUCCESS" $((_N * 2))
+    eq "concurrency n=$_N exact outputs" "$_CC_MATCH" $((_N * 2))
+    eq "concurrency n=$_N stderr empty" "$_CC_STDERR_EMPTY" $((_N * 2))
+    eq "concurrency n=$_N TSV rows" "$_CC_ROWS" $((_N * 2))
+    eq "concurrency n=$_N immutable store untouched" "$_CC_IMMUTABLE" 1
+  else
+    bad "concurrency n=$_N" "expected=$_CC_EXPECTED rcfiles=$_CC_RCFILES success=$_CC_SUCCESS nonempty=$_CC_NONEMPTY match=$_CC_MATCH stderr=$_CC_STDERR_EMPTY rows=$_CC_ROWS immutable=$_CC_IMMUTABLE"
+  fi
+done
+
+# A killed render leaves its trim temporary behind and nothing used to retire it.
+# The sweep must take only what is unambiguously ours and unambiguously dead: an
+# exactly <base>.<digits>.tmp name, a regular file, and older than the store it was
+# derived from, since a temporary a live render is still writing is newer than the
+# base it is about to replace.
+CASE="$TMPD/tmpsweep"; mkdir -p "$CASE"
+_SB_BASE="$CASE/burn.tsv"
+printf 'x\n' > "$_SB_BASE.111.tmp"; printf 'x\n' > "$_SB_BASE.222.tmp"
+printf 'x\n' > "$_SB_BASE.abc.tmp"; printf 'x\n' > "$_SB_BASE.333.bak"
+ln -s /dev/null "$_SB_BASE.444.tmp"
+sleep 1; printf 'row\n' > "$_SB_BASE"; sleep 1; printf 'live\n' > "$_SB_BASE.555.tmp"
+burn_tmp_sweep
+true_case 'sweep removes an orphaned temporary' test ! -e "$_SB_BASE.111.tmp"
+true_case 'sweep removes every orphaned temporary' test ! -e "$_SB_BASE.222.tmp"
+true_case 'sweep keeps a non-numeric name' test -f "$_SB_BASE.abc.tmp"
+true_case 'sweep keeps a non-temporary suffix' test -f "$_SB_BASE.333.bak"
+true_case 'sweep keeps a symlink' test -L "$_SB_BASE.444.tmp"
+true_case 'sweep keeps a temporary newer than the store' test -f "$_SB_BASE.555.tmp"
+true_case 'sweep leaves the store intact' test -s "$_SB_BASE"
+
+# Binding and renderer regressions after state/storage tests. Stubs isolate the
+# already-tested estimators from the presentation logic.
+VL_BURN_GLYPH='↗'; VL_BG_BURN=''; VL_BG_5H=237; VL_LAYOUT=fixed
+VL_FG_OK=114; VL_FG_WARN=179; VL_FG_HOT=167; VL_FG_DIM=245; VL_NOCOLOR=0
+fh_pct=8; wd_pct=0; _STATE_READY=0
+mk5h() { _B5_STATE="$1"; _B5_ETA="$2"; _B5_RATE="$3"; _B5_TTR="$4"; }
+mk7d() { _B7_ETA="$1"; _B7_RATE="$2"; _B7_TTR="$3"; }
+burn_eta_5h() { mk5h "$M5S" "$M5E" "$M5R" "$M5T"; }
+burn_eta_7d() { mk7d "$M7E" "$M7R" "$M7T"; }
+_STATE_MUTATE=0; _CUR7_VALID=0; _STATE_RL7_VALID=0
+M5S=active M5E=21600 M5R=0 M5T=15000 M7E=7200 M7R=0 M7T=86400
+burn_estimate; eq 'binding label 7d' "$_BURN_LABEL" 7d
+M5S=active M5E=5000 M5R=0 M5T=9000 M7E=5000 M7R=0 M7T=9000
+burn_estimate; eq 'binding ETA tie chooses 5h' "$_BURN_LABEL" 5h
+
+# The projection binds to whatever source the gauge is willing to show, or the bar
+# and the 7d pill would describe different windows in one render. That means the
+# store feeds burn_eta_7d whenever it is valid, with or without a reading of our own.
+burn_eta_7d() { _B7_ARGS="$1|$2"; mk7d "$M7E" "$M7R" "$M7T"; }
+_VLS_SAVE=$VL_LIMIT_SYNC; VL_LIMIT_SYNC=1
+_STATE_RL7_VALID=1; _STATE_RL7_PCT=99000; _STATE_RL7_RST=1345600
+_CUR7_VALID=0; _CUR7_PCT=0; _CUR7_RST=0
+_B7_ARGS=unset; burn_estimate
+eq 'no own 7d reading still projects from the store' "$_B7_ARGS" '99000|1345600'
+_CUR7_VALID=1; _CUR7_PCT=30000; _CUR7_RST=1345600
+_B7_ARGS=unset; burn_estimate
+eq 'own 7d reading admits the synced projection' "$_B7_ARGS" '99000|1345600'
+_STATE_RL7_VALID=0
+_B7_ARGS=unset; burn_estimate
+eq 'no store leaves the projection on the payload' "$_B7_ARGS" '30000|1345600'
+VL_LIMIT_SYNC=$_VLS_SAVE; _STATE_RL7_VALID=0; _CUR7_VALID=0
+burn_eta_7d() { mk7d "$M7E" "$M7R" "$M7T"; }
+
+# The 5h projection must describe the same window as the gauge. When only the store
+# supplies that window, a burn history still sitting on the one that just closed
+# would put an active ETA for the old window beside a gauge for the new one; the
+# estimator reports its window as NOW + _B5_TTR.
+NOW=1000000; _VLS_SAVE2=$VL_LIMIT_SYNC; VL_LIMIT_SYNC=1
+_CUR5_VALID=0; _STATE_RL5_VALID=1; _STATE_RL5_RST=$(( NOW + 9000 ))
+_CUR7_VALID=0; _STATE_RL7_VALID=0
+M5S=active M5E=4000 M5R=0 M5T=9000 M7E=inf M7R=0 M7T=0
+burn_estimate
+eq 'store-only 5h projection on the stored window survives' "$_BURN_STATE" active
+M5T=0
+burn_estimate
+eq 'store-only 5h projection on a closed window is dropped' "$_B5_STATE" warming
+eq 'dropped 5h projection leaves burn warming' "$_BURN_STATE" warming
+# A valid reading of our own does not exempt the projection. rl_choose lets a
+# strictly newer stored window beat it, and the session that published that window
+# need not run burn at all, so the shared history can hold only the older one.
+_CUR5_VALID=1; _CUR5_RST=$(( NOW + 1000 )); _STATE_RL5_RST=$(( NOW + 1000 ))
+M5T=1000
+burn_estimate
+eq 'own 5h window matching the store keeps its projection' "$_BURN_STATE" active
+M5T=1000; _STATE_RL5_RST=$(( NOW + 9000 ))
+burn_estimate
+eq 'newer stored window drops a projection still on the older one' "$_B5_STATE" warming
+M5T=9000
+burn_estimate
+eq 'projection rebound to the newer stored window survives' "$_BURN_STATE" active
+_STATE_RL5_VALID=0
+M5T=1000
+burn_estimate
+eq 'no synced state leaves the projection alone' "$_BURN_STATE" active
+VL_LIMIT_SYNC=$_VLS_SAVE2; _STATE_RL5_VALID=0; _CUR5_VALID=0
+M5S=active M5E=21600 M5R=0 M5T=15000 M7E=7200 M7R=0 M7T=86400
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _BURN_STATE=active; _BURN_LABEL=5h; _BURN_ETA=1000; _BURN_RATE=0; _BURN_TTR=900
+seg_burn
+case "${SEG_TXT[0]}" in (*'↗ 5h ⇢ 16m'*) ok 'burn renderer uses precomputed estimate' ;; (*) bad 'burn renderer uses precomputed estimate' "${SEG_TXT[0]}" ;; esac
+case "${SEG_TXT[0]}" in (*$'\033[38;5;179m'*) ok 'burn renderer warning color' ;; (*) bad 'burn renderer warning color' 'missing warning fg' ;; esac
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _BURN_STATE=warming; _BURN_LABEL=''; _BURN_ETA=inf; _BURN_RATE=0; _BURN_TTR=0
+seg_burn
+case "${SEG_TXT[0]}" in (*'↗ …'*) ok 'burn renderer warming marker' ;; (*) bad 'burn renderer warming marker' "${SEG_TXT[0]}" ;; esac
+
+# The projection accepts the same sources as the gauges. Leaving burn gated on the
+# payload alone would show 5h and 7d from the store with a hole between them.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_READY=1
+_CUR5_VALID=0; _CUR7_VALID=0; _STATE_RL5_VALID=0; _STATE_RL7_VALID=0
+seg_burn
+eq 'no reading and no store draws no projection' "${#SEG_TXT[@]}" 0
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL7_VALID=1
+seg_burn
+eq 'store window alone draws the projection' "${#SEG_TXT[@]}" 1
+_STATE_READY=0; _STATE_RL7_VALID=0
+
+# Synced limit segments override the payload but never gate on it. Once a window's
+# reset passes, the payload snapshot and every store entry go invalid in the same
+# render, so gating here blanked the segment for the whole idle stretch until the
+# next keystroke delivered a fresh snapshot. The fallback reads the canonical
+# _CUR*_PCT, never the raw payload, so an unvalidated pct still renders nothing.
+NOW=1000000; VL_BG_7D=236; VL_LIMIT_SYNC=1
+VL_BAR_WIDTH=5; VL_BAR_FILL='▰'; VL_BAR_EMPTY='▱'; VL_WARN_PCT=50; VL_HOT_PCT=75
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+fh_pct=41.2; fh_rst=1015900; _CUR5_CANON='041.200'; _CUR5_PCT=41200; _CUR5_RST=1015900
+_CUR5_VALID=1; _CUR7_VALID=1
+_STATE_RL5_VALID=1; _STATE_RL5_PCT=62000; _STATE_RL5_RST=1015900
+seg_limit5h
+case "${SEG_TXT[0]}" in (*'5h '*' 62% '*) ok 'synced high-water overrides the payload' ;; (*) bad 'synced high-water overrides the payload' "${SEG_TXT[0]}" ;; esac
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL5_VALID=0; _CUR5_RST=999000
+seg_limit5h
+eq 'expired 5h window still renders' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*'5h '*' 41% '*) ok 'expired 5h window keeps the canonical reading' ;; (*) bad 'expired 5h window keeps the canonical reading' "${SEG_TXT[0]}" ;; esac
+case "${SEG_TXT[0]}" in (*'↺now'*) ok 'expired 5h window countdown reads now' ;; (*) bad 'expired 5h window countdown reads now' "${SEG_TXT[0]}" ;; esac
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL7_VALID=0
+wd_pct=30; wd_rst=999000; _CUR7_CANON='030.000'; _CUR7_PCT=30000; _CUR7_RST=999000
+seg_limit7d
+eq 'expired 7d window still renders' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*'7d '*' 30% '*) ok 'expired 7d window keeps the canonical reading' ;; (*) bad 'expired 7d window keeps the canonical reading' "${SEG_TXT[0]}" ;; esac
+
+# An oversized/malformed payload pct leaves _CUR5_CANON empty, so the fallback
+# must draw nothing rather than push the raw value through make_bar/pct_fg.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL5_VALID=0; _CUR5_CANON=''; _CUR5_PCT=0
+fh_pct=$_LONG_PCT; fh_rst=999000
+seg_limit5h
+eq 'unvalidated payload pct renders nothing' "${#SEG_TXT[@]}" 0
+
+# A canonical pct is not on its own evidence of an elapsed window. A missing or
+# malformed reset leaves _CUR5_RST at 0 and a sentinel reset lands beyond the
+# window ceiling; drawing either would invent a countdown that was never observed.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_CANON='041.200'; _CUR5_PCT=41200; _CUR5_RST=0
+seg_limit5h
+eq 'unparsed reset renders nothing' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_RST=$(( NOW + 999999 ))
+seg_limit5h
+eq 'far-future sentinel reset renders nothing' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_RST=$NOW
+seg_limit5h
+eq 'reset exactly at now counts as elapsed' "${#SEG_TXT[@]}" 1
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL7_VALID=0; _CUR7_RST=0
+seg_limit7d
+eq '7d unparsed reset renders nothing' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_CANON=''; fh_pct=''; fh_rst=''
+seg_limit5h
+eq 'no payload and no synced state renders nothing' "${#SEG_TXT[@]}" 0
+
+# With no reading of its own the session shows the store's open window, in both
+# windows alike. This is the case that blanked both gauges for a freshly started,
+# resumed, or idle session, whose payload carries no rate_limits at all.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+fh_pct=''; fh_rst=''; _CUR5_VALID=0; _CUR5_CANON=''; _CUR5_RST=0
+_STATE_RL5_VALID=1; _STATE_RL5_PCT=99000; _STATE_RL5_RST=1015900
+seg_limit5h
+eq 'no own 5h reading shows the stored window' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*'5h '*' 99% '*) ok 'stored 5h value reaches the bar' ;; (*) bad 'stored 5h value reaches the bar' "${SEG_TXT[0]}" ;; esac
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+wd_pct=''; wd_rst=''; _CUR7_VALID=0; _CUR7_CANON=''; _CUR7_RST=0
+_STATE_RL7_VALID=1; _STATE_RL7_PCT=99000; _STATE_RL7_RST=1345600
+seg_limit7d
+eq 'no own 7d reading shows the stored window' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*'7d '*' 99% '*) ok 'stored 7d value reaches the bar' ;; (*) bad 'stored 7d value reaches the bar' "${SEG_TXT[0]}" ;; esac
+
+# Nothing of our own and nothing in the store still renders nothing.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _STATE_RL5_VALID=0
+seg_limit5h
+eq 'no own 5h reading and no store renders nothing' "${#SEG_TXT[@]}" 0
+
+# An elapsed window is a fallback for one that JUST closed. Claude Code replays the
+# last snapshot an idle session received forever, so past the window ceiling that
+# reading stops standing in for the current window: it falls through to the store,
+# and renders nothing when the store has nothing either.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+fh_pct=41.2; fh_rst=1; _CUR5_CANON='041.200'; _CUR5_PCT=41200
+_CUR5_RST=$(( NOW - RL_MAX_5H )); _CUR5_VALID=0; _STATE_RL5_VALID=0
+seg_limit5h
+eq 'elapsed exactly at the ceiling still renders' "${#SEG_TXT[@]}" 1
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=(); _CUR5_RST=$(( NOW - RL_MAX_5H - 1 ))
+seg_limit5h
+eq 'elapsed past the ceiling renders nothing' "${#SEG_TXT[@]}" 0
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+_STATE_RL5_VALID=1; _STATE_RL5_PCT=33000; _STATE_RL5_RST=1015900
+seg_limit5h
+eq 'elapsed past the ceiling falls through to the store' "${#SEG_TXT[@]}" 1
+case "${SEG_TXT[0]}" in (*' 33% '*) ok 'stale reading never outranks the open window' ;; (*) bad 'stale reading never outranks the open window' "${SEG_TXT[0]}" ;; esac
+
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+wd_pct=30; wd_rst=1; _CUR7_CANON='030.000'; _CUR7_PCT=30000
+_CUR7_RST=$(( NOW - RL_MAX_7D - 1 )); _CUR7_VALID=0; _STATE_RL7_VALID=0
+seg_limit7d
+eq '7d elapsed past the ceiling renders nothing' "${#SEG_TXT[@]}" 0
+
+# The roll-over catch-up survives: this session holds a valid but older window and
+# the store holds a strictly newer one, which is the case rl_choose lets win.
+SEG_BGS=(); SEG_TXT=(); SEG_LEN=()
+fh_pct=41.2; fh_rst=1015900; _CUR5_VALID=1; _CUR5_CANON='041.200'; _CUR5_PCT=41200; _CUR5_RST=1015900
+_STATE_RL5_VALID=1; _STATE_RL5_PCT=7000; _STATE_RL5_RST=1016900
+seg_limit5h
+case "${SEG_TXT[0]}" in (*'5h '*' 7% '*) ok 'roll-over catch-up still renders the newer window' ;; (*) bad 'roll-over catch-up still renders the newer window' "${SEG_TXT[0]}" ;; esac
+
+printf 'SUMMARY pass=%s fail=%s\n' "$pass" "$fail"
+[ "$fail" -eq 0 ] || exit 1
+printf 'ALL PASS\n'

@@ -156,6 +156,10 @@ struct SubCtx<'a> {
     fg_ok: String,
     fg_warn: String,
     fg_hot: String,
+    fg_sub_text: String,
+    fg_sub_ok: String,
+    fg_sub_hot: String,
+    fg_sub_dim: String,
 }
 
 impl<'a> SubCtx<'a> {
@@ -210,11 +214,13 @@ impl<'a> SubCtx<'a> {
         if label.is_empty() {
             return;
         }
+        // The status inks are the name pill's own, when the theme published a
+        // set for the ground it paints; empty falls back to the main palette.
         let col = match t.status.as_str() {
-            "running" | "in_progress" | "active" => &self.fg_text,
-            "completed" | "success" | "done" => &self.fg_ok,
-            "failed" | "error" | "cancelled" => &self.fg_hot,
-            _ => &self.fg_dim, // incl. missing → unknown
+            "running" | "in_progress" | "active" => &self.fg_sub_text,
+            "completed" | "success" | "done" => &self.fg_sub_ok,
+            "failed" | "error" | "cancelled" => &self.fg_sub_hot,
+            _ => &self.fg_sub_dim, // incl. missing → unknown
         };
         self.push(
             segs,
@@ -266,8 +272,9 @@ impl<'a> SubCtx<'a> {
                 segs,
                 bgc,
                 format!(
-                    "{} \u{2B21} {} {}% {}{} ",
+                    "{} {} {} {}% {}{} ",
                     self.pct_fg(ci),
+                    cfg.ctx_glyph,
                     bar,
                     ci,
                     self.fg_dim,
@@ -275,7 +282,11 @@ impl<'a> SubCtx<'a> {
                 ),
             );
         } else {
-            self.push(segs, bgc, format!("{} \u{2B21} {} ", self.fg_dim, tok_s));
+            self.push(
+                segs,
+                bgc,
+                format!("{} {} {} ", self.fg_dim, cfg.ctx_glyph, tok_s),
+            );
         }
     }
 
@@ -295,6 +306,15 @@ impl<'a> SubCtx<'a> {
             self.or(&self.cfg.bg_sub_elapsed, &self.cfg.bg_duration),
             format!("{} \u{29D6} {} ", self.fg_text, fmt_duration_s(diff * 1000)),
         );
+    }
+}
+
+/// `${VL_FG_SUB_X:-$VL_FG_X}` — an unset panel ink falls back to the main one.
+fn fallback<'a>(v: &'a str, main: &'a str) -> &'a str {
+    if v.is_empty() {
+        main
+    } else {
+        v
     }
 }
 
@@ -323,6 +343,10 @@ pub fn run(input: &str, cfg: &Config, now: i64) -> String {
         fg_ok: render::fg(&cfg.fg_ok),
         fg_warn: render::fg(&cfg.fg_warn),
         fg_hot: render::fg(&cfg.fg_hot),
+        fg_sub_text: render::fg(fallback(&cfg.fg_sub_text, &cfg.fg_text)),
+        fg_sub_ok: render::fg(fallback(&cfg.fg_sub_ok, &cfg.fg_ok)),
+        fg_sub_hot: render::fg(fallback(&cfg.fg_sub_hot, &cfg.fg_hot)),
+        fg_sub_dim: render::fg(fallback(&cfg.fg_sub_dim, &cfg.fg_dim)),
     };
     let mut out = String::new();
     for tj in tasks {

@@ -393,8 +393,114 @@ fn fmt_countdown(reset: &str, now: i64) -> String {
     }
 }
 
+/// C `printf "%.0f"`, which rounds halves to even — not Rust's `f64::round`.
 fn round_pct(v: f64) -> i64 {
-    v.round() as i64
+    if !v.is_finite() {
+        return 0;
+    }
+    let f = v.floor();
+    let diff = v - f;
+    let n = f as i64;
+    if diff > 0.5 || (diff == 0.5 && n % 2 != 0) {
+        n + 1
+    } else {
+        n
+    }
+}
+
+/// A `cost.total_cost_usd` scalar the cost segment is willing to print: a
+/// finite, non-negative decimal no larger than 1e9, written in a shape C's
+/// `strtod` and bash's `printf` agree on. Everything else hides the segment
+/// rather than rendering a number nobody can defend (upstream seg_cost).
+fn cost_value(raw: &str) -> Option<f64> {
+    if raw.len() > 128 {
+        return None;
+    }
+    let t = raw.trim_matches(' ');
+    let b = t.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    // ^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$
+    let (significand, exp_text) = match t.find(['e', 'E']) {
+        Some(i) => (&t[..i], &t[i + 1..]),
+        None => (t, ""),
+    };
+    let sig_body = significand
+        .strip_prefix(['+', '-'])
+        .unwrap_or(significand);
+    let (int_part, frac_part) = match sig_body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (sig_body, ""),
+    };
+    if sig_body.matches('.').count() > 1 {
+        return None;
+    }
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|c| c.is_ascii_digit()) || !frac_part.bytes().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let lexical_nonzero = sig_body.bytes().any(|c| (b'1'..=b'9').contains(&c));
+    if significand.starts_with('-') && lexical_nonzero {
+        return None;
+    }
+    let mut exp_value: i64 = 0;
+    if !exp_text.is_empty() {
+        let (sign, digits) = match exp_text.strip_prefix(['+', '-']) {
+            Some(d) => (if exp_text.starts_with('-') { -1 } else { 1 }, d),
+            None => (1, exp_text),
+        };
+        if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let trimmed = digits.trim_start_matches('0');
+        let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+        if trimmed.len() > 3 {
+            return None;
+        }
+        let v: i64 = trimmed.parse().ok()?;
+        if v > 308 {
+            return None;
+        }
+        exp_value = sign * v;
+    }
+    if lexical_nonzero {
+        let digits: String = sig_body.chars().filter(|c| *c != '.').collect();
+        let leading_zeroes = digits.len() - digits.trim_start_matches('0').len();
+        let adjusted = exp_value + int_part.len() as i64 - leading_zeroes as i64 - 1;
+        if !(-323..=9).contains(&adjusted) {
+            return None;
+        }
+        if adjusted == 9 {
+            let significant = &digits[leading_zeroes..];
+            if !significant.starts_with('1') || significant[1..].bytes().any(|c| c != b'0') {
+                return None;
+            }
+        }
+    }
+    let v: f64 = t.parse().ok()?;
+    if !v.is_finite() || v > 1e9 {
+        return None;
+    }
+    if v < 0.0 {
+        return None;
+    }
+    // A value that only underflows to zero is not a zero anybody reported.
+    if v == 0.0 && lexical_nonzero {
+        return None;
+    }
+    Some(v)
+}
+
+/// `printf -v x '%.0f' "$raw" 2>/dev/null || x=0` on a jq-tostring field.
+pub(crate) fn pct_of(raw: &str) -> i64 {
+    match raw.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() => round_pct(v),
+        _ => 0,
+    }
 }
 
 /// d/h/m rendering of a burn ETA in seconds (mirrors fmt_countdown's shapes).
@@ -421,6 +527,7 @@ struct Ctx<'a> {
     sec: u32,
     now_epoch: i64,
     burn: Option<&'a crate::burn::Burn>,
+    gate: Option<&'a crate::state::Gate>,
     fg_text: String,
     fg_dim: String,
     fg_ok: String,
@@ -524,8 +631,9 @@ impl<'a> Ctx<'a> {
                     segs,
                     bg,
                     format!(
-                        "{BOLD}{} \u{2B22} {} {NORM}",
+                        "{BOLD}{} {} {} {NORM}",
                         self.fg_text,
+                        cfg.project_glyph,
                         trunc(&self.git.root, cfg.name_max)
                     ),
                 );
@@ -611,19 +719,22 @@ impl<'a> Ctx<'a> {
                 );
             }
             "ctx" => {
-                let cp = match p.ctx_pct {
-                    Some(v) => v,
-                    None => return,
-                };
-                let ci = round_pct(cp);
+                // An absent percentage renders as 0% only when the payload was
+                // readable and its context window is genuinely empty — never as
+                // a cover for a malformed or missing one.
+                if p.ctx_pct.is_empty() && !(cfg.ctx_always_show && p.json_ok && p.ctx_empty) {
+                    return;
+                }
+                let ci = pct_of(&p.ctx_pct);
                 let bar = make_bar(ci, cfg.bar_width, &cfg.bar_fill, &cfg.bar_empty);
                 let cn = self.pct_fg(ci);
                 self.push(
                     segs,
                     &cfg.bg_ctx,
                     format!(
-                        "{} \u{2B21} {} {}% {}\u{2191}{} \u{2193}{} cr:{} cw:{} ",
+                        "{} {} {} {}% {}\u{2191}{} \u{2193}{} cr:{} cw:{} ",
                         cn,
+                        cfg.ctx_glyph,
                         bar,
                         ci,
                         self.fg_dim,
@@ -634,36 +745,25 @@ impl<'a> Ctx<'a> {
                     ),
                 );
             }
-            "limit5h" => {
-                // With VL_LIMIT_SYNC, show the freshest cross-session value for
-                // the current window (falling back to this session's snapshot).
-                let (mut pv, mut rs) = (p.fh_pct, p.fh_rst.clone());
-                if cfg.limit_sync {
-                    if let Some((pct, rst)) =
-                        crate::burn::rl_latest(&cfg.rl5h_file, crate::burn::RL_MAX_5H, self.now_epoch)
-                    {
-                        pv = pct.parse().ok();
-                        rs = rst.to_string();
-                    }
-                }
-                self.seg_limit(segs, "5h", pv, &rs, &cfg.bg_5h)
-            }
-            "limit7d" => {
-                let (mut pv, mut rs) = (p.wd_pct, p.wd_rst.clone());
-                if cfg.limit_sync {
-                    if let Some((pct, rst)) =
-                        crate::burn::rl_latest(&cfg.rl7d_file, crate::burn::RL_MAX_7D, self.now_epoch)
-                    {
-                        pv = pct.parse().ok();
-                        rs = rst.to_string();
-                    }
-                }
-                self.seg_limit(segs, "7d", pv, &rs, &cfg.bg_7d)
-            }
+            "limit5h" => self.seg_limit_window(segs, 5),
+            "limit7d" => self.seg_limit_window(segs, 7),
             "burn" => {
-                // range-to-empty ETA until the binding 5h/7d limit hits 100%
-                if p.fh_pct_raw.is_empty() && p.wd_pct_raw.is_empty() {
-                    return;
+                // range-to-empty ETA until the binding 5h/7d limit hits 100%.
+                // Same sources the gauges accept: once a synced store can render
+                // 5h/7d for a session that has reported nothing itself, hiding
+                // only the projection would leave a gap between two segments
+                // describing the same windows.
+                match self.gate {
+                    Some(g) => {
+                        if !(g.cur5.valid || g.cur7.valid || g.rl5.valid || g.rl7.valid) {
+                            return;
+                        }
+                    }
+                    None => {
+                        if p.fh_pct.is_empty() && p.wd_pct.is_empty() {
+                            return;
+                        }
+                    }
                 }
                 let Some(b) = self.burn else { return };
                 let bgc = if cfg.bg_burn.is_empty() {
@@ -712,9 +812,26 @@ impl<'a> Ctx<'a> {
                 );
             }
             "cost" => {
-                let c = match p.cost {
-                    Some(v) if v != 0.0 => v,
-                    _ => return,
+                let c = match p.cost_kind {
+                    // A cost the payload simply never reported can render as
+                    // $0.00, but only on an otherwise readable payload.
+                    crate::CostKind::Missing => {
+                        if !(cfg.cost_always_show && p.json_ok) {
+                            return;
+                        }
+                        0.0
+                    }
+                    crate::CostKind::Scalar => match cost_value(&p.cost) {
+                        Some(v) if v != 0.0 => v,
+                        Some(_) => {
+                            if !(cfg.cost_always_show && p.json_ok) {
+                                return;
+                            }
+                            0.0
+                        }
+                        None => return,
+                    },
+                    crate::CostKind::Invalid => return,
                 };
                 self.push(
                     segs,
@@ -786,12 +903,60 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn seg_limit(&self, segs: &mut Vec<Seg>, label: &str, pct: Option<f64>, reset: &str, bgc: &str) {
-        let pv = match pct {
-            Some(v) => v,
-            None => return,
+    /// With VL_LIMIT_SYNC, the gauge draws the once-per-render canonical state:
+    /// this session's own reading wins its own window, a strictly newer stored
+    /// window beats it, and a window that just elapsed with no interaction still
+    /// shows its last reading rather than blanking until the next keystroke.
+    fn seg_limit_window(&self, segs: &mut Vec<Seg>, which: u8) {
+        let cfg = self.cfg;
+        let p = self.p;
+        let (raw, rst_raw, bgc) = match which {
+            5 => (&p.fh_pct, &p.fh_rst, &cfg.bg_5h),
+            _ => (&p.wd_pct, &p.wd_rst, &cfg.bg_7d),
         };
-        let v = round_pct(pv);
+        let label = if which == 5 { "5h" } else { "7d" };
+        if !cfg.limit_sync {
+            self.seg_limit(segs, label, raw, rst_raw, bgc, None);
+            return;
+        }
+        let Some(g) = self.gate else { return };
+        let (state, cur, max) = match which {
+            5 => (&g.rl5, &g.cur5, crate::state::RL_MAX_5H),
+            _ => (&g.rl7, &g.cur7, crate::state::RL_MAX_7D),
+        };
+        // A reset of 0 means the payload never carried a parseable one, so the
+        // elapsed-window fallback must not claim a window that was never seen.
+        let elapsed_ok = !cur.canon.is_empty()
+            && cur.rst > 0
+            && cur.rst <= self.now_epoch
+            && self.now_epoch - cur.rst <= max;
+        let (milli, rst) = if state.valid {
+            (state.pct, state.rst)
+        } else if elapsed_ok {
+            (cur.pct, cur.rst)
+        } else {
+            return;
+        };
+        let pct = format!("{}.{:03}", milli / 1000, milli % 1000);
+        self.seg_limit(segs, label, &pct, &rst.to_string(), bgc, Some(milli));
+    }
+
+    fn seg_limit(
+        &self,
+        segs: &mut Vec<Seg>,
+        label: &str,
+        pct: &str,
+        reset: &str,
+        bgc: &str,
+        milli: Option<i64>,
+    ) {
+        if pct.is_empty() {
+            return;
+        }
+        let v = match milli {
+            Some(m) => crate::state::round_even(m as i128, 1000).unwrap_or(0),
+            None => pct_of(pct),
+        };
         let bar = make_bar(v, self.cfg.bar_width, &self.cfg.bar_fill, &self.cfg.bar_empty);
         let cn = self.pct_fg(v);
         let cd = fmt_countdown(reset, self.now_epoch);
@@ -966,6 +1131,7 @@ pub fn render(
     sec: u32,
     now_epoch: i64,
     burn: Option<&crate::burn::Burn>,
+    gate: Option<&crate::state::Gate>,
 ) -> String {
     let ctx = Ctx {
         cfg,
@@ -977,6 +1143,7 @@ pub fn render(
         sec,
         now_epoch,
         burn,
+        gate,
         fg_text: fg(&cfg.fg_text),
         fg_dim: fg(&cfg.fg_dim),
         fg_ok: fg(&cfg.fg_ok),
