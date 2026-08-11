@@ -26,26 +26,37 @@ mod float;
 mod git;
 mod json;
 mod render;
+mod state;
 mod subagent;
 
 use config::Config;
 use json::Json;
 
+/// What the payload's `cost.total_cost_usd` is, in upstream's `_COST_KIND`
+/// terms: absent/empty (`missing`), a usable scalar, or something else.
+#[derive(PartialEq)]
+pub enum CostKind {
+    Missing,
+    Scalar,
+    Invalid,
+}
+
 pub struct Payload {
     pub cwd: String,
     pub model: String,
-    pub ctx_pct: Option<f64>,
+    pub ctx_pct: String, // jq-tostring form; "" when absent
+    pub ctx_empty: bool, // a valid context window that simply reports nothing
+    pub json_ok: bool,   // the payload parsed and its root is an object
     pub tok_in: i64,
     pub tok_out: i64,
     pub tok_cr: i64,
     pub tok_cw: i64,
-    pub fh_pct: Option<f64>,
-    pub fh_pct_raw: String, // jq-tostring form, for burn/limit-sync sampling
+    pub fh_pct: String, // jq-tostring form, for burn/limit-sync sampling
     pub fh_rst: String,
-    pub wd_pct: Option<f64>,
-    pub wd_pct_raw: String,
+    pub wd_pct: String,
     pub wd_rst: String,
-    pub cost: Option<f64>,
+    pub cost: String,
+    pub cost_kind: CostKind,
     pub lines_add: i64,
     pub lines_del: i64,
     pub out_style: String,
@@ -132,50 +143,91 @@ fn render_all(j: Option<&Json>, home: &str, coralline_dir: &str) -> String {
     let (h, m, s) = local_hms();
     let now = now_epoch();
 
-    // Burn / limit-sync sampling, gated on the segment scan exactly like
-    // upstream (CORALLINE_NO_SAMPLE=1 makes a render read-only, so preview
-    // sentinels never poison the cross-session stores).
+    // Burn / limit-sync state, gated on the segment scan exactly like upstream.
+    // The disabled path does no state work at all; CORALLINE_NO_SAMPLE keeps
+    // every read but forbids mutation, so a preview render's sentinel values
+    // never poison the cross-session stores.
     let uses_burn = uses("burn");
-    let no_sample = matches!(std::env::var("CORALLINE_NO_SAMPLE"), Ok(v) if v == "1");
-    if !no_sample {
-        if uses_burn {
-            burn::burn_sample(&cfg.burn_file, now, &p.fh_pct_raw, &p.fh_rst);
+    // burn takes both limit gates, not just 7d: it can bind to either window and
+    // its 5h projection is rebound to the synced state below.
+    let gate5 = cfg.limit_sync && (uses("limit5h") || uses_burn);
+    let gate7 = cfg.limit_sync && (uses("limit7d") || uses_burn);
+    let mut gate = None;
+    if uses_burn || gate5 || gate7 {
+        let mut g = state::Gate::new(
+            &p.fh_pct,
+            &p.fh_rst,
+            &p.wd_pct,
+            &p.wd_rst,
+            now,
+            &cfg.burn_file,
+            &cfg.rl5h_file,
+            &cfg.rl7d_file,
+            cfg.burn_window,
+            cfg.burn_trim,
+        );
+        if g.mutate {
+            if uses_burn {
+                g.burn_sample();
+            }
+            if gate5 {
+                g.rl_sample(5);
+            }
+            if gate7 {
+                g.rl_sample(7);
+            }
         }
         if cfg.limit_sync {
-            if uses("limit5h") {
-                burn::rl_sample(&cfg.rl5h_file, &p.fh_pct_raw, &p.fh_rst, burn::RL_MAX_5H, now);
+            if gate5 {
+                g.resolve(5, now);
             }
-            // burn also consumes the synced 7d, so sample whenever burn shows too.
-            if uses("limit7d") || uses_burn {
-                burn::rl_sample(&cfg.rl7d_file, &p.wd_pct_raw, &p.wd_rst, burn::RL_MAX_7D, now);
+            if gate7 {
+                g.resolve(7, now);
             }
         }
+        gate = Some(g);
     }
-    let burn_est = if uses_burn {
-        Some(burn::burn_estimate(
-            &cfg, &p.fh_pct_raw, &p.fh_rst, &p.wd_pct_raw, &p.wd_rst, now,
-        ))
-    } else {
-        None
+    let burn_est = match (&gate, uses_burn) {
+        (Some(g), true) => Some(burn::burn_estimate(g, cfg.limit_sync, now)),
+        _ => None,
     };
 
     // seg_dir collapses the *shell* $HOME (matches upstream `${cwd/#$HOME/~}`),
     // which differs from the Windows USERPROFILE used for filesystem paths.
-    render::render(&cfg, &p, &git, &shell_home(), h, m, s, now, burn_est.as_ref())
+    render::render(
+        &cfg,
+        &p,
+        &git,
+        &shell_home(),
+        h,
+        m,
+        s,
+        now,
+        burn_est.as_ref(),
+        gate.as_ref(),
+    )
+}
+
+/// Drop C0, DEL, and C1 control characters — upstream's jq `scrub`, applied to
+/// every extracted field so a crafted payload can't smuggle terminal escapes.
+pub(crate) fn scrub(s: &str) -> String {
+    s.chars()
+        .filter(|&c| {
+            let u = c as u32;
+            !(u < 0x20 || u == 0x7f || (0x80..=0x9f).contains(&u))
+        })
+        .collect()
 }
 
 fn extract(j: &Json) -> Payload {
-    let s = |path: &[&str]| {
-        j.path(path)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
+    let s = |path: &[&str]| scrub(j.path(path).and_then(|v| v.as_str()).unwrap_or(""));
     let f = |path: &[&str]| j.path(path).and_then(|v| v.as_f64());
     let i = |path: &[&str]| f(path).map(|x| x as i64).unwrap_or(0);
+    // jq `// ""` then `tostring`: strings and numbers survive, everything else
+    // (absent, null, false) reads as the empty field.
     let tok = |path: &[&str]| match j.path(path) {
-        Some(Json::Str(st)) => st.clone(),
-        Some(Json::Num(n)) => fmt_num(*n),
+        Some(Json::Str(st)) => scrub(st),
+        Some(Json::Num(n)) => scrub(&fmt_num(*n)),
         _ => String::new(),
     };
 
@@ -188,21 +240,52 @@ fn extract(j: &Json) -> Payload {
         }
     };
 
+    // ctx_empty: a context window that is absent, or present but reporting no
+    // percentage — the only shape VL_CTX_ALWAYS_SHOW is allowed to render as 0%.
+    let ctx_empty = match j.path(&["context_window"]) {
+        None | Some(Json::Null) => true,
+        Some(Json::Obj(_)) => match j.path(&["context_window", "used_percentage"]) {
+            None | Some(Json::Null) => true,
+            Some(Json::Str(v)) => v.is_empty(),
+            _ => false,
+        },
+        _ => false,
+    };
+
+    let cost_kind = match j.path(&["cost"]) {
+        None | Some(Json::Null) => CostKind::Missing,
+        Some(Json::Obj(_)) => match j.path(&["cost", "total_cost_usd"]) {
+            None | Some(Json::Null) => CostKind::Missing,
+            Some(Json::Str(v)) if v.is_empty() => CostKind::Missing,
+            Some(Json::Str(v)) => {
+                if scrub(v) != *v {
+                    CostKind::Invalid
+                } else {
+                    CostKind::Scalar
+                }
+            }
+            Some(Json::Num(_)) => CostKind::Scalar,
+            _ => CostKind::Invalid,
+        },
+        _ => CostKind::Invalid,
+    };
+
     Payload {
         cwd,
         model: s(&["model", "display_name"]),
-        ctx_pct: f(&["context_window", "used_percentage"]),
+        ctx_pct: tok(&["context_window", "used_percentage"]),
+        ctx_empty,
+        json_ok: matches!(j, Json::Obj(_)),
         tok_in: i(&["context_window", "total_input_tokens"]),
         tok_out: i(&["context_window", "total_output_tokens"]),
         tok_cr: i(&["context_window", "current_usage", "cache_read_input_tokens"]),
         tok_cw: i(&["context_window", "current_usage", "cache_creation_input_tokens"]),
-        fh_pct: f(&["rate_limits", "five_hour", "used_percentage"]),
-        fh_pct_raw: tok(&["rate_limits", "five_hour", "used_percentage"]),
+        fh_pct: tok(&["rate_limits", "five_hour", "used_percentage"]),
         fh_rst: tok(&["rate_limits", "five_hour", "resets_at"]),
-        wd_pct: f(&["rate_limits", "seven_day", "used_percentage"]),
-        wd_pct_raw: tok(&["rate_limits", "seven_day", "used_percentage"]),
+        wd_pct: tok(&["rate_limits", "seven_day", "used_percentage"]),
         wd_rst: tok(&["rate_limits", "seven_day", "resets_at"]),
-        cost: f(&["cost", "total_cost_usd"]),
+        cost: tok(&["cost", "total_cost_usd"]),
+        cost_kind,
         lines_add: i(&["cost", "total_lines_added"]),
         lines_del: i(&["cost", "total_lines_removed"]),
         out_style: s(&["output_style", "name"]),

@@ -31,7 +31,7 @@ check(){ # $1=label  (reads conf on stdin into $tmp/conf, COLUMNS via $2)
   else printf '  ✗ %s\n' "$label"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
 }
 
-for theme in claude-coral catppuccin-mocha nord gruvbox-dark tokyo-night mono dracula reverie lunar-pink; do
+for theme in claude-coral catppuccin-mocha nord gruvbox-dark tokyo-night mono dracula reverie lunar-pink morning-haze; do
   printf '. %s/themes/%s.conf\nVL_SEGMENTS="%s"\n' "$RT" "$theme" "$SEGS" > "$tmp/conf"
   check "theme: $theme"
 done
@@ -207,6 +207,16 @@ SPAY2="{\"tasks\":[{\"id\":\"e1\",\"label\":\"timed\",\"status\":\"running\",\"s
 subcheck "subagent: elapsed (seconds masked)" "$SPAY2" "sed -E 's/(⧖ [0-9]+h[0-9]+m)[0-9]+s/\\1XXs/'"
 subcheck "subagent: concatenated docs → last wins" "{\"tasks\":[{\"id\":\"old\",\"label\":\"stale\",\"status\":\"running\"}]}${SPAY}"
 subcheck "subagent: empty tasks → no output" "{\"tasks\":[]}"
+# The name pill's status inks are adopted only while the palette (and, in the
+# styles that paint one, the bar) is still the one they were solved against.
+printf '. %s/themes/claude-coral.conf\nVL_SUB_SEGMENTS="name"\nVL_FG_OK="0,0,0"\n' "$RT" > "$tmp/conf"
+subcheck "subagent: a retinted palette keeps its own inks" "$SPAY"
+printf '. %s/themes/claude-coral.conf\nVL_SUB_SEGMENTS="name"\nVL_BG_SUB_NAME=""\n' "$RT" > "$tmp/conf"
+subcheck "subagent: explicit VL_BG_SUB_NAME restores the light pill" "$SPAY"
+printf '. %s/themes/claude-coral.conf\nVL_SUB_SEGMENTS="name"\nVL_STYLE="lean"\n' "$RT" > "$tmp/conf"
+subcheck "subagent: bare lean bows out of the pill inks" "$SPAY"
+printf '. %s/themes/morning-haze.conf\nVL_SUB_SEGMENTS="name model ctx"\n' "$RT" > "$tmp/conf"
+subcheck "subagent: morning-haze theme candidates" "$SPAY"
 unset CORALLINE_CONFIG
 rm -rf "$sa"
 
@@ -216,12 +226,16 @@ ix=$(mktemp -d)
 if command -v cygpath >/dev/null 2>&1; then ixp=$(cygpath -m "$ix"); else ixp="$ix"; fi
 printf '. %s/themes/claude-coral.conf\nVL_LIMIT_SYNC=1\nVL_SEGMENTS="limit5h"\n' "$RT" > "$tmp/conf"
 IXPAY5="{\"rate_limits\":{\"five_hour\":{\"used_percentage\":62.4,\"resets_at\":$((NOWT+3600))}}}"
-IXPAY4="{\"rate_limits\":{\"five_hour\":{\"used_percentage\":40,\"resets_at\":$((NOWT+3600))}}}"
 env CORALLINE_RL5H_FILE="$ixp/limit-5h.tsv" CORALLINE_CONFIG="$tmp/conf" \
-  bash "$US" <<<"$IXPAY5" 2>/dev/null | mask > "$tmp/b"        # bash records 62.4
+  bash "$US" <<<"$IXPAY5" >/dev/null 2>&1                      # bash records 62.4
+# A session with no reading of its own takes the store as its sole source, so
+# this is the read path both renderers have to agree on byte-for-byte.
 env CORALLINE_RL5H_FILE="$ixp/limit-5h.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
-  "$EXE" <<<"$IXPAY4" 2>/dev/null | mask > "$tmp/e"            # rust must read it back
-if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "interop: rust reads bash-written rl store"; pass=$((pass+1))
+  bash "$US" <<<'{}' 2>/dev/null | mask > "$tmp/b"
+env CORALLINE_RL5H_FILE="$ixp/limit-5h.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
+  "$EXE" <<<'{}' 2>/dev/null | mask > "$tmp/e"
+if diff -q "$tmp/b" "$tmp/e" >/dev/null && grep -q '62' "$tmp/e"; then
+  printf '  ✓ %s\n' "interop: rust reads bash-written rl store"; pass=$((pass+1))
 else printf '  ✗ %s\n' "interop: rust reads bash-written rl store"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
 printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="burn"\n' "$RT" > "$tmp/conf"
 for i in 0 1 2 3 4; do printf '%s\t%s\t%s\n' $((NOWT-300+i*60)) $((40+i*3)) $((NOWT+7200)); done > "$ix/burn-5h.tsv"
@@ -229,21 +243,78 @@ env CORALLINE_BURN_FILE="$ixp/burn-5h.tsv" CORALLINE_CONFIG="$tmp/conf" \
   "$EXE" <<<"{\"rate_limits\":{\"five_hour\":{\"used_percentage\":55,\"resets_at\":$((NOWT+7200))}}}" 2>/dev/null | mask > "$tmp/e"   # rust appends its own sample
 env CORALLINE_BURN_FILE="$ixp/burn-5h.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
   bash "$US" <<<"{\"rate_limits\":{\"five_hour\":{\"used_percentage\":55,\"resets_at\":$((NOWT+7200))}}}" 2>/dev/null | mask > "$tmp/b"
-if diff -q "$tmp/b" "$tmp/e" >/dev/null && grep -q "	55	" "$ix/burn-5h.tsv"; then
+if diff -q "$tmp/b" "$tmp/e" >/dev/null && grep -q "	55.000	" "$ix/burn-5h.tsv"; then
   printf '  ✓ %s\n' "interop: bash reads rust-appended burn samples"; pass=$((pass+1))
 else printf '  ✗ %s\n' "interop: bash reads rust-appended burn samples"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
-# trim rewrite equality: an over-cap file must be rewritten byte-identically
-# (this pins the awk CONVFMT %.6g stringification of fractional percents).
+# trim rewrite equality: an over-cap file must be rewritten byte-identically,
+# down to the canonical %d.%03d percentages the rewrite emits. Trimming is a
+# mutation, so CORALLINE_NO_SAMPLE would suppress it; the payload carries no
+# rate_limits instead, which keeps either renderer from appending a row of its
+# own (whose timestamp would differ between the two runs).
 mktrim() { for i in $(seq 1 1600); do printf '%s\t%s\t%s\n' $((NOWT-3200+i)) "4$((i%2)).${i}5" $((NOWT+7200)); done; }
 mktrim > "$ix/tb.tsv"; mktrim > "$ix/te.tsv"
-env CORALLINE_BURN_FILE="$ixp/tb.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
-  bash "$US" <<<"$BPAY" >/dev/null 2>&1
-env CORALLINE_BURN_FILE="$ixp/te.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
-  "$EXE" <<<"$BPAY" >/dev/null 2>&1
+env CORALLINE_BURN_FILE="$ixp/tb.tsv" CORALLINE_CONFIG="$tmp/conf" bash "$US" <<<'{}' >/dev/null 2>&1
+env CORALLINE_BURN_FILE="$ixp/te.tsv" CORALLINE_CONFIG="$tmp/conf" "$EXE" <<<'{}' >/dev/null 2>&1
 if diff -q "$ix/tb.tsv" "$ix/te.tsv" >/dev/null && [ "$(wc -l < "$ix/tb.tsv")" -le 1500 ]; then
   printf '  ✓ %s\n' "interop: burn trim rewrite is byte-identical"; pass=$((pass+1))
 else printf '  ✗ %s\n' "interop: burn trim rewrite is byte-identical"; diff "$ix/tb.tsv" "$ix/te.tsv" | head -4; fail=$((fail+1)); fi
 rm -rf "$ix"
+
+# ── 2026-08 upstream features ────────────────────────────────────────────────
+# Glyph overrides (#47): a terminal font without the plain-Unicode ⬡/⬢ can swap
+# them for characters it does carry, on the main bar and the panel rows alike.
+printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="project ctx"\nVL_CTX_GLYPH="C"\nVL_PROJECT_GLYPH="P"\n' "$RT" > "$tmp/conf"
+check "glyph: VL_CTX_GLYPH + VL_PROJECT_GLYPH"
+printf '. %s/themes/claude-coral.conf\nVL_SUB_SEGMENTS="name ctx"\nVL_CTX_GLYPH="C"\n' "$RT" > "$tmp/conf"
+CORALLINE_CONFIG="$tmp/conf" bash "$US" --subagent <<<"{\"tasks\":[{\"id\":\"g\",\"label\":\"glyph\",\"status\":\"running\",\"contextWindowSize\":200000,\"tokenCount\":42000}]}" 2>/dev/null > "$tmp/b"
+CORALLINE_CONFIG="$tmp/conf" "$EXE" --subagent <<<"{\"tasks\":[{\"id\":\"g\",\"label\":\"glyph\",\"status\":\"running\",\"contextWindowSize\":200000,\"tokenCount\":42000}]}" 2>/dev/null > "$tmp/e"
+if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "glyph: subagent ctx row"; pass=$((pass+1))
+else printf '  ✗ %s\n' "glyph: subagent ctx row"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+
+# VL_CTX_ALWAYS_SHOW / VL_COST_ALWAYS_SHOW: an empty-but-valid reading renders
+# as 0% / $0.00; a malformed one still hides the segment.
+alwayscheck() { # $1=label $2=payload
+  COLUMNS= CORALLINE_CONFIG="$tmp/conf" bash "$US" <<<"$2" 2>/dev/null | mask > "$tmp/b"
+  COLUMNS= CORALLINE_CONFIG="$tmp/conf" "$EXE"      <<<"$2" 2>/dev/null | mask > "$tmp/e"
+  if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "$1"; pass=$((pass+1))
+  else printf '  ✗ %s\n' "$1"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+}
+printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="ctx cost clock"\nVL_CTX_ALWAYS_SHOW=1\nVL_COST_ALWAYS_SHOW=1\n' "$RT" > "$tmp/conf"
+alwayscheck "always-show: absent ctx/cost render as zero" '{"cwd":"/tmp"}'
+alwayscheck "always-show: empty context_window object" '{"context_window":{},"cost":{}}'
+alwayscheck "always-show: null used_percentage / total_cost_usd" '{"context_window":{"used_percentage":null},"cost":{"total_cost_usd":null}}'
+alwayscheck "always-show: non-object context_window/cost stay hidden" '{"context_window":7,"cost":"x"}'
+alwayscheck "always-show: real values still win" '{"context_window":{"used_percentage":62},"cost":{"total_cost_usd":1.23}}'
+printf '. %s/themes/claude-coral.conf\nVL_SEGMENTS="ctx cost clock"\n' "$RT" > "$tmp/conf"
+alwayscheck "always-show: off by default" '{"cwd":"/tmp"}'
+alwayscheck "cost: negative and out-of-range values are refused" '{"cost":{"total_cost_usd":-4}}'
+alwayscheck "cost: exponent form" '{"cost":{"total_cost_usd":"1.5e-2"}}'
+
+# The limit gauge after a window elapses (#57) and with no reading of our own
+# (#63): an idle session keeps showing the window it last saw, and a session
+# that has never had a reading borrows the store's still-open window.
+le=$(mktemp -d)
+if command -v cygpath >/dev/null 2>&1; then lep=$(cygpath -m "$le"); else lep="$le"; fi
+printf '. %s/themes/claude-coral.conf\nVL_LIMIT_SYNC=1\nVL_SEGMENTS="limit5h clock"\n' "$RT" > "$tmp/conf"
+elapsedcheck() { # $1=label $2=payload
+  env CORALLINE_RL5H_FILE="$lep/limit-5h.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
+    bash "$US" <<<"$2" 2>/dev/null | mask > "$tmp/b"
+  env CORALLINE_RL5H_FILE="$lep/limit-5h.tsv" CORALLINE_NO_SAMPLE=1 CORALLINE_CONFIG="$tmp/conf" \
+    "$EXE" <<<"$2" 2>/dev/null | mask > "$tmp/e"
+  if diff -q "$tmp/b" "$tmp/e" >/dev/null; then printf '  ✓ %s\n' "$1"; pass=$((pass+1))
+  else printf '  ✗ %s\n' "$1"; diff "$tmp/b" "$tmp/e" | head -4; fail=$((fail+1)); fi
+}
+elapsedcheck "limit sync: window elapsed minutes ago still renders" \
+  "{\"rate_limits\":{\"five_hour\":{\"used_percentage\":41,\"resets_at\":$((NOWT-600))}}}"
+elapsedcheck "limit sync: window elapsed past the ceiling is dropped" \
+  "{\"rate_limits\":{\"five_hour\":{\"used_percentage\":41,\"resets_at\":$((NOWT-100000))}}}"
+elapsedcheck "limit sync: no reset parsed → nothing to show" \
+  '{"rate_limits":{"five_hour":{"used_percentage":41}}}'
+mkdir -p "$le/limit-5h.d/$(printf '%010d_%07.3f' $((NOWT+3600)) 33.5)"
+elapsedcheck "limit sync: store is the sole source without an own reading" '{}'
+elapsedcheck "limit sync: a newer stored window beats an older own one" \
+  "{\"rate_limits\":{\"five_hour\":{\"used_percentage\":41,\"resets_at\":$((NOWT+60))}}}"
+rm -rf "$le"
 
 # HOME collapse: cwd under $HOME renders as ~/… with no stray characters.
 # MSYS path-converts a POSIX-looking HOME before a native exe sees it (and

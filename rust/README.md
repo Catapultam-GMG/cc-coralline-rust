@@ -27,9 +27,12 @@ needs **no `jq`**, and parses JSON + renders in well under a millisecond.
 all three styles (pill/lean/classic), both layouts, ASCII mode, the clock
 variants, the `node`/`python`/`burn` segments, cross-session limit sync
 (including shared-store interop: each renderer reads state the other wrote, and
-the burn-file trim rewrite is compared byte-for-byte), and `--subagent` panel
-rows, using upstream's own `test/sample-input.json`. Volatile fields
-(wall-clock, rate-limit countdowns) are masked. Run it:
+the burn-file trim rewrite is compared byte-for-byte), the glyph overrides,
+`VL_CTX_ALWAYS_SHOW` / `VL_COST_ALWAYS_SHOW`, the elapsed-window and
+store-only limit fallbacks, and `--subagent` panel rows (including the themed
+name-pill inks and the fingerprint checks that withdraw them), using upstream's
+own `test/sample-input.json`. Volatile fields (wall-clock, rate-limit
+countdowns) are masked. Run it:
 
 ```bash
 ./test-parity.sh            # from the rust/ directory
@@ -73,6 +76,15 @@ Identical to upstream — it reads the same `~/.claude/coralline.conf` (and its
 `. include` of a theme file) and the same `VL_*` variables. See the
 [main README](../README.md) for the full configuration reference and theme
 gallery, and [`INSTALL.md`](INSTALL.md) for the guided (AI-agent) installer.
+
+That includes the 2026-08 upstream knobs: `VL_CTX_GLYPH` / `VL_PROJECT_GLYPH`
+(swap the plain-Unicode `⬡`/`⬢` for characters your terminal font carries),
+`VL_CTX_ALWAYS_SHOW` / `VL_COST_ALWAYS_SHOW` (render an empty-but-valid reading
+as `0%` / `$0.00` instead of hiding the segment), and the themed subagent
+name pill (`VL_BG_SUB_NAME` plus the `VL_FG_SUB_TEXT` / `_OK` / `_HOT` / `_DIM`
+status inks, adopted from a theme's candidates only while the palette they were
+solved against is intact). The burn and rate-limit stores use upstream's
+canonical on-disk format, so both renderers can share one state directory.
 
 ## Beyond upstream
 

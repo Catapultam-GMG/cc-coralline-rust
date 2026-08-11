@@ -63,8 +63,10 @@ Use your interactive question tool (e.g. `AskUserQuestion`); otherwise ask in
 plain text. Ask these five, showing theme previews from the
 [main README](../README.md) gallery so they can compare:
 
-1. **Theme** — claude-coral · catppuccin-mocha · nord · gruvbox-dark · tokyo-night · dracula · mono
-2. **Style** — `pill` (powerline) or `lean` (flat p10k text)
+1. **Theme** — claude-coral · catppuccin-mocha · nord · gruvbox-dark · tokyo-night ·
+   dracula · mono · reverie · lunar-pink · morning-haze
+2. **Style** — `pill` (powerline), `lean` (flat p10k text), or `classic`
+   (p10k's uniform dark bar)
 3. **Layout** — `auto` (responsive, wraps when narrow) or `fixed` (pinned rows)
 4. **Clock** — `12h` / `24h` / `off`, and seconds on/off
 5. **Segments** — default `dir git model ctx limit5h limit7d cost clock`; offer
@@ -90,8 +92,17 @@ VL_LAYOUT="auto"
 VL_SEGMENTS="dir git model ctx limit5h limit7d cost clock"
 VL_CLOCK="12h"
 VL_CLOCK_SECONDS=1
-# VL_NAME_MAX=20   # uncomment to truncate long project/branch names
+# VL_NAME_MAX=20        # uncomment to truncate long project/branch names
+# VL_CTX_GLYPH="⬡"      # swap if the terminal font renders ⬡/⬢ double-width
+# VL_PROJECT_GLYPH="⬢"
+# VL_CTX_ALWAYS_SHOW=1  # show an empty-but-valid context window as 0%
+# VL_COST_ALWAYS_SHOW=1 # show a missing-but-valid cost as $0.00
 ```
+
+If the user reports that `⬡` or `⬢` renders wide enough to shove the rest of the
+row out of alignment, set `VL_CTX_GLYPH` / `VL_PROJECT_GLYPH` to characters their
+font actually carries — these are plain Unicode, not Nerd Font icons, so the
+terminal's own fallback decides their width.
 
 ## Step 5 — Register in `settings.json`
 

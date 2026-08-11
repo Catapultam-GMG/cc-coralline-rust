@@ -32,6 +32,10 @@ pub struct Config {
     pub project_roots: Vec<String>,
     pub name_max: i64,
     pub cost_decimals: usize,
+    pub ctx_glyph: String,
+    pub project_glyph: String,
+    pub ctx_always_show: bool,
+    pub cost_always_show: bool,
     pub warn_pct: i64,
     pub hot_pct: i64,
     pub ascii: bool,
@@ -81,6 +85,30 @@ pub struct Config {
     pub fg_ok: String,
     pub fg_warn: String,
     pub fg_hot: String,
+    // Subagent name-pill inks; empty → the main VL_FG_* counterpart.
+    pub fg_sub_text: String,
+    pub fg_sub_ok: String,
+    pub fg_sub_hot: String,
+    pub fg_sub_dim: String,
+}
+
+/// Assignments that only matter while resolving the subagent name pill: the
+/// theme's candidate colors plus the palette/bar fingerprints they were solved
+/// against, and whether the user set the public knobs themselves.
+#[derive(Default)]
+struct SubCandidates {
+    bg_name_set: bool,
+    bg_name: Option<String>,
+    fg_text: Option<String>,
+    fg_ok: Option<String>,
+    fg_hot: Option<String>,
+    fg_dim: Option<String>,
+    fp: Option<String>,
+    bar: Option<String>,
+    user_fg_text: Option<String>,
+    user_fg_ok: Option<String>,
+    user_fg_hot: Option<String>,
+    user_fg_dim: Option<String>,
 }
 
 impl Default for Config {
@@ -112,6 +140,10 @@ impl Default for Config {
             project_roots: Vec::new(),
             name_max: 0,
             cost_decimals: 2,
+            ctx_glyph: "\u{2B21}".into(),
+            project_glyph: "\u{2B22}".into(),
+            ctx_always_show: false,
+            cost_always_show: false,
             warn_pct: 50,
             hot_pct: 75,
             ascii: false,
@@ -158,6 +190,10 @@ impl Default for Config {
             fg_ok: "114".into(),
             fg_warn: "179".into(),
             fg_hot: "167".into(),
+            fg_sub_text: "".into(),
+            fg_sub_ok: "".into(),
+            fg_sub_hot: "".into(),
+            fg_sub_dim: "".into(),
         }
     }
 }
@@ -188,7 +224,13 @@ impl Config {
             .ok()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("{home}/.claude/coralline.conf")));
-        c.apply_file(&conf, home, 0);
+        // The name-pill palette is only safe while the palette it was solved
+        // against is intact, so fingerprint the built-ins before the config runs.
+        let stock_fp = c.palette_fp();
+        let stock_bar = c.bar_fp();
+        let mut sub = SubCandidates::default();
+        c.apply_file(&conf, home, 0, &mut sub);
+        c.resolve_sub_name(&sub, &stock_fp, &stock_bar);
         c.burn_file = expand(&c.burn_file, home);
         c.rl5h_file = expand(&c.rl5h_file, home);
         c.rl7d_file = expand(&c.rl7d_file, home);
@@ -201,7 +243,46 @@ impl Config {
         c
     }
 
-    fn apply_file(&mut self, path: &Path, home: &str, depth: u8) {
+    fn palette_fp(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.bg_dir, self.fg_text, self.fg_ok, self.fg_hot, self.fg_dim
+        )
+    }
+
+    fn bar_fp(&self) -> String {
+        format!("{}|{}", self.bg_bar, self.lean_bg)
+    }
+
+    /// Adopt a theme's name-pill candidates only while nothing retinted the
+    /// palette (or the bar the lean/classic styles paint the row on) after the
+    /// theme was sourced — otherwise a dark ink can end up on a dark pill.
+    fn resolve_sub_name(&mut self, sub: &SubCandidates, stock_fp: &str, stock_bar: &str) {
+        let mut ok = !sub.bg_name_set && self.lean_fg.is_empty();
+        if self.style == "lean" || self.style == "classic" {
+            if self.style == "lean" && self.lean_bg.is_empty() {
+                ok = false; // bare lean paints no ground at all
+            }
+            if self.bar_fp() != *sub.bar.clone().unwrap_or_else(|| stock_bar.to_string()) {
+                ok = false;
+            }
+        }
+        if !ok || self.palette_fp() != *sub.fp.clone().unwrap_or_else(|| stock_fp.to_string()) {
+            return;
+        }
+        let pick = |user: &Option<String>, cand: &Option<String>, def: &str| -> String {
+            user.clone()
+                .or_else(|| cand.clone())
+                .unwrap_or_else(|| def.to_string())
+        };
+        self.bg_sub_name = sub.bg_name.clone().unwrap_or_else(|| "68,68,68".into());
+        self.fg_sub_text = pick(&sub.user_fg_text, &sub.fg_text, "255,255,255");
+        self.fg_sub_ok = pick(&sub.user_fg_ok, &sub.fg_ok, "");
+        self.fg_sub_hot = pick(&sub.user_fg_hot, &sub.fg_hot, "231,157,157");
+        self.fg_sub_dim = pick(&sub.user_fg_dim, &sub.fg_dim, "177,177,177");
+    }
+
+    fn apply_file(&mut self, path: &Path, home: &str, depth: u8, sub: &mut SubCandidates) {
         if depth > 4 {
             return;
         }
@@ -224,13 +305,42 @@ impl Config {
                 .map(str::trim);
             if let Some(incpath) = inc {
                 let expanded = expand(incpath, home);
-                self.apply_file(Path::new(&expanded), home, depth + 1);
+                self.apply_file(Path::new(&expanded), home, depth + 1, sub);
                 continue;
             }
             if let Some(eq) = line.find('=') {
                 let key = line[..eq].trim();
                 let val = unquote(line[eq + 1..].trim());
-                self.set(key, &val);
+                match key {
+                    "_VL_SUB_BG_NAME" => sub.bg_name = Some(val),
+                    "_VL_SUB_FG_TEXT" => sub.fg_text = Some(val),
+                    "_VL_SUB_FG_OK" => sub.fg_ok = Some(val),
+                    "_VL_SUB_FG_HOT" => sub.fg_hot = Some(val),
+                    "_VL_SUB_FG_DIM" => sub.fg_dim = Some(val),
+                    "_VL_SUB_FP" => sub.fp = Some(val),
+                    "_VL_SUB_BAR" => sub.bar = Some(val),
+                    "VL_FG_SUB_TEXT" => {
+                        sub.user_fg_text = Some(val.clone());
+                        self.fg_sub_text = val;
+                    }
+                    "VL_FG_SUB_OK" => {
+                        sub.user_fg_ok = Some(val.clone());
+                        self.fg_sub_ok = val;
+                    }
+                    "VL_FG_SUB_HOT" => {
+                        sub.user_fg_hot = Some(val.clone());
+                        self.fg_sub_hot = val;
+                    }
+                    "VL_FG_SUB_DIM" => {
+                        sub.user_fg_dim = Some(val.clone());
+                        self.fg_sub_dim = val;
+                    }
+                    "VL_BG_SUB_NAME" => {
+                        sub.bg_name_set = true;
+                        self.bg_sub_name = val;
+                    }
+                    _ => self.set(key, &val),
+                }
             }
         }
     }
@@ -270,6 +380,10 @@ impl Config {
             }
             "VL_NAME_MAX" => self.name_max = v.parse().unwrap_or(self.name_max),
             "VL_COST_DECIMALS" => self.cost_decimals = v.parse().unwrap_or(self.cost_decimals),
+            "VL_CTX_GLYPH" => self.ctx_glyph = v,
+            "VL_PROJECT_GLYPH" => self.project_glyph = v,
+            "VL_CTX_ALWAYS_SHOW" => self.ctx_always_show = v == "1",
+            "VL_COST_ALWAYS_SHOW" => self.cost_always_show = v == "1",
             "VL_WARN_PCT" => self.warn_pct = v.parse().unwrap_or(self.warn_pct),
             "VL_HOT_PCT" => self.hot_pct = v.parse().unwrap_or(self.hot_pct),
             "VL_ASCII" => self.ascii = v == "1",
