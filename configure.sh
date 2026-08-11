@@ -172,6 +172,16 @@ knob_names() {  # $1=statusline file
     | sed -E 's/=0.*$//' | sort -u | tr '\n' ' '
 }
 
+# Glyph knobs (VL_CTX_GLYPH, VL_BAR_EMPTY, ...) are deliberately NOT reported
+# here. An option token is the exact assignment the UPGRADE.md playbook appends,
+# and the right value for a glyph depends on what the user's terminal font
+# carries — something no delta can know. Emitting the shipped default would
+# write a no-op; emitting a replacement would change the look of installs that
+# render fine. Worse, the two gauge knobs are not new, so a "new since your
+# installed copy" report structurally cannot surface them at all. That check
+# lives in UPGRADE.md's verification step instead, where the user is already
+# looking at a rendered line (#47).
+
 # Inline comment after `seg_<name>() {`, else empty.
 segment_desc() {  # $1=statusline file $2=segment name
   local line

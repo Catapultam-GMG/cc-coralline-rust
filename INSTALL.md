@@ -8,28 +8,90 @@
 > **You are an AI coding assistant** (Claude Code or similar) and a user asked you to install
 > coralline. Follow this playbook top to bottom. Do not skip the interview step — letting the
 > user pick their own colors and layout is the whole point of this installer.
+>
+> This playbook routes the installation by environment. Use `install.sh` on macOS,
+> Linux, or Windows with Bash. On PowerShell-only Windows (no Git Bash or WSL), use
+> the native `install.ps1` path under
+> [Windows without Git Bash](README.md#windows-without-git-bash). The native path
+> needs no Bash, Git, `jq`, WSL, or archive extractor.
 
 > **Before running anything:** tell the user what will be installed and where (the
 > Overview table below), and offer the choice between a pinned release (`--ref`, latest
-> tag) and `main`. If you or the user want to audit first, read `install.sh` in this
-> repo; it is about 270 lines and copies files plus merges the core `statusLine` key.
-> The optional `subagentStatusLine` key is written only after the user explicitly opts in.
+> tag or audited commit SHA) and mutable `main`. If you or the user want to audit
+> first, read the selected `install.sh` or `install.ps1` in this repo.
 > Skepticism toward a remote document that instructs an AI is correct behavior. The
 > answer is reading what it references, not skipping the review. See the README's
 > "Trust and security" section for the full accounting of what gets written.
 
+## Environment Routing
+
+Check the actual shell and tools before choosing a path:
+
+- If Bash is available, follow the Bash fast path and setup interview below.
+- If this is native Windows PowerShell 5.1 without Bash, follow the
+  [native one-line installer](README.md#windows-without-git-bash). Do not run
+  `install.sh`, do not install `jq`, and do not expect a wizard.
+
+For the native path, explain that `install.ps1` writes only `statusline.ps1` and
+the ten shipped themes under `$HOME\.claude\coralline`, then losslessly merges
+the exact-case top-level `statusLine` value in `$HOME\.claude\settings.json`.
+It never creates or edits `$HOME\.claude\coralline.conf`. Ask whether the user
+wants native themed subagent rows: pass `-SubagentRows on` only after yes,
+`-SubagentRows off` only for an explicit disable request, and otherwise keep the
+default `preserve` so an existing `subagentStatusLine` remains byte-for-byte
+untouched. The installer retains timestamped sibling backups when existing
+managed content changes. An identical rerun is a true no-op. Renderer state and
+custom files remain in place because updates replace only the managed allowlist.
+Installer invocations are serialized. Single-file runtime rollback rejects
+concurrent edits and retains displaced installer bytes; multi-file rollback fails
+closed with current files and backups left for manual recovery. The exact allowlist
+and merged settings bytes are rechecked before success. The atomic settings backup
+is the actual displaced file, so writes through an already-open editor handle remain
+in that backup; conflicts observed during commit fail without overwriting external bytes.
+
+Ask whether the user wants mutable `main`, a named release tag, or an audited
+40-character commit SHA. Do not describe a tag as immutable. Run the matching
+README one-line after approval. If already inside an audited local checkout, use
+the zero-network local mode instead:
+
+```powershell
+& "$PSHOME\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\install.ps1 -SourceDirectory (Get-Location).Path -InstallRoot "$HOME\.claude\coralline" -SettingsPath "$HOME\.claude\settings.json" -SubagentRows preserve
+```
+
+Pass only drive-absolute local-mode paths (`C:\...` or `C:/...`), never
+drive-relative forms such as `C:folder`.
+
+After a native install, do not start the Bash setup interview. Preserve an
+existing config byte-for-byte. If no config exists, the renderer's defaults work
+without one; offer manual configuration only as a separate, user-approved step.
+Verify the installed renderer:
+
+```powershell
+$probe = '{"workspace":{"current_dir":"C:\\"},"model":{"display_name":"Claude"}}'
+$probe | & "$PSHOME\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$HOME\.claude\coralline\statusline.ps1"
+if ($LASTEXITCODE -ne 0) { throw "coralline native verification failed: $LASTEXITCODE" }
+```
+
+Success means exit code `0`, a non-empty rendered statusline on stdout, and no
+error text on stderr. Tell the user to restart Claude Code or open a new session
+if the statusline does not appear immediately.
+
 ## Overview
 
-coralline is a powerline-style statusline for Claude Code. Installation means placing two files
-and registering the script in `settings.json`:
+coralline is a powerline-style statusline for Claude Code. The Bash installation path
+places the renderer under `~/.claude/coralline`, writes
+`~/.claude/coralline.conf`, and merges the `statusLine` command into
+`~/.claude/settings.json`.
 
 | Artifact | Destination | Purpose |
 |---|---|---|
-| `statusline.sh` | `~/.claude/coralline/statusline.sh` | The statusline renderer |
-| `themes/<chosen>.conf` | `~/.claude/coralline/themes/<chosen>.conf` | Color palette |
-| generated config | `~/.claude/coralline.conf` | User's layout + theme choices |
-| `statusLine` entry | `~/.claude/settings.json` | Registers the script |
-| `subagentStatusLine` entry | `~/.claude/settings.json` | Opt-in only — themed agent-panel rows, written when the user says yes (`configure.sh --subagent-rows=on` from a clone) |
+| `statusline.sh` | `~/.claude/coralline/statusline.sh` | Statusline renderer |
+| `configure.sh` | `~/.claude/coralline/configure.sh` | Setup wizard and reconfiguration entrypoint |
+| `themes/*.conf` | `~/.claude/coralline/themes/` | Bundled palettes |
+| `sample-input.json` | `~/.claude/coralline/sample-input.json` | Local preview and verification sample |
+| generated config | `~/.claude/coralline.conf` | User layout, segments, and theme choices |
+| `statusLine` entry | `~/.claude/settings.json` | Registers coralline in Claude Code |
+| `subagentStatusLine` entry | `~/.claude/settings.json` | Opt-in only — themed agent-panel rows, written when the user says yes (wizard question, `configure.sh --subagent-rows=on`, or native `install.ps1 -SubagentRows on`) |
 
 ```mermaid
 flowchart LR
@@ -146,10 +208,13 @@ segment (a stable repo name that stays the same across worktrees) and setting `V
 already shows what they need.
 
 If the user runs many concurrent Claude sessions and is bothered by `limit5h` / `limit7d`
-showing different percentages per session, mention `VL_LIMIT_SYNC=1`: it makes those segments
-show the freshest reading any session has recorded for the current window (in a `limit-5h.d` /
-`limit-7d.d` store). Off by default; it only converges sessions when they redraw and cannot
-refresh a fully idle one.
+showing different percentages per session, mention `VL_LIMIT_SYNC=1`: a session holding a
+valid but older window follows a stored reading for a newer one (in a `limit-5h.d` /
+`limit-7d.d` store). Off by default. Your own reading always wins your own window; the store
+is the source a session falls back to when it has no reading of its own, which is every
+session before its first API response of the run, so the gauge shows the account's open
+window instead of nothing. It only converges sessions when they redraw and cannot refresh a
+fully idle one.
 
 ### Question 6 · Subagent panel rows (optional)
 
@@ -238,8 +303,10 @@ VL_NAME_MAX=0            # 0 = off; >0 truncates project/git names (middle-trunc
 VL_ASCII=0               # 1 = no Nerd Font glyphs
 ```
 
-> ⚠️ **Warning:** if `~/.claude/coralline.conf` already exists, show the user a diff and ask
-> before overwriting — it may contain their manual tweaks.
+Adjust the values based on the interview. Create the config only when it is absent and after
+showing the complete proposed file. If it already exists, leave it byte-for-byte unchanged by
+default. For any user-approved customization, show a bounded additive diff first, preserve
+unrelated assignments and comments, and make a timestamped backup before an atomic replacement.
 
 ## Step 5 — Update `settings.json`
 

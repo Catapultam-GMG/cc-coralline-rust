@@ -4,6 +4,12 @@
 > backs up the old `statusline.sh` and never touches `~/.claude/coralline.conf`. It
 > only *reports* what is new; you enable the new opt-in features additively, with the
 > user's consent.
+>
+> This playbook updates Bash-based installs. On PowerShell-only Windows, do not run
+> `install.sh`; re-run the native archive procedure under
+> [Windows without Git Bash](README.md#windows-without-git-bash). It preserves
+> `coralline.conf` and keeps `subagentStatusLine` unchanged by default; use
+> `-SubagentRows on` or `-SubagentRows off` only for an explicit user choice.
 
 ## Overview
 
@@ -42,7 +48,9 @@ Contract: each item line is `  <kind>  <token>  <free-text description>`. `<kind
 is `segment` or `option`. For `segment`, `<token>` is the segment name. For
 `option`, `<token>` is the exact assignment to add (e.g. `VL_FLOAT=1`). Everything
 after `<token>` is a human description that may contain spaces and `=` — do not
-parse it. If there is no report, the install is already current — stop here.
+parse it. An empty report means no new segments or options, not that nothing
+changed: the runtime was still replaced. Skip the interview and the config write,
+and go straight to **Verification**.
 
 ## Enable interview
 
@@ -76,6 +84,11 @@ append the approved segments:
 
 followed by one line per approved option.
 
+Before writing an existing `coralline.conf`, show the bounded additive diff and obtain
+explicit approval. Leave the file byte-for-byte unchanged when no change was approved.
+When a write is approved, create a timestamped byte-exact backup and replace through a
+sibling temporary file; never reorder, drop, or rewrite unrelated content.
+
 ## Verification
 
 Render once with the bundled sample to confirm it still renders and the new
@@ -84,8 +97,25 @@ segments are present:
     cat ~/.claude/coralline/sample-input.json | CORALLINE_NO_SAMPLE=1 bash ~/.claude/coralline/statusline.sh
 
 A newly added segment like `burn` may show a neutral "warming" glyph until real
-usage data accrues — that is expected. Then tell the user to restart Claude Code
-or open a new session.
+usage data accrues — that is expected.
+
+Then check the glyphs, which the delta cannot do for you: the gauge and segment
+characters are plain Unicode rather than Nerd Font icons, so a font that lacks
+them leaves the substitution to the terminal, which may pick one wider than a
+cell and push the row out of alignment. Ask the user to look at the rendered
+line. If the gauge blocks run together, or the `ctx` / `project` glyph looks too
+wide and everything after it is shifted, offer the replacements below — each is
+present at exactly one cell in both Meslo and JetBrainsMono Nerd Font. Write only
+the ones the user asks for, and never overwrite a value they already set:
+
+    VL_BAR_FILL="▪"     VL_BAR_EMPTY="▫"
+    VL_CTX_GLYPH="◔"    VL_PROJECT_GLYPH="▣"
+
+Note these are not upgrade items and will never appear in the delta: `VL_BAR_FILL`
+and `VL_BAR_EMPTY` are not new, and the right value for any of the four depends on
+the user's font rather than on which version they came from.
+
+Then tell the user to restart Claude Code or open a new session.
 
 ## Manual fallback
 

@@ -1,0 +1,118 @@
+# coralline 效能量測方法
+
+[English](./BENCHMARK.md)
+
+Claude Code 每秒重跑一次狀態列，所以單次 render 的成本是產品層級的限制，不是細節。這份文件記錄 release notes 裡那些效能數字是怎麼量出來的。它之所以存在，是因為 v0.13.0 期間有好幾次量測看起來完全合理，結果卻是錯的，而且每一次都錯得很有說服力：數字乾淨、可讀、可引用，只是不成立。
+
+## 該量什麼
+
+**要回答「這個改動是不是多做了工」，就量 CPU 時間（`user + sys`），不要量牆鐘時間。** 在並行情境下牆鐘時間被排程和資源競爭主導：40% 的 CPU 節省可能在牆鐘時間上完全看不出來，而一個寫壞的量測台可以憑空造出 2 倍的牆鐘差異。
+
+**牆鐘時間回答的是另一個問題：使用者實際等多久。** 當你要主張的是「有沒有落在 refresh 間隔內」，就用牆鐘時間，而且要量整個行程，包含直譯器啟動。兩者不能互換，release notes 若把兩種混著寫，自己就會前後矛盾。v0.13.0 的 PowerShell 數字依據引用哪一種，會差 400 毫秒，而這個差距剛好跨在一秒門檻的兩側。
+
+另外一定要量**直譯器地板**：在那台機器上，一個什麼都不做的 `bash` 或 `powershell.exe` 要花多久。把成本歸給 coralline 之前，先把這一段扣掉。
+
+## 實驗設計
+
+**配對交替輪次。** 每一輪把所有 arm 背靠背跑完。這樣環境負載會落在同一輪的每個 arm 上，而不是剛好砸在某一個身上。
+
+**輪替誰先跑。** 第 `r` 輪從第 `r % 總數` 個 arm 開始。少了這一步，第一個 arm 會固定承擔冷快取的代價。
+
+**一定要帶一個位元完全相同的控制組。** 把候選版複製成另一個名字，當作獨立版本一起量。它跟候選版量出來的差，就是雜訊底線；任何比這個底線小的數字都不算結果。這是整份文件裡投資報酬率最高的習慣：v0.13.0 期間它擋下了兩個錯誤結論，而那兩個結論本身就是在沒有控制組的情況下產生的。
+
+**回報的是每輪統計量的中位數**，不是所有 render 的平均。先在一輪之內算 p50／p95／max，再取跨輪的中位數。
+
+**配對比值不等於兩個中位數相除。** 如果兩者都要一起發佈，就要講清楚，否則讀者會拿兩個絕對值去除，然後發現對不上你的比值。
+
+## 環境控制
+
+- **關掉正在跑的狀態列。** 那就是受測程式本身，而且每個開著的 session 每秒都在跑。備份 `~/.claude/settings.json`、記下 SHA-256、移除 `statusLine` 與 `subagentStatusLine`、跑完還原、驗證雜湊相符。**把還原放進 `EXIT` 與訊號 trap**，不要只是排在量測指令後面：收到 `SIGINT`、或在 `set -e` 下失敗時，只排在後面的東西不會執行。雜湊驗證也要從同一條清理路徑做。
+- **剝掉繼承來的設定。** 子行程環境裡的 `REMORA_*` 和 `CORALLINE_*` 全部 unset。先前有一批量測就是因為繼承了這些而整批作廢。
+- **絕對不要讓量測指向真實 store。** 每個 arm 給自己的 state 目錄。一個設定檔壞掉的 arm 會退回預設值，然後直接讀寫 `~/.claude/coralline/`。
+- **記錄量測前後的機器負載。** 在 load average 20 量到的結果，跟在 3 量到的不能並列，即使相對關係仍然成立。
+
+## Fixture
+
+每個 arm 拿到內容相同的 state 目錄，同時包含兩種形狀的歷史，這樣一份 fixture 對每個世代都公平：
+
+- `burn-5h.tsv`，放滿 `BURN_TRIM` 列，欄位順序是每個 renderer 都預期的三欄，以 tab 分隔：sample epoch、百分比、reset epoch。注意這個順序和下面 marker 檔名相反，marker 是 reset 在前。無法解析的列不會產生任何 observation，所以欄位寫錯時仍然會跨過實體列數門檻，但量到的是「重寫一份空歷史」。
+- 這組列不會觸發 heal。解析失敗的列會被靜默跳過；只有「解析成功但不合理」的列才會升起 healing 旗標，也就是 `sample > now + 300`、`reset < sample`、或 `reset > now + 21600`。要量 heal 就加一列這種記錄，例如一列格式正確但 reset 是 `now + 99999` 的列，並在結果裡註明。
+- `burn-5h.d/`，放 N 個**空的一般檔案**，命名為 `b_<reset:12>_<sample:12>_<pct>_<counter>`，只有 v0.12 世代會讀它。必須是檔案：那個世代只有在 `[ -f ]`、`[ ! -L ]`、`[ ! -s ]` 同時成立時才接受一個 marker，所以目錄會被枚舉之後丟掉，你量到的是目錄走訪而不是 marker 處理。這件事弄錯的話，1400 個 marker 下 v0.12 會被量成 386 毫秒而不是 1670 毫秒，而且 #58 看起來只改善 13%，實際上是 68%，因為 #58 優化的那段程式碼根本沒被執行到。
+- `limit-5h.d/` 與 `limit-7d.d/`，各放一個**空目錄**，命名為 `<reset:10>_<pct:7.3>`。這兩個是目錄不是檔案：驗證要求 `-d`、非 symlink、且為空。兩種 store 的形狀正好相反，弄成同一種的話會變成有些 arm 讀得到、有些 arm 直接忽略。
+
+**要變動 marker 數量**（350／1400／4000），才看得出成本是否隨歷史成長。單一 fixture 大小分不出「比較慢」和「用越久越慢」，而後者才是真正要處理的缺陷。
+
+**每一輪開始前，每個 arm 都要從不可變的模板重置。** 超過 `BURN_TRIM` 之後，v0.12 世代會把多出來的部分當成 retention candidate，每次 render 刪掉 128 個，所以 4000 個的 store 會掉到 3872、3744、3616。不重置的話，後面幾輪量的是比你在結果裡寫的還小的 fixture。
+
+設 `CORALLINE_NO_SAMPLE=1` 可以單獨量讀取路徑。它跟可寫入版本的差就是寫入路徑，而強化措施的成本通常集中在那裡。
+
+## 產生 fixture
+
+上面所有東西，在沒有給每個 arm 一份「打開 state 路徑」的設定之前都不會執行。預設的 segment 清單裡沒有 `burn`，`VL_LIMIT_SYNC` 預設是 `0`，而沒帶 `CORALLINE_CONFIG` 啟動的 arm 會載入使用者的真實設定，這也正是量測最後會去讀寫真實 store 的原因。
+
+每個 arm 一份，用 LF 換行：
+
+```
+VL_SEGMENTS='dir git model ctx limit5h limit7d burn cost clock'
+VL_LIMIT_SYNC=1
+BURN_FILE='<state>/burn-5h.tsv'
+RL5H_FILE='<state>/limit-5h.tsv'
+RL7D_FILE='<state>/limit-7d.tsv'
+```
+
+它指向的 state 目錄：
+
+```bash
+now=$(date +%s); r5=$((now + 9000)); r7=$((now + 400000))
+mkdir -p "$state/burn-5h.d"
+
+# TSV 三欄：sample、百分比、reset
+awk -v n="$now" -v r="$r5" 'BEGIN{ for (i = 1500; i >= 1; i--) printf "%d\t037.000\t%d\n", n - i, r }' \
+  > "$state/burn-5h.tsv"
+
+# marker：空的一般檔案
+i=0; while [ "$i" -lt "$markers" ]; do
+  printf -v nm 'b_%012d_%012d_%03d.%03d_%04d' "$r5" $((now - markers + i)) 37 0 0
+  : > "$state/burn-5h.d/$nm"; i=$((i + 1))
+done
+
+# limit 記錄：空目錄
+mkdir -p "$state/limit-5h.d/$(printf '%010d_%07.3f' "$r5" 37)" \
+         "$state/limit-7d.d/$(printf '%010d_%07.3f' "$r7" 64)"
+```
+
+payload 和 fixture 一樣重要，因為它決定了「要量的那個 mutation」到底會不會發生。它需要有 `rate_limits.five_hour` 的百分比，以及一個落在 `(now, now + 21600]` 之內、在執行當下產生的 `resets_at`。不能用 `test/sample-input.json`：它那些 2030 年的 sentinel reset 會被每個 arm 拒絕，於是什麼都不會被追加、trim 門檻永遠不會被跨過，只剩 v0.12 那個 arm 還在做 marker 的工作。
+
+## 量測台的陷阱
+
+以下每一條都產生過看起來合理的錯誤數字。
+
+**不要由父行程餵 stdin。** 先用 `stdin=PIPE` 生出 N 個子行程、再逐一寫入，等於把它們序列化：子行程會卡在第一次讀取，直到父行程輪到它，而計時器早就開始了。實測 n=12 時 p50 灌水 2.3 倍、max 灌水 4.3 倍，而且失真程度取決於生成順序。正確做法是每個子行程各自開 payload 檔，把描述符交給它。
+
+**每個變體的輸出檔名要不同。** 用 `basename $BASH` 產生檔名時，`/bin/bash` 和 `/opt/homebrew/bin/bash` 都叫 `bash`，第二批會靜默蓋掉第一批。
+
+**`sed 's/x/y/' f > f` 會把 `f` 清空。** shell 在 `sed` 讀取之前就開啟了重導向。要從模板產生，不要從你正要寫入的那個檔案的兄弟檔產生。
+
+**腳本不要跟標準庫模組同名。** `bisect.py` 會蓋掉 Python 的 `bisect`，而 `statistics` 會間接 import 它，錯誤訊息會以難以理解的循環 import 形式出現。
+
+**`$(times)` 量到的是子 shell。** 命令替換和管線都會 fork，所以 `t=$(times)` 和 `times | head -1` 都回報 0。改成從父行程讀取子行程的 `rusage`。
+
+**zsh 的 `noclobber` 會靜默保留舊檔。** 對已存在的檔案下 `cat > f` 會失敗，而且常常不會讓外層指令跟著失敗。先 `rm -f`，而且任何要對外發佈的內容，寫完都要回讀驗證。
+
+**在 Windows 上要從原生 PowerShell 父行程啟動。** 從 MSYS bash 父行程啟動子行程，每個大約多加 240 毫秒，比多數要量的效應本身還大。
+
+**不要用多層引號的內嵌字串透過 SSH 下 Windows 指令。** `ssh` 加上 `powershell -Command` 的多層引號會把參數改壞，而且錯誤看起來像程式本身的問題。寫成 `.ps1`、`scp` 過去、用 `-File` 執行。
+
+**Bash arm 的設定檔要用 LF 換行。** `while IFS= read -r line` 會把歸位字元留在值的尾巴，所以 CRLF 的 `coralline.conf` 宣告的每一條路徑都是無效的。PowerShell renderer 不受影響：它在解析賦值之前會先用 `` `r`n|`n|`r `` 分行。
+
+## 下結論之前
+
+先做歸屬，再發佈。一個「這版比較慢」的數字是起點，不是結論。
+
+1. **對 merge 點做逐版比較。** 把每個 merge commit 當成一個 arm。如果整個差距集中在某一個 commit，你拿到的就是成因，不是猜測。
+2. **把 render 切開。** 分別量「沒有 state segment」「state 唯讀」「可寫入」三種情況。v0.13.0 相對 v0.11 的差距，在一般渲染是 1.0 毫秒、讀取路徑 0.8 毫秒、寫入路徑 13.3 毫秒，直接指向每次 mutation 前的重新驗證。
+3. **把可疑對象單獨微量測。** 在同一個行程裡跑 N 次再相除。一個被懷疑要 9 毫秒的函式，實際是 38 微秒；那 9 毫秒是 15 輪、沒有控制組的樣本產生的雜訊。
+
+## 重現 v0.13.0 的數字
+
+Arm 一律釘在 commit 上，這樣分支往前走之後實驗仍然可重現：`56fa44b`（v0.11.0）、`780df84`（v0.12.0）、`4bdd69e`（#58 的 merge）、`a597ac2`（v0.13.0）。各以 `git show <commit>:statusline.sh` 取出，每個 arm 都套用〈產生 fixture〉那節的設定與 state 目錄，payload 在執行當下產生，不要沿用存起來的舊檔。Cohort 為 n = 1、5、12、16，每個 cohort 25 輪配對、arm 輪替，在 macOS Bash 3.2.57 與 5.3.15 上、關閉現有狀態列的情況下執行。Windows 數字採同樣設計，在原生 x64 PowerShell 5.1 上進行，帶一個位元相同的控制組，並在同一次執行中量出直譯器地板。
